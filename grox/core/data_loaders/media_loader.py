@@ -4,6 +4,7 @@ import logging
 import traceback
 from urllib.parse import urlparse
 from tenacity import retry, wait_fixed, stop_after_attempt
+from broadcast_tools.broadcast import BroadcastLoader
 from grox.core.lm.convo import Image as ConvoImage, Video as ConvoVideo
 from monitor.metrics import Metrics
 from video_tools.image import process_image_bytes, resize_tile, enhance_image_with_clahe
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm")
 _VIDEO_DURATION_LIMIT_MINUTES = 360
+_VIDEO_PREVIEW_MIN_DURATION_MS = 30_000
 _VIDEO_MAX_ESTIMATED_BYTES = int(2 * 1024**3)
 _MAX_URL_VIDEOS_PER_POST = 7
 
@@ -48,6 +50,7 @@ class MediaLoader:
     cdn_downloader = CDNDownloader()
     tweet_render = TweetRenderForGrox(pool_size=2, max_contexts_per_browser=5)
     grox_fetcher_client = GroxFetcherClient(use_sharding=False, timeout=120)
+    _broadcast_loader: BroadcastLoader | None = None
 
     @classmethod
     def _metrics_attributes(cls) -> dict[str, str]:
@@ -227,6 +230,11 @@ class MediaLoader:
                 grox_config.media_hydration.enable_light_dark_enhancement
                 and is_main_post
             )
+            should_enable_motion_reveal = (
+                grox_config.media_hydration.enable_motion_reveal
+                and is_main_post
+                and is_high_fav
+            )
             for medium in post.media:
                 if isinstance(medium, Image):
                     tasks.append(
@@ -244,6 +252,7 @@ class MediaLoader:
                             is_main_post,
                             is_high_fav,
                             should_enable_clahe_enhancement,
+                            should_enable_motion_reveal,
                         )
                     )
         if post.broadcast_metadata and post.broadcast_metadata.thumbnail_image:
@@ -377,6 +386,7 @@ class MediaLoader:
         is_main_post: bool = False,
         is_high_fav: bool = False,
         enable_clahe_enhancement: bool = False,
+        enable_motion_reveal: bool = False,
     ) -> None:
         url = None
         if video.videoInfo and video.videoInfo.durationMillis:
@@ -458,6 +468,8 @@ class MediaLoader:
                 is_main_post,
                 is_high_fav,
                 enable_clahe_enhancement,
+                enable_motion_reveal,
+                max_duration=video.crop_seconds,
             )
             Metrics.counter("media_loader.hydrate_video_success.count").add(
                 1, attributes=cls._metrics_attributes()
@@ -470,34 +482,112 @@ class MediaLoader:
                 1, attributes=cls._metrics_attributes()
             )
             raise
+        if grox_config.media_hydration.enable_video_preview_image:
+            await cls.hydrate_video_preview(video, is_main_post and is_high_fav)
+
+    @classmethod
+    async def hydrate_video_preview(cls, video: Video, is_deluxe: bool) -> None:
+        if (
+            video.convo_video is None
+            or not video.url
+            or not video.videoInfo
+            or (video.videoInfo.durationMillis or 0) <= _VIDEO_PREVIEW_MIN_DURATION_MS
+        ):
+            return
+        tile_size = (
+            grox_config.media_hydration.deluxe_image_tile_size
+            if is_deluxe
+            else grox_config.media_hydration.image_tile_size
+        )
+        try:
+            bs = await cls._download(video.url)
+            if not bs:
+                return
+            preview = resize_tile(bs, tile_size)
+        except Exception:
+            logger.warning(
+                f"failed to hydrate video preview {video.url}, error: {traceback.format_exc()}"
+            )
+            Metrics.counter("media_loader.hydrate_video_preview_failed.count").add(
+                1, attributes=cls._metrics_attributes()
+            )
+            return
+        video.convo_video.preview_image = preview
+        Metrics.counter("media_loader.hydrate_video_preview.count").add(
+            1, attributes=cls._metrics_attributes()
+        )
+
+    @classmethod
+    def _get_broadcast_loader(cls) -> BroadcastLoader:
+        if cls._broadcast_loader is None:
+            cls._broadcast_loader = BroadcastLoader(
+                bearer_token=os.environ.get("X_API_BEARER", ""),
+                guest_token=os.environ.get("BROADCAST_GUEST_TOKEN"),
+            )
+        return cls._broadcast_loader
+
+    @classmethod
+    async def _extract_broadcast_video(
+        cls, broadcast_metadata: BroadcastMetadata
+    ) -> Video:
+        config = grox_config.media_hydration
+        result = await cls._get_broadcast_loader().load_broadcast(
+            broadcast_metadata.broadcast_id,
+            media_key=broadcast_metadata.media_key,
+            max_frames=config.video_max_frames,
+            tile_size=config.video_tile_size,
+            max_duration=broadcast_metadata.crop_seconds,
+        )
+        frames = result.video.frames
+        if not frames:
+            raise ValueError(
+                f"No frames for broadcast {broadcast_metadata.broadcast_id}"
+            )
+        interval = (
+            (frames[-1].time_sec - frames[0].time_sec) / (len(frames) - 1)
+            if len(frames) > 1
+            else 1.0
+        )
+        return Video(
+            convo_video=ConvoVideo(
+                frames=[frame.frame for frame in frames],
+                duration=interval,
+                total_duration=result.video.sampled_duration,
+            )
+        )
 
     @classmethod
     async def hydrate_broadcast(cls, broadcast_metadata: BroadcastMetadata) -> None:
         Metrics.counter("media_loader.hydrate_broadcast.count").add(
             1, attributes=cls._metrics_attributes()
         )
-        logger.info("Hydrating broadcast frames from grox-fetcher")
         try:
-            broadcast_data = await cls.grox_fetcher_client.fetch_broadcast(
-                broadcast_metadata.broadcast_id,
-                broadcast_metadata.media_key,
-                dedup_video_frames=False,
-            )
-            if not broadcast_data or not broadcast_data.broadcast_content:
-                Metrics.counter("media_loader.hydrate_broadcast_failed.count").add(
-                    1, attributes=cls._metrics_attributes()
+            if grox_config.media_hydration.enable_local_broadcast_frame_extraction:
+                broadcast_metadata.video = await cls._extract_broadcast_video(
+                    broadcast_metadata
                 )
-                return
-            broadcast_content = broadcast_data.broadcast_content
-            frames = [frame.frame for frame in broadcast_content.frames]
-            broadcast_metadata.video = Video(
-                convo_video=ConvoVideo(
-                    frames=frames,
-                    subtitles=None,
-                    duration=broadcast_content.duration,
-                    total_duration=broadcast_content.total_duration,
+            else:
+                logger.info("Hydrating broadcast frames from grox-fetcher")
+                broadcast_data = await cls.grox_fetcher_client.fetch_broadcast(
+                    broadcast_metadata.broadcast_id,
+                    broadcast_metadata.media_key,
+                    dedup_video_frames=False,
                 )
-            )
+                if not broadcast_data or not broadcast_data.broadcast_content:
+                    Metrics.counter("media_loader.hydrate_broadcast_failed.count").add(
+                        1, attributes=cls._metrics_attributes()
+                    )
+                    return
+                broadcast_content = broadcast_data.broadcast_content
+                frames = [frame.frame for frame in broadcast_content.frames]
+                broadcast_metadata.video = Video(
+                    convo_video=ConvoVideo(
+                        frames=frames,
+                        subtitles=None,
+                        duration=broadcast_content.duration,
+                        total_duration=broadcast_content.total_duration,
+                    )
+                )
             Metrics.counter("media_loader.hydrate_broadcast_success.count").add(
                 1, attributes=cls._metrics_attributes()
             )
@@ -527,6 +617,8 @@ class MediaLoader:
         is_main_post: bool = False,
         is_high_fav: bool = False,
         enable_clahe_enhancement: bool = False,
+        enable_motion_reveal: bool = False,
+        max_duration: float | None = None,
     ) -> ConvoVideo:
         video_max_frames = grox_config.media_hydration.video_max_frames_light
         video_tile_size = grox_config.media_hydration.video_tile_size
@@ -545,6 +637,8 @@ class MediaLoader:
             video_tile_size,
             enable_clahe=enable_clahe_enhancement,
             include_combined_video_bytes=False,
+            enable_motion_reveal=enable_motion_reveal,
+            max_duration=max_duration,
         )
         times = [frame.time_sec for frame in video_data.frames]
         frames = [frame.frame for frame in video_data.frames]
@@ -555,7 +649,9 @@ class MediaLoader:
             total_duration = times[-1] if times else duration
         if subtitles:
             try:
-                subtitles = SubtitleAligner(subtitles).align(times)
+                subtitles = SubtitleAligner(subtitles).align(
+                    times, max_time=max_duration
+                )
             except Exception:
                 logger.warning(
                     f"failed to align video subtitles, error: {traceback.format_exc()}"
@@ -574,10 +670,20 @@ class MediaLoader:
                 1, attributes=cls._metrics_attributes()
             )
 
+        if video_data.motion_reveal_frames:
+            Metrics.counter("media_loader.motion_reveal_built.count").add(
+                1, attributes=cls._metrics_attributes()
+            )
+        elif enable_motion_reveal:
+            Metrics.counter("media_loader.motion_reveal_skipped.count").add(
+                1, attributes=cls._metrics_attributes()
+            )
+
         return ConvoVideo(
             frames=frames,
             subtitles=subtitles,
             duration=duration,
             total_duration=total_duration,
             is_deluxe_target=is_main_post and is_high_fav,
+            motion_reveal_frames=video_data.motion_reveal_frames,
         )

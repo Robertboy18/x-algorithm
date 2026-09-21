@@ -1,7 +1,10 @@
-use crate::models::candidate::PostCandidate;
+use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
+use crate::util::composition::Composition;
 use crate::util::tweet_type_metrics::*;
-use std::collections::HashSet;
+use crate::util::viewer_history;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use tonic::async_trait;
 use xai_candidate_pipeline::component_library::utils::duration_since_creation_opt;
 use xai_candidate_pipeline::hydrator::Hydrator;
@@ -132,6 +135,93 @@ impl TweetTypeMetricsHydrator {
         true_tweet_types
     }
 
+    pub fn author_diversity_bits(authors: &Composition) -> HashSet<usize> {
+        let mut bits = HashSet::new();
+        if authors.size == 0 {
+            return bits;
+        }
+        if authors.unique_ratio() <= 0.5 {
+            bits.insert(UNIQUE_AUTHOR_RATIO_LTE_50_PCT);
+        }
+        if authors.unique <= 5 {
+            bits.insert(UNIQUE_AUTHOR_LTE_5);
+        }
+        if authors.unique <= 10 {
+            bits.insert(UNIQUE_AUTHOR_LTE_10);
+        }
+        if authors.unique <= 15 {
+            bits.insert(UNIQUE_AUTHOR_LTE_15);
+        }
+        if authors.max_share() >= 0.25 {
+            bits.insert(SINGLE_AUTHOR_GTE_25_PCT);
+        }
+        if authors.max_share() >= 0.5 {
+            bits.insert(SINGLE_AUTHOR_GTE_50_PCT);
+        }
+        bits
+    }
+
+    pub fn slate_position_bits(
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+    ) -> Vec<HashSet<usize>> {
+        let mut score_order: Vec<usize> = (0..candidates.len()).collect();
+        score_order.sort_by(|&a, &b| {
+            let score = |i: usize| candidates[i].score.unwrap_or(f64::NEG_INFINITY);
+            score(b).partial_cmp(&score(a)).unwrap_or(Ordering::Equal)
+        });
+
+        let followed: HashSet<u64> = query
+            .user_features
+            .followed_user_ids
+            .iter()
+            .map(|&id| id as u64)
+            .collect();
+        let engaged_authors = query
+            .columnar_scoring_sequence
+            .as_ref()
+            .and_then(viewer_history::positively_engaged_author_ids);
+
+        let mut author_counts: HashMap<u64, usize> = HashMap::new();
+        let mut seen_sid_l1: HashSet<&[i32]> = HashSet::new();
+        let mut seen_sid_l2: HashSet<&[i32]> = HashSet::new();
+        let mut bits = vec![HashSet::new(); candidates.len()];
+
+        for idx in score_order {
+            let candidate = &candidates[idx];
+            let post_bits = &mut bits[idx];
+
+            let prior_appearances = author_counts.entry(candidate.author_id).or_insert(0);
+            if *prior_appearances >= 1 {
+                post_bits.insert(AUTHOR_REPEAT_IN_SLATE);
+            }
+            if *prior_appearances >= 2 {
+                post_bits.insert(AUTHOR_REPEAT_GTE_3_IN_SLATE);
+            }
+            *prior_appearances += 1;
+
+            if let Some(engaged) = &engaged_authors
+                && !followed.contains(&candidate.author_id)
+                && !engaged.contains(&candidate.author_id)
+            {
+                post_bits.insert(AUTHOR_NOT_ENGAGED_BY_VIEWER);
+            }
+
+            if let Some(l1) = candidate.semantic_id_prefix(1) {
+                post_bits.insert(HAS_SEMANTIC_IDS);
+                if !seen_sid_l1.insert(l1) {
+                    post_bits.insert(SID_L1_REPEAT_IN_SLATE);
+                }
+            }
+            if let Some(l2) = candidate.semantic_id_prefix(2)
+                && !seen_sid_l2.insert(l2)
+            {
+                post_bits.insert(SID_L2_REPEAT_IN_SLATE);
+            }
+        }
+        bits
+    }
+
         pub fn bitset_to_bytes(bits: &HashSet<usize>) -> Vec<u8> {
         if bits.is_empty() {
             return Vec::new();
@@ -158,9 +248,15 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for TweetTypeMetricsHydrator {
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
     ) -> Vec<Result<PostCandidate, String>> {
+        let authors = Composition::from_keys(candidates.iter().map(|c| c.author_id));
+        let author_diversity_bits = Self::author_diversity_bits(&authors);
+        let slate_position_bits = Self::slate_position_bits(query, candidates);
+
         let mut hydrated_candidates = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            let true_tweet_types = Self::create_tweet_type_bitset(candidate, query);
+        for (candidate, position_bits) in candidates.iter().zip(slate_position_bits) {
+            let mut true_tweet_types = Self::create_tweet_type_bitset(candidate, query);
+            true_tweet_types.extend(&author_diversity_bits);
+            true_tweet_types.extend(position_bits);
 
             let tweet_type_metrics = Some(Self::bitset_to_bytes(&true_tweet_types));
 

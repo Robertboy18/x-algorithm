@@ -1,7 +1,7 @@
 use crate::clients::engagement_counts_client::EngagementCountsClient;
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
-use crate::params::{ColdStartFollowerCap, EnableEngagementCountsHydration, EnableViewerColdStart};
+use crate::params::{ColdStartFollowerCap, EnableEngagementCountsHydration};
 use crate::scorers::author_cold_start::cold_start_base_eligible;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +21,7 @@ pub struct CachedCounts {
     repost_count: Option<i64>,
     quote_count: Option<i64>,
     view_count: Option<u64>,
+    view_count_on_home: Option<u64>,
     bookmark_count: Option<i64>,
 }
 
@@ -32,6 +33,7 @@ impl CachedCounts {
             repost_count: Some(c.retweet_count as i64),
             quote_count: Some(c.quote_count as i64),
             view_count: Some(c.view_count),
+            view_count_on_home: Some(c.view_count_on_home),
             bookmark_count: Some(c.bookmark_count as i64),
         }
     }
@@ -43,6 +45,7 @@ impl CachedCounts {
             repost_count: self.repost_count,
             quote_count: self.quote_count,
             view_count: self.view_count,
+            view_count_on_home: self.view_count_on_home,
             bookmark_count: self.bookmark_count,
             ..Default::default()
         }
@@ -56,6 +59,7 @@ fn preserve_counts(c: &PostCandidate) -> PostCandidate {
         repost_count: c.repost_count,
         quote_count: c.quote_count,
         view_count: c.view_count,
+        view_count_on_home: c.view_count_on_home,
         bookmark_count: c.bookmark_count,
         ..Default::default()
     }
@@ -82,9 +86,7 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for EngagementCountsHydrato
     type CacheValue = CachedCounts;
 
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        query.params.get(EnableViewerColdStart)
-            || (!query.has_cached_posts
-                && (query.params.get(EnableEngagementCountsHydration) || query.is_shadow_traffic))
+        query.params.get(EnableEngagementCountsHydration) || query.is_shadow_traffic
     }
 
     fn cache_store(&self) -> &dyn CacheStore<Self::CacheKey, Self::CacheValue> {
@@ -102,6 +104,7 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for EngagementCountsHydrato
             repost_count: hydrated.repost_count,
             quote_count: hydrated.quote_count,
             view_count: hydrated.view_count,
+            view_count_on_home: hydrated.view_count_on_home,
             bookmark_count: hydrated.bookmark_count,
         }
     }
@@ -160,6 +163,7 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for EngagementCountsHydrato
         candidate.repost_count = hydrated.repost_count;
         candidate.quote_count = hydrated.quote_count;
         candidate.view_count = hydrated.view_count;
+        candidate.view_count_on_home = hydrated.view_count_on_home;
         candidate.bookmark_count = hydrated.bookmark_count;
     }
 }
@@ -212,16 +216,25 @@ mod tests {
     async fn enable_matrix() {
         let h = hydrator(HashMap::new()).await;
         assert!(h.enable(&query(false, &[(COUNTS, "true")])));
-        assert!(h.enable(&query(false, &[(COLD_START, "true"), (COUNTS, "false")])));
-        assert!(h.enable(&query(true, &[(COLD_START, "true")])));
-        assert!(!h.enable(&query(true, &[(COUNTS, "true"), (COLD_START, "false")])));
-        assert!(!h.enable(&query(false, &[(COUNTS, "false"), (COLD_START, "false")])));
-        assert!(!h.enable(&query(true, &[(COUNTS, "false"), (COLD_START, "false")])));
+        assert!(h.enable(&query(true, &[(COUNTS, "true")])));
+        assert!(!h.enable(&query(false, &[(COUNTS, "false")])));
+        assert!(!h.enable(&query(true, &[(COUNTS, "false")])));
+        let mut shadow = query(true, &[(COUNTS, "false")]);
+        shadow.is_shadow_traffic = true;
+        assert!(h.enable(&shadow));
     }
 
     #[tokio::test]
     async fn no_cached_posts_hydrates_all() {
-        let h = hydrator(view_counts(&[(20, 7)])).await;
+        let h = hydrator(HashMap::from([(
+            20,
+            EngagementCounts {
+                view_count: 7,
+                view_count_on_home: 3,
+                ..Default::default()
+            },
+        )]))
+        .await;
         let candidates = vec![PostCandidate {
             tweet_id: 20,
             author_id: 2,
@@ -232,6 +245,7 @@ mod tests {
         let q = query(false, &[(COUNTS, "true"), (CAP, "1000")]);
         let result = h.hydrate_from_client(&q, &candidates).await;
         assert_eq!(result[0].as_ref().unwrap().view_count, Some(7));
+        assert_eq!(result[0].as_ref().unwrap().view_count_on_home, Some(3));
     }
 
     #[tokio::test]

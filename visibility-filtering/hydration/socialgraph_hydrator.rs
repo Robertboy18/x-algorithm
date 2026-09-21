@@ -7,7 +7,7 @@ use crate::rules::SafetyLevel;
 use std::sync::Arc;
 use std::time::Duration;
 
-const CLIENT_TIMEOUT: Duration = Duration::from_millis(150);
+const CLIENT_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
 const CLIENT: &str = "socialgraph";
 
 pub struct SocialgraphHydrator {
@@ -58,7 +58,7 @@ impl SocialgraphHydrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::socialgraph_client::MockSocialgraphClient;
+    use crate::clients::socialgraph_client::FakeSocialgraphClient;
     use crate::hydration::batch::Hydrated;
     use crate::models::{resolve_candidate, RawCandidate, TweetId};
     use std::collections::HashMap;
@@ -71,6 +71,7 @@ mod tests {
                 request_author_id: Some(author_id),
             },
             &HashMap::<TweetId, PureCoreData>::new(),
+            &HashMap::new(),
         )
         .unwrap()
     }
@@ -91,13 +92,13 @@ mod tests {
             &self,
             _viewer_id: u64,
             _author_ids: &[u64],
-        ) -> HashMap<u64, bool> {
-            HashMap::new()
+        ) -> Option<HashMap<u64, bool>> {
+            Some(HashMap::new())
         }
     }
 
     #[tokio::test]
-    async fn rpc_error_empty_response_marks_every_key_failed() {
+    async fn rpc_empty_response_marks_every_key_failed() {
         let hydrator = SocialgraphHydrator {
             sg_client: Arc::new(EmptyResponseSocialgraphClient),
         };
@@ -107,13 +108,18 @@ mod tests {
             .hydrate(&candidates, Viewer::LoggedIn(99), SafetyLevel::TimelineHome)
             .await;
 
-        assert_eq!(relationships.failed_count(), 2);
+        for tweet_id in [TweetId(1), TweetId(2)] {
+            assert!(matches!(
+                relationships.hydrated(&tweet_id),
+                Some(Hydrated::Failed(_))
+            ));
+        }
     }
 
     #[tokio::test]
     async fn logged_out_viewer_is_found_default_even_for_duplicate_tweets() {
         let hydrator = SocialgraphHydrator {
-            sg_client: Arc::new(MockSocialgraphClient::default()),
+            sg_client: Arc::new(FakeSocialgraphClient),
         };
         let candidates = vec![candidate(1, 10), candidate(1, 10), candidate(2, 20)];
 
@@ -121,7 +127,6 @@ mod tests {
             .hydrate(&candidates, Viewer::LoggedOut, SafetyLevel::TimelineHome)
             .await;
 
-        assert_eq!(relationships.failed_count(), 0);
         for tweet_id in [TweetId(1), TweetId(2)] {
             assert!(matches!(
                 relationships.hydrated(&tweet_id),

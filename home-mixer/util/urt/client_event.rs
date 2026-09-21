@@ -1,4 +1,5 @@
 use super::controller_data;
+use crate::models::query::RequestType;
 use crate::util::string_case::upper_snake_to_pascal;
 use xai_home_mixer_proto::{ScoredPost, ServedType};
 use xai_recsys_proto::AdIndexInfo;
@@ -6,9 +7,13 @@ use xai_urt_thrift::metadata::{ClientEventDetails, ClientEventInfo, TimelinesDet
 
 pub(super) const ELEMENT_TWEET: &str = "tweet";
 pub(super) const ELEMENT_USER: &str = "user";
-pub(super) const COMPONENT_ADS: &str = "for_you_promoted";
 pub(super) const COMPONENT_WTF: &str = "suggest_who_to_follow";
-const ADS_INJECTION_TYPE: &str = "ForYouPromoted";
+const COMPONENT_ADS_FOR_YOU: &str = "for_you_promoted";
+const ADS_INJECTION_TYPE_FOR_YOU: &str = "ForYouPromoted";
+const COMPONENT_ADS_FOLLOWING: &str = "following_promoted";
+const ADS_INJECTION_TYPE_FOLLOWING: &str = "FollowingPromoted";
+const COMPONENT_ADS_RANKED_FOLLOWING: &str = "ranked_following_promoted";
+const ADS_INJECTION_TYPE_RANKED_FOLLOWING: &str = "RankedFollowingPromoted";
 const WTF_INJECTION_TYPE: &str = "WhoToFollow";
 
 pub(super) fn served_type_component(st: i32) -> String {
@@ -68,17 +73,25 @@ pub(super) fn post_client_event_info(
     }
 }
 
-pub(super) fn ad_client_event_info(ad: &AdIndexInfo) -> ClientEventInfo {
+pub(super) fn ad_client_event_info(ad: &AdIndexInfo, request_type: RequestType) -> ClientEventInfo {
+    let (component, injection_type) = match request_type {
+        RequestType::Following => (COMPONENT_ADS_FOLLOWING, ADS_INJECTION_TYPE_FOLLOWING),
+        RequestType::RankedFollowing => (
+            COMPONENT_ADS_RANKED_FOLLOWING,
+            ADS_INJECTION_TYPE_RANKED_FOLLOWING,
+        ),
+        _ => (COMPONENT_ADS_FOR_YOU, ADS_INJECTION_TYPE_FOR_YOU),
+    };
     let mut details = empty_details();
     details.timelines_details = Some(TimelinesDetails {
-        injection_type: Some(ADS_INJECTION_TYPE.to_string()),
+        injection_type: Some(injection_type.to_string()),
         controller_data: controller_data::ad_item_controller_data(),
         source_data: None,
     });
     details.adindex_details = controller_data::ad_index_controller_data(ad);
 
     ClientEventInfo {
-        component: Some(COMPONENT_ADS.to_string()),
+        component: Some(component.to_string()),
         element: Some(ELEMENT_TWEET.to_string()),
         details: Some(details),
         action: None,
@@ -103,11 +116,18 @@ pub(super) fn wtf_item_client_event_info(tracking_token: Option<&str>) -> Client
     }
 }
 
-pub(super) fn wtf_module_client_event_info() -> ClientEventInfo {
+pub(super) fn wtf_module_client_event_info(tracking_token: Option<&str>) -> ClientEventInfo {
+    let mut details = empty_details();
+    details.timelines_details = Some(TimelinesDetails {
+        injection_type: Some(WTF_INJECTION_TYPE.to_string()),
+        controller_data: tracking_token.and_then(controller_data::wtf_controller_data),
+        source_data: tracking_token.map(|s| s.to_string()),
+    });
+
     ClientEventInfo {
         component: Some(COMPONENT_WTF.to_string()),
         element: None,
-        details: None,
+        details: Some(details),
         action: None,
         entity_token: None,
     }

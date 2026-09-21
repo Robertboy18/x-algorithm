@@ -9,6 +9,7 @@ members = [
     "crates/serving/xai-recsys-proto",
     "crates/serving/xai-recsys-server",
     "crates/serving/xai-recsys-sid-proto",
+    "crates/storage/xai-o2",
 ]
 
 [workspace.package]
@@ -57,13 +58,15 @@ prost-build = "0.14"
 pyo3 = { version = "0.26", features = ["bytes"] }
 rand = "0.9"
 rayon = "1"
+rcgen = { version = "0.13", features = ["pem"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 scopeguard = "1"
 serde_json = "1"
+serial_test = "3"
 simd-adler32 = "0.3.7"
 static_assertions = "1.1.0"
 tempfile = "3"
-thrift = { git = "https://github.com/apache/thrift.git", tag = "v0.23.0" }
+thrift = "0.24.0"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -76,6 +79,7 @@ tonic-reflection = "0.14"
 tower = "0.5"
 tracing = "0.1"
 url = "2"
+xai-o2 = { path = "crates/storage/xai-o2" }
 xai-recsys = { path = "crates/common/xai-recsys" }
 xai-recsys-mm-server = { path = "crates/serving/xai-recsys-mm-server" }
 xai-recsys-proto = { path = "crates/serving/xai-recsys-proto" }

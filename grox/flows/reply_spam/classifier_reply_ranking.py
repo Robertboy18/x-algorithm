@@ -64,6 +64,7 @@ class ReplyScorer:
                 role=Role.HUMAN,
                 separator=THINKING_CONTROL_START + SEPARATOR,
                 include_signals=True,
+                include_follower_count=True,
             )
         )
         if non_reasoning:

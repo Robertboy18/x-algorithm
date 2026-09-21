@@ -75,4 +75,8 @@ object DownstreamServices {
   case object UrlToSlugStore extends DownstreamService {
     override val name = "URL_TO_SLUG_STORE"
   }
+
+  case object XReviewIntake extends DownstreamService {
+    override val name = "XREVIEW_INTAKE"
+  }
 }

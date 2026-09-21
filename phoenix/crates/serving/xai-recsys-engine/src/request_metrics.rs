@@ -172,8 +172,9 @@ lazy_static! {
             "recsys_engine_client_server_network_delay_ms",
             "Approximate client->server network delay (ms): wall-clock delta \
              between the caller's x-request-send-time-ms (stamped just before \
-             the request hits the wire) and server handler entry.",
-            &["client"],
+             the request hits the wire) and server handler entry. Labels: \
+             client, src_dc.",
+            &["client", "src_dc"],
             buckets
         )
         .unwrap()
@@ -365,7 +366,7 @@ pub fn export() {
     let _ = TOKENS_PER_ROW.with_label_values(&["history"]);
     let _ = TOKENS_PER_ROW.with_label_values(&["candidate"]);
     let _ = NOT_READY_ARRIVAL_SECONDS.with_label_values(&["unknown"]);
-    let _ = CLIENT_SERVER_NETWORK_DELAY.with_label_values(&["unknown"]);
+    let _ = CLIENT_SERVER_NETWORK_DELAY.with_label_values(&["unknown", "unknown"]);
     let _ = ADMISSION_BUDGET_REMAINING.with_label_values(&["unknown"]);
     NUM_REQUESTS_REJECTED
         .with_label_values(&["deadline_admission", "unknown"])
@@ -385,8 +386,9 @@ pub fn record_client_server_network_delay<T>(request: &Request<T>, client: &str)
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let src_dc = src_dc_label(request);
     CLIENT_SERVER_NETWORK_DELAY
-        .with_label_values(&[client])
+        .with_label_values(&[client, &src_dc])
         .observe(now_ms.saturating_sub(sent_ms) as f64);
 }
 
@@ -432,9 +434,7 @@ pub fn observe_admission<T, Item>(
         return Ok(());
     }
     DEADLINE_SHED.with_label_values(&[client]).inc();
-    NUM_REQUESTS_REJECTED
-        .with_label_values(&["deadline_admission", client])
-        .inc();
+    guard.record_reject("deadline_admission");
     let budget_source = if grpc_timeout.is_some() {
         "grpc-timeout"
     } else {
@@ -452,6 +452,12 @@ pub fn observe_admission<T, Item>(
 pub fn record_admission_service_sample(admission: &AdmissionController, sample_us: u64) {
     admission.record_service_time_us(sample_us);
     ADMISSION_SERVICE_TIME_MS.set(admission.service_time_us() as f64 / 1000.0);
+}
+
+pub fn reset_admission_estimates(admission: &AdmissionController) {
+    admission.reset_estimates();
+    ADMISSION_SERVICE_TIME_MS.set(0.0);
+    ADMISSION_PIPELINE_TIME_MS.set(0.0);
 }
 
 pub fn record_admission_sojourn_sample(
@@ -560,6 +566,7 @@ pub struct RequestMetricsGuard {
     admit_backlog: i64,
     admission: Option<Arc<AdmissionController>>,
     finished: bool,
+    recorded_reject: bool,
 }
 
 impl RequestMetricsGuard {
@@ -571,7 +578,15 @@ impl RequestMetricsGuard {
             admit_backlog: 0,
             admission: None,
             finished: false,
+            recorded_reject: false,
         }
+    }
+
+    pub fn record_reject(&mut self, reason: &str) {
+        NUM_REQUESTS_REJECTED
+            .with_label_values(&[reason, self.labels.client.as_str()])
+            .inc();
+        self.recorded_reject = true;
     }
 
     pub fn client(&self) -> &str {
@@ -600,7 +615,7 @@ impl RequestMetricsGuard {
     pub fn finish<R>(mut self, result: tonic::Result<Response<R>>) -> tonic::Result<Response<R>> {
         self.record_sojourn();
         self.finished = true;
-        on_request_finished(&self.labels, &result);
+        on_request_finished(&self.labels, &result, self.recorded_reject);
         result
     }
 }
@@ -615,7 +630,11 @@ impl Drop for RequestMetricsGuard {
     }
 }
 
-pub fn on_request_finished<T>(labels: &RequestLabels, result: &tonic::Result<Response<T>>) {
+pub fn on_request_finished<T>(
+    labels: &RequestLabels,
+    result: &tonic::Result<Response<T>>,
+    already_rejected: bool,
+) {
     let code = status_code(result);
     emit_request_metrics(
         labels.start,
@@ -628,14 +647,18 @@ pub fn on_request_finished<T>(labels: &RequestLabels, result: &tonic::Result<Res
         tonic::Code::Ok => NUM_REQUESTS_SUCCEEDED.inc(),
         tonic::Code::Cancelled => NUM_REQUESTS_CANCELED.inc(),
         tonic::Code::Unavailable => {
-            NUM_REQUESTS_REJECTED
-                .with_label_values(&["checkpoint_loading", labels.client.as_str()])
-                .inc();
+            if !already_rejected {
+                NUM_REQUESTS_REJECTED
+                    .with_label_values(&["checkpoint_loading", labels.client.as_str()])
+                    .inc();
+            }
         }
         tonic::Code::ResourceExhausted => {
-            NUM_REQUESTS_REJECTED
-                .with_label_values(&["inflight_cap", labels.client.as_str()])
-                .inc();
+            if !already_rejected {
+                NUM_REQUESTS_REJECTED
+                    .with_label_values(&["inflight_cap", labels.client.as_str()])
+                    .inc();
+            }
         }
         tonic::Code::InvalidArgument => {}
         _ => NUM_REQUESTS_FAILED.inc(),
@@ -645,6 +668,7 @@ pub fn on_request_finished<T>(labels: &RequestLabels, result: &tonic::Result<Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::{AdmissionConfig, AdmissionEtaModel};
     use tonic::Request;
 
     #[test]
@@ -682,6 +706,17 @@ mod tests {
 
         let absent = Request::new(());
         assert_eq!(src_dc_label(&absent), "unknown");
+    }
+
+    #[test]
+    fn network_delay_records_under_client_and_src_dc() {
+        let mut req = Request::new(());
+        req.metadata_mut()
+            .insert("x-request-send-time-ms", "1".parse().unwrap());
+        req.metadata_mut().insert("src_dc", "pdxa".parse().unwrap());
+        record_client_server_network_delay(&req, "example-service/ranking-xds");
+        let _ =
+            CLIENT_SERVER_NETWORK_DELAY.with_label_values(&["example-service/ranking-xds", "pdxa"]);
     }
 
     #[test]
@@ -758,5 +793,89 @@ mod tests {
             admission.pipeline_time_us() > 0,
             "client cancel must still fold P"
         );
+    }
+
+    fn rejected(reason: &str, client: &str) -> u64 {
+        NUM_REQUESTS_REJECTED
+            .with_label_values(&[reason, client])
+            .get()
+    }
+
+    #[test]
+    fn reset_admission_estimates_clears_gauges_and_p() {
+        let admission = AdmissionController::new(AdmissionConfig {
+            enabled: true,
+            batch_size: 4,
+            margin_us: 0,
+            post_us: 0,
+            fallback_budget_us: 0,
+            ewma_alpha: 1.0,
+            pipeline_depth: 0,
+            eta_model: AdmissionEtaModel::Pipeline,
+        });
+        admission.record_service_time_us(50_000);
+        admission.record_sojourn_us(80_000, 0);
+        record_admission_service_sample(&admission, 50_000);
+        record_admission_sojourn_sample(&admission, 80_000, 0);
+        assert!(admission.pipeline_time_us() > 0);
+        reset_admission_estimates(&admission);
+        assert_eq!(admission.service_time_us(), 0);
+        assert_eq!(admission.pipeline_time_us(), 0);
+        assert_eq!(ADMISSION_SERVICE_TIME_MS.get(), 0.0);
+        assert_eq!(ADMISSION_PIPELINE_TIME_MS.get(), 0.0);
+    }
+
+    #[test]
+    fn deadline_shed_does_not_double_count_as_inflight_cap() {
+        let client = "test-deadline-shed-no-double";
+        let admission = AdmissionController::new(AdmissionConfig {
+            enabled: true,
+            batch_size: 1,
+            margin_us: 0,
+            post_us: 0,
+            fallback_budget_us: 0,
+            ewma_alpha: 1.0,
+            pipeline_depth: 0,
+            eta_model: AdmissionEtaModel::Loop,
+        });
+        admission.record_service_time_us(100_000);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<()>(2);
+        tx.try_send(()).unwrap();
+
+        let mut req = Request::new(());
+        req.metadata_mut()
+            .insert("x-client-name", client.parse().unwrap());
+        req.metadata_mut()
+            .insert("grpc-timeout", "1m".parse().unwrap());
+
+        let shed_before = DEADLINE_SHED.with_label_values(&[client]).get();
+        let deadline_before = rejected("deadline_admission", client);
+        let inflight_before = rejected("inflight_cap", client);
+
+        let mut guard = RequestMetricsGuard::begin(&req);
+        let err = observe_admission(&req, client, 0, &tx, &admission, &mut guard)
+            .expect_err("deadline admission must shed");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let _ = guard.finish::<()>(Err(err));
+
+        assert_eq!(
+            DEADLINE_SHED.with_label_values(&[client]).get(),
+            shed_before + 1
+        );
+        assert_eq!(rejected("deadline_admission", client), deadline_before + 1);
+        assert_eq!(rejected("inflight_cap", client), inflight_before);
+    }
+
+    #[test]
+    fn resource_exhausted_without_prior_reject_counts_inflight_cap() {
+        let client = "test-inflight-cap-from-finish";
+        let mut req = Request::new(());
+        req.metadata_mut()
+            .insert("x-client-name", client.parse().unwrap());
+        let before = rejected("inflight_cap", client);
+        let guard = RequestMetricsGuard::begin(&req);
+        let _ = guard.finish::<()>(Err(Status::resource_exhausted("queue full")));
+        assert_eq!(rejected("inflight_cap", client), before + 1);
     }
 }

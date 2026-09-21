@@ -1,7 +1,7 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
-use xai_visibility_filtering::models::{Action, FilteredReason};
+use xai_visibility_filtering::models::Action;
 
 pub struct VFFilter;
 
@@ -13,86 +13,44 @@ impl Filter<ScoredPostsQuery, PostCandidate> for VFFilter {
     ) -> FilterResult<PostCandidate> {
         let (removed, kept): (Vec<_>, Vec<_>) = candidates
             .into_iter()
-            .partition(|c| should_drop(&c.visibility_reason));
+            .partition(|c| c.visibility_action.as_ref().is_some_and(should_drop_action));
 
         FilterResult { kept, removed }
     }
 }
 
-fn should_drop(reason: &Option<FilteredReason>) -> bool {
-    match reason {
-        Some(FilteredReason::SafetyResult(safety_result)) => {
-            matches!(safety_result.action, Action::Drop(_))
-        }
-        Some(_) => true,
-        None => false,
+pub(crate) fn should_drop_action(action: &Action) -> bool {
+    match action {
+        Action::Allow | Action::Interstitial | Action::Avoid | Action::Downrank => false,
+        Action::Drop(_) | Action::Tombstone | Action::NotEvaluated => true,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xai_visibility_filtering::models::DropReason;
 
-    fn candidate_with_reason(reason: Option<FilteredReason>) -> PostCandidate {
-        PostCandidate {
-            visibility_reason: reason,
-            ..Default::default()
+    #[test]
+    fn partitions_by_action() {
+        let cases = [
+            (None, false),
+            (Some(Action::Allow), false),
+            (Some(Action::Interstitial), false),
+            (Some(Action::Avoid), false),
+            (Some(Action::Downrank), false),
+            (Some(Action::Drop(DropReason {})), true),
+            (Some(Action::Tombstone), true),
+            (Some(Action::NotEvaluated), true),
+        ];
+        for (action, dropped) in cases {
+            let candidate = PostCandidate {
+                visibility_action: action,
+                ..Default::default()
+            };
+            let result = VFFilter.filter(&ScoredPostsQuery::default(), vec![candidate]);
+            assert_eq!(result.removed.len(), usize::from(dropped));
+            assert_eq!(result.kept.len(), usize::from(!dropped));
         }
-    }
-
-    #[tokio::test]
-    async fn drops_when_action_is_drop() {
-        let filter = VFFilter;
-        let query = ScoredPostsQuery::default();
-
-        let drop_reason =
-            FilteredReason::SafetyResult(xai_visibility_filtering::models::SafetyResult {
-                action: Action::Drop(Default::default()),
-                ..Default::default()
-            });
-        let candidates = vec![
-            candidate_with_reason(Some(drop_reason)),
-            candidate_with_reason(None),
-        ];
-
-        let result = filter.filter(&query, candidates);
-
-        assert_eq!(result.removed.len(), 1);
-        assert_eq!(result.kept.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn keeps_when_action_allows() {
-        let filter = VFFilter;
-        let query = ScoredPostsQuery::default();
-
-        let allowed_reason =
-            FilteredReason::SafetyResult(xai_visibility_filtering::models::SafetyResult {
-                action: Action::Allow,
-                ..Default::default()
-            });
-        let candidates = vec![candidate_with_reason(Some(allowed_reason))];
-
-        let result = filter.filter(&query, candidates);
-
-        assert_eq!(result.removed.len(), 0);
-        assert_eq!(result.kept.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn drops_when_user_filtered_state_present() {
-        let filter = VFFilter;
-        let query = ScoredPostsQuery::default();
-
-        let reason = FilteredReason::AuthorBlockViewer;
-        let candidates = vec![
-            candidate_with_reason(Some(reason)),
-            candidate_with_reason(None),
-        ];
-
-        let result = filter.filter(&query, candidates);
-
-        assert_eq!(result.removed.len(), 1);
-        assert_eq!(result.kept.len(), 1);
     }
 }

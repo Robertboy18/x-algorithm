@@ -376,6 +376,7 @@ def run(
     runner.hotswap_download_max_concurrent = args.hotswap_download_max_concurrent
     runner.hotswap_stage_rate_limit_gbps = args.hotswap_stage_rate_limit_gib_per_s
     runner.hotswap_stage_chunk_mib = args.hotswap_stage_chunk_mib
+    runner.hotswap_malloc_trim = args.hotswap_malloc_trim
     if args.worker_id is not None:
         runner.worker_id = args.worker_id
     if args.num_workers is not None:
@@ -383,8 +384,6 @@ def run(
     runner.log_rotate = args.log_rotate
     runner.log_rotate_max_bytes = args.log_rotate_max_bytes
     runner.log_rotate_backup_count = args.log_rotate_backup_count
-    if args.sid_endpoint is not None:
-        runner.sid_endpoint = args.sid_endpoint
     if hasattr(runner, "beam_width") and args.beam_width != 1:
         runner.beam_width = args.beam_width
     if hasattr(runner, "decode_levels") and args.decode_levels != 0:
@@ -463,7 +462,16 @@ if __name__ == "__main__":
         "--copy_url",
         type=str,
         default="",
-        help="address of a weight source, typically trainer",
+        help="address of a weight source, typically trainer; an https:// prefix opts into TLS",
+    )
+    parser.add_argument("--copy_tls_ca", type=str, default="", help="CA PEM verifying the server")
+    parser.add_argument("--copy_tls_cert", type=str, default="", help="client cert PEM (mTLS)")
+    parser.add_argument("--copy_tls_key", type=str, default="", help="client key PEM (mTLS)")
+    parser.add_argument(
+        "--copy_tls_server_name",
+        type=str,
+        default="",
+        help="hostname-verification override matching a server cert SAN",
     )
     parser.add_argument(
         "--grpc_port",
@@ -639,17 +647,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_pinned_d2h",
         type=str2bool,
-        default=False,
+        default=True,
         help="Use CUDA pinned host memory for D2H transfer (~50 GB/s vs JAX's ~3 GB/s). "
-        "Saves ~29ms/inference.",
+        "Saves ~29ms/inference. Default True; pass False to opt out.",
     )
     parser.add_argument(
         "--pinned_d2h_num_buffers",
         type=int,
         default=3,
-        help="Number of pinned host buffers per output shape when --use_pinned_d2h is enabled. "
-        "Only needs to cover the Python pipeline depth (not Rust reply threads) since "
-        "reply_request() copies into heap memory before donating to Rust.",
+        help="Floor for the number of pinned host buffers per output shape when "
+        "--use_pinned_d2h is enabled; the runner auto-raises it to "
+        "len(retrieval_dataset_types)+1 to cover all transfers within one batch.",
     )
     parser.add_argument(
         "--embedding_gather_threads",
@@ -705,6 +713,14 @@ if __name__ == "__main__":
         help="Cap the live-swap host->GPU staging bandwidth in GiB/s so staging "
         "does not starve per-request embedding H2D. None = unlimited / single "
         "device_put per leaf (default). Only used by the live swap path.",
+    )
+    parser.add_argument(
+        "--hotswap_malloc_trim",
+        type=str2bool,
+        default=True,
+        help="glibc malloc_trim(0) on the coordinator thread after each applied "
+        "hotswap; returns the cycle's freed pages (glibc slots otherwise "
+        "ratchet ~196 MiB/cycle). No-op under jemalloc.",
     )
     parser.add_argument(
         "--hotswap_stage_chunk_mib",
@@ -787,16 +803,6 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--sid_endpoint",
-        type=str,
-        default=None,
-        help=(
-            "gRPC endpoint of the SID service for SID-aware retrieval inference. "
-            "Required when the model uses use_post_sid=True. The endpoint must match "
-            "the model's trained sid_codebook_size."
-        ),
-    )
-    parser.add_argument(
         "--jax_compilation_cache_dir",
         type=str,
         default=os.environ.get("JAX_COMPILATION_CACHE_DIR", ""),
@@ -845,5 +851,13 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    for flag, env in (
+        ("copy_tls_ca", "COPY_PORT_TLS_CA"),
+        ("copy_tls_cert", "COPY_PORT_TLS_CERT"),
+        ("copy_tls_key", "COPY_PORT_TLS_KEY"),
+        ("copy_tls_server_name", "COPY_PORT_TLS_SERVER_NAME"),
+    ):
+        if value := getattr(args, flag):
+            os.environ[env] = value
     pin_visible_devices(args.num_devices_per_process)
     run(args=args)

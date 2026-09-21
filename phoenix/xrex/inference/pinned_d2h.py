@@ -41,6 +41,8 @@ class PinnedD2HBuffer:
 
         self._buf_idx = 0
 
+        self._transfers_since_cycle: int | None = None
+
         logger.info(
             f"PinnedD2HBuffer: allocated {num_buffers * self._nbytes / 1024 / 1024:.1f} MB "
             f"pinned memory ({num_buffers}x{self._nbytes / 1024 / 1024:.1f} MB ring) "
@@ -64,6 +66,14 @@ class PinnedD2HBuffer:
         assert len(shards) == self._num_shards, (
             f"Expected {self._num_shards} shards, got {len(shards)}"
         )
+
+        if self._transfers_since_cycle is not None:
+            self._transfers_since_cycle += 1
+            if self._transfers_since_cycle > self._num_buffers:
+                raise RuntimeError(
+                    f"PinnedD2HBuffer ring overflow: more than {self._num_buffers} transfers "
+                    f"in one cycle for shape {self._shape} — would overwrite a live view."
+                )
 
         buf_idx = self._buf_idx
         self._buf_idx = (self._buf_idx + 1) % self._num_buffers
@@ -92,6 +102,9 @@ class PinnedD2HBuffer:
             cp.cuda.runtime.streamSynchronize(0)
 
         return self._outs[buf_idx]
+
+    def begin_cycle(self) -> None:
+        self._transfers_since_cycle = 0
 
     def __del__(self) -> None:
         pass

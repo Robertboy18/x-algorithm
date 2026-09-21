@@ -1,4 +1,5 @@
 mod following_ad_blender;
+mod multi_risk_blender;
 mod partition_organic_blender;
 mod safe_gap_blender;
 #[cfg(test)]
@@ -7,6 +8,7 @@ mod time_gap_blender;
 pub(crate) mod util;
 
 pub use following_ad_blender::FollowingAdBlender;
+pub use multi_risk_blender::MultiRiskAdsBlender;
 pub use partition_organic_blender::PartitionOrganicAdsBlender;
 pub use safe_gap_blender::SafeGapAdsBlender;
 pub use time_gap_blender::{TimeGapAdsBlender, TimeGapConfig};

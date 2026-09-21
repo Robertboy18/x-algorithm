@@ -27,10 +27,9 @@ where
     V: Clone,
 {
     pub(crate) fn with_clock(capacity: usize, clock: Clock) -> Self {
-        Self {
-            cache: Cache::new(capacity),
-            clock,
-        }
+        let cache = Cache::new(capacity);
+        cache.reserve(capacity);
+        Self { cache, clock }
     }
 
     pub(crate) fn get(&self, key: &K) -> Lookup<V> {

@@ -6,7 +6,7 @@ use super::new_tweets_pill::build_new_tweets_pill_instruction;
 use super::post_marshaller::marshal_post;
 use super::prompt_marshaller::{marshal_prompt, PromptUrtResult};
 use super::wtf_marshaller::marshal_wtf;
-use crate::models::query::FollowingPaginationMeta;
+use crate::models::query::{FollowingPaginationMeta, RequestType};
 use cursors::{build_cursors, initial_sort_index as compute_initial_sort_index};
 use xai_home_mixer_proto::feed_item::Item as FeedItemKind;
 use xai_home_mixer_proto::FeedItem;
@@ -35,6 +35,7 @@ pub(crate) fn make_urt_timeline(
         cursor,
         language_code,
         country_code,
+        false,
     )
     .into_iter()
     .collect();
@@ -53,10 +54,17 @@ pub(crate) fn make_urt_timeline(
                     ))
                 }
             }
-            Some(FeedItemKind::Ad(ad)) => Some(marshal_ad(ad, feed_item.position as i64)),
-            Some(FeedItemKind::WhoToFollow(wtf)) => {
-                marshal_wtf(wtf, feed_item.position as i64, client_app_id)
-            }
+            Some(FeedItemKind::Ad(ad)) => Some(marshal_ad(
+                ad,
+                feed_item.position as i64,
+                RequestType::Following,
+            )),
+            Some(FeedItemKind::WhoToFollow(wtf)) => marshal_wtf(
+                wtf,
+                feed_item.position as i64,
+                client_app_id,
+                initial_sort_index,
+            ),
             Some(FeedItemKind::Prompt(module)) => {
                 match marshal_prompt(module, feed_item.position as i64) {
                     Some(PromptUrtResult::Entry(entry)) => Some(entry),

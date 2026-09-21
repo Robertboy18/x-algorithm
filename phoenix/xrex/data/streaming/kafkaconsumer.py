@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import asyncio
+import dataclasses
 import enum
 import gc
 import io
@@ -30,6 +31,87 @@ def parse_positive_action_indices(value: str) -> tuple[int, ...]:
     if not value:
         return ()
     return tuple(int(part) for part in value.split(",") if part)
+
+
+@dataclasses.dataclass(frozen=True)
+class KafkaAuth:
+    mode: str
+    ca_path: str | None = None
+    cert_path: str | None = None
+    key_path: str | None = None
+    sasl_mechanism: str | None = None
+    sasl_username: str | None = None
+    sasl_password: str | None = None
+    verify_broker: bool = False
+
+    @classmethod
+    def mtls(
+        cls,
+        ca_path: str | None,
+        cert_path: str,
+        key_path: str,
+        verify_broker: bool = False,
+    ) -> "KafkaAuth":
+        return cls(
+            mode="mtls",
+            ca_path=ca_path,
+            cert_path=cert_path,
+            key_path=key_path,
+            verify_broker=verify_broker,
+        )
+
+    @classmethod
+    def sasl(cls, mechanism: str, username: str, password: str) -> "KafkaAuth":
+        return cls(
+            mode="sasl",
+            sasl_mechanism=mechanism,
+            sasl_username=username,
+            sasl_password=password,
+        )
+
+    def ssl_context(self) -> ssl.SSLContext:
+        if self.mode == "mtls":
+            if not (self.cert_path and self.key_path):
+                raise ValueError("mTLS KafkaAuth is missing cert/key paths")
+            ctx = (
+                ssl.create_default_context(cafile=self.ca_path)
+                if (self.verify_broker and self.ca_path)
+                else ssl.create_default_context()
+            )
+            ctx.load_cert_chain(certfile=self.cert_path, keyfile=self.key_path)
+            ctx.check_hostname = False
+            if not self.verify_broker:
+                ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def consumer_kwargs(self) -> dict[str, Any]:
+        ctx = self.ssl_context()
+        if self.mode == "mtls":
+            return {"security_protocol": "SSL", "ssl_context": ctx}
+        return {
+            "security_protocol": "SASL_SSL",
+            "sasl_kerberos_domain_name": "kafka",
+            "sasl_kerberos_service_name": "kafka",
+            "sasl_mechanism": self.sasl_mechanism,
+            "sasl_plain_username": self.sasl_username,
+            "sasl_plain_password": self.sasl_password,
+            "ssl_context": ctx,
+        }
+
+
+def _coerce_auth(
+    auth: KafkaAuth | None,
+    sasl_mechanism: str,
+    sasl_plain_username: str,
+    sasl_plain_password: str,
+) -> KafkaAuth:
+    if auth is not None:
+        return auth
+    return KafkaAuth.sasl(sasl_mechanism, sasl_plain_username, sasl_plain_password)
 
 
 def _has_positive_candidate(
@@ -432,20 +514,13 @@ async def discover_partition_count(
     sasl_mechanism: str,
     sasl_plain_username: str,
     sasl_plain_password: str,
+    auth: KafkaAuth | None = None,
 ) -> int:
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
+    auth = _coerce_auth(auth, sasl_mechanism, sasl_plain_username, sasl_plain_password)
 
     consumer = AIOKafkaConsumer(
         bootstrap_servers=bootstrap_servers,
-        security_protocol="SASL_SSL",
-        sasl_kerberos_domain_name="kafka",
-        sasl_kerberos_service_name="kafka",
-        sasl_mechanism=sasl_mechanism,
-        sasl_plain_username=sasl_plain_username,
-        sasl_plain_password=sasl_plain_password,
-        ssl_context=ssl_ctx,
+        **auth.consumer_kwargs(),
         request_timeout_ms=30000,
     )
     await consumer.start()
@@ -752,10 +827,9 @@ async def _consumer_poll_loop(
     drop_controller: DropModeController | None,
     metric_attrs: dict[str, str],
     reset_to_latest_event: asyncio.Event | None = None,
+    auth: KafkaAuth | None = None,
 ) -> None:
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
+    auth = _coerce_auth(auth, sasl_mechanism, sasl_plain_username, sasl_plain_password)
 
     consumer_metric_attrs = {**metric_attrs, "consumer_index": str(consumer_index)}
 
@@ -766,13 +840,7 @@ async def _consumer_poll_loop(
         auto_offset_reset=auto_offset_reset,
         enable_auto_commit=True,
         auto_commit_interval_ms=KAFKA_AUTO_COMMIT_INTERVAL_MS,
-        security_protocol="SASL_SSL",
-        sasl_kerberos_domain_name="kafka",
-        sasl_kerberos_service_name="kafka",
-        sasl_mechanism=sasl_mechanism,
-        sasl_plain_username=sasl_plain_username,
-        sasl_plain_password=sasl_plain_password,
-        ssl_context=ssl_ctx,
+        **auth.consumer_kwargs(),
         partition_assignment_strategy=[StickyPartitionAssignor],
         fetch_max_bytes=KAFKA_MAX_FETCH_BYTES,
         fetch_min_bytes=KAFKA_MIN_FETCH_BYTES,
@@ -963,20 +1031,13 @@ async def _consume_multi_consumer(
     reset_to_latest_event: threading.Event | None = None,
     negative_downsample_rate: int = 1,
     negative_downsample_positive_action_indices: str = DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES,
+    auth: KafkaAuth | None = None,
 ) -> None:
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
+    auth = _coerce_auth(auth, sasl_mechanism, sasl_plain_username, sasl_plain_password)
 
     discovery_consumer = AIOKafkaConsumer(
         bootstrap_servers=bootstrap_servers,
-        security_protocol="SASL_SSL",
-        sasl_kerberos_domain_name="kafka",
-        sasl_kerberos_service_name="kafka",
-        sasl_mechanism=sasl_mechanism,
-        sasl_plain_username=sasl_plain_username,
-        sasl_plain_password=sasl_plain_password,
-        ssl_context=ssl_ctx,
+        **auth.consumer_kwargs(),
         request_timeout_ms=30000,
     )
     await discovery_consumer.start()
@@ -1058,6 +1119,7 @@ async def _consume_multi_consumer(
                 sasl_mechanism=sasl_mechanism,
                 sasl_plain_username=sasl_plain_username,
                 sasl_plain_password=sasl_plain_password,
+                auth=auth,
                 reset_to_latest=reset_to_latest,
                 seek_to_timestamp_ms=seek_to_timestamp_ms,
                 seek_to_offset=seek_to_offset,
@@ -1160,6 +1222,7 @@ async def consume_messages(
     sasl_mechanism: str,
     sasl_plain_username: str,
     sasl_plain_password: str,
+    auth: KafkaAuth | None = None,
     reset_to_latest: bool = False,
     seek_to_timestamp_ms: int | None = None,
     seek_to_offset: dict[int, int] | None = None,
@@ -1175,6 +1238,7 @@ async def consume_messages(
     negative_downsample_rate: int = 1,
     negative_downsample_positive_action_indices: str = DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES,
 ):
+    auth = _coerce_auth(auth, sasl_mechanism, sasl_plain_username, sasl_plain_password)
     metric_attrs = {
         "training_name": training_name,
         "topic": topic,
@@ -1196,6 +1260,7 @@ async def consume_messages(
             sasl_mechanism=sasl_mechanism,
             sasl_plain_username=sasl_plain_username,
             sasl_plain_password=sasl_plain_password,
+            auth=auth,
             reset_to_latest=reset_to_latest,
             seek_to_timestamp_ms=seek_to_timestamp_ms,
             seek_to_offset=seek_to_offset,
@@ -1212,9 +1277,6 @@ async def consume_messages(
         )
         return
 
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
     group_instance_id = f"shard_{shard_index}_of_{num_shards}"
     total_fetched_batch_count = 0
 
@@ -1225,13 +1287,7 @@ async def consume_messages(
         auto_offset_reset=auto_offset_reset,
         enable_auto_commit=True,
         auto_commit_interval_ms=KAFKA_AUTO_COMMIT_INTERVAL_MS,
-        security_protocol="SASL_SSL",
-        sasl_kerberos_domain_name="kafka",
-        sasl_kerberos_service_name="kafka",
-        sasl_mechanism=sasl_mechanism,
-        sasl_plain_username=sasl_plain_username,
-        sasl_plain_password=sasl_plain_password,
-        ssl_context=ssl_context,
+        **auth.consumer_kwargs(),
         partition_assignment_strategy=[StickyPartitionAssignor],
         fetch_max_bytes=KAFKA_MAX_FETCH_BYTES,
         fetch_min_bytes=KAFKA_MIN_FETCH_BYTES,

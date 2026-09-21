@@ -1,4 +1,3 @@
-import os
 import struct
 import uuid
 import asyncio
@@ -13,6 +12,7 @@ from kafka_cli.config import KafkaMessage
 from grox.config.config import grox_config
 from kafka_cli.consumer import KafkaConsumer
 from kafka_cli.multi_region_consumer import MultiRegionKafkaConsumer
+from limits import RateLimitItemPerSecond, storage, strategies
 from grox.core.data_loaders.data_types import Post
 from grox.core.data_loaders.message_queue_loader import (
     MessageQueueLoader,
@@ -27,6 +27,7 @@ from thrifts.gen.twitter.strato.columns.content_understanding.content_understand
 
 logger = logging.getLogger(__name__)
 MAX_WORKING_THREADS = 12
+_limiter = strategies.FixedWindowRateLimiter(storage.MemoryStorage())
 
 
 def parse_native_encoding(data: bytes) -> int:
@@ -51,24 +52,11 @@ class KafkaLoader(MessageQueueLoader):
             self.consumer = MultiRegionKafkaConsumer(self.consumer_config)
         else:
             self.consumer_config = grox_config.get_kafka_consumer_topic(topic_name)
-            self._maybe_inject_scram_password(self.consumer_config)
             self.consumer = KafkaConsumer(self.consumer_config)
         self.queue: asyncio.Queue[MessageQueuePayload] = asyncio.Queue()
         self._prefetcher_task: asyncio.Task | None = None
-
-    @staticmethod
-    def _maybe_inject_scram_password(consumer_config) -> None:
-        ssl_conf = consumer_config.ssl
-        if ssl_conf is None or not ssl_conf.sasl_mechanism.startswith("SCRAM"):
-            return
-        if ssl_conf.sasl_plain_password:
-            return
-        password = os.environ.get("KAFKA_RECSYS_PASSWORD")
-        if not password:
-            raise RuntimeError(
-                "KAFKA_RECSYS_PASSWORD env var is required for SCRAM auth but is not set."
-            )
-        ssl_conf.sasl_plain_password = password
+        self._max_qps_per_partition = self.loader_config.max_qps_per_partition
+        self._limit_item: RateLimitItemPerSecond | None = None
 
     def _is_shutdown(self) -> bool:
         try:
@@ -100,20 +88,44 @@ class KafkaLoader(MessageQueueLoader):
         await self.consumer.stop()
         logger.warning(f"KafkaLoader stopped, topic: {self.topic_name}")
 
+    def _current_limit(self) -> RateLimitItemPerSecond | None:
+        if not self._max_qps_per_partition:
+            return None
+        partitions = self.consumer.assigned_partitions
+        if partitions <= 0:
+            return self._limit_item
+        amount = self._max_qps_per_partition * partitions
+        if self._limit_item is None or self._limit_item.amount != amount:
+            self._limit_item = RateLimitItemPerSecond(amount, 1)
+        return self._limit_item
+
     async def poll(self) -> AsyncGenerator[MessageQueuePayload | None, None]:
         while not self._shutdown_event.is_set() or not self.queue.empty():
+            limit = self._current_limit()
+            if (
+                limit
+                and not self._shutdown_event.is_set()
+                and not _limiter.test(limit, self.topic_name)
+            ):
+                yield None
+                continue
             try:
-                yield self.queue.get_nowait()
+                payload = self.queue.get_nowait()
             except asyncio.QueueEmpty:
                 logger.debug(
                     f"Queue is empty, waiting for prefetcher to fill, topic: {self.topic_name}"
                 )
                 yield None
+                continue
             except Exception:
                 logger.error(
                     f"Error polling from kafka, topic: {self.topic_name}, error: {traceback.format_exc()}"
                 )
                 yield None
+                continue
+            if limit:
+                _limiter.hit(limit, self.topic_name)
+            yield payload
 
     async def ack(self, mid: str, success: bool = True):
         pass

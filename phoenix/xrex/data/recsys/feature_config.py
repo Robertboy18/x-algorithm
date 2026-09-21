@@ -33,11 +33,15 @@ COMPUTED_CATEGORICAL_FEATURE_NAMES: frozenset[str] = frozenset(
     }
 )
 
+COMPUTED_BOOL_FEATURE_NAMES: frozenset[str] = frozenset({"isStalePost14d"})
+
 AUTHOR_NSFW_BIT = 2
 
 
 class BoolFeature(enum.IntEnum):
-    pass
+    isStalePost14d = 0
+    isAuthorFollowedByViewerSeq = 1
+    isAuthorFollowingViewerSeq = 2
 
 
 class FloatFeature(enum.IntEnum):
@@ -53,6 +57,21 @@ class Int64Feature(enum.IntEnum):
     quoteCountSeq = 8
     viewCountSeq = 9
     ipAddressSeq = 10
+    firstDpaProductKey = 11
+    firstDpaProductKeyHash2 = 12
+
+
+COMPUTED_INT64_FEATURE_NAMES: frozenset[str] = frozenset({"firstDpaProductKeyHash2"})
+
+
+ADS_PRODUCT_KEY_TABLE_SIZE = 10_000_000
+ADS_PRODUCT_KEY_HASH_SCALE = 1_566_083_941
+ADS_PRODUCT_KEY_HASH_BIAS = 774_047_449
+ADS_PRODUCT_KEY_HASH_SCALE_2 = 1_204_318_477
+ADS_PRODUCT_KEY_HASH_BIAS_2 = 393_342_739
+ADS_PRODUCT_KEY_HASH_MODULUS = 2_147_483_647
+
+STALE_POST_14D_TTL_SEC = 1_213_200
 
 
 CATEGORICAL_FEATURES: list[str] = [f.name for f in CategoricalFeature]
@@ -115,7 +134,29 @@ BASE_REQUIRED_COLUMNS: list[str] = [
 ]
 
 
+OPTIONAL_COLUMNS: list[str] = [
+    "searchQueryEmbeddingSeq",
+    "lineItemObjectiveSeq",
+    "safetyLabelMaskSeq",
+    "semanticIdSeq",
+    "sampleWeight",
+    "firstDpaProductKey",
+    "authorFollowerCountSeq",
+    "inReplyToPostIdSeq",
+    "sample_source",
+    "valueLabelValidSeq",
+    "valueBaselineMeanUsdSeq",
+    "conversionKeepMask",
+]
+
+
 def _build_required_columns() -> list[str]:
+    excluded_names = (
+        COMPUTED_CATEGORICAL_FEATURE_NAMES
+        | COMPUTED_INT64_FEATURE_NAMES
+        | COMPUTED_BOOL_FEATURE_NAMES
+        | set(OPTIONAL_COLUMNS)
+    )
     seen: set[str] = set()
     result: list[str] = []
     for col in BASE_REQUIRED_COLUMNS:
@@ -133,20 +174,10 @@ def _build_required_columns() -> list[str]:
         USER_INT64_FEATURES,
     ):
         for col in feature_list:
-            if col not in seen and col not in COMPUTED_CATEGORICAL_FEATURE_NAMES:
+            if col not in seen and col not in excluded_names:
                 result.append(col)
                 seen.add(col)
     return result
 
 
 REQUIRED_COLUMNS: list[str] = _build_required_columns()
-
-OPTIONAL_COLUMNS: list[str] = [
-    "searchQueryEmbeddingSeq",
-    "lineItemObjectiveSeq",
-    "safetyLabelMaskSeq",
-    "semanticIdSeq",
-    "sampleWeight",
-    "authorFollowerCountSeq",
-    "inReplyToPostIdSeq",
-]

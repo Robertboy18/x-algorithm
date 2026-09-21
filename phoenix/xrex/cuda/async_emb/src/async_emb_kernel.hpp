@@ -18,15 +18,19 @@ struct AdagradParams {
   float eps;
   float decay;
   float inv_emb_width;
+  float weight_decay_factor;
+  float accum_decay_rate;
+  float weight_decay_rate;
 };
 
 struct UpdateScalars {
   float norm;
   int32_t valid;
   int32_t pending;
+  int32_t step;
 };
 
-static_assert(sizeof(UpdateScalars) == 3 * sizeof(int32_t));
+static_assert(sizeof(UpdateScalars) == 4 * sizeof(int32_t));
 
 void launch_lookup_dispatch(
     const int32_t* token_ids_all,
@@ -66,6 +70,7 @@ void launch_rowwise_adagrad_apply(
     const float* row_sq_sums,
     const int32_t* unique_tokens,
     float* row_state,
+    int32_t* last_step,
     __nv_bfloat16* table_shard,
     int64_t vocab_rows,
     UpdateScalars* scalars,

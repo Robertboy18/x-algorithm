@@ -14,9 +14,11 @@ predicted engagement).
 > infrastructure (production data feeds, cluster orchestration, internal
 > telemetry) — every such seam is replaced by a documented local equivalent,
 > and synthetic data generators are included so the whole system runs end to
-> end with nothing external. One training-recipe exception is disclosed in
-> [TRAINING.md](TRAINING.md): the dense-optimizer slot ships as standard
-> AdamW rather than production's tuned internal variant.
+> end with nothing external. One training-recipe substitution is disclosed in
+> [TRAINING.md](TRAINING.md): for configs on the legacy dense-optimizer
+> slot, the export ships standard AdamW rather than production's tuned
+> internal variant. The flagship ranking configs and the nano twin train
+> the production Muon recipe, which ships in full.
 
 ## Table of Contents
 
@@ -305,7 +307,7 @@ toolchain, `cmake`, `pkg-config`, RDMA verbs headers, bindgen's `libclang`, and
 `numa_num_possible_nodes` warning) — on Debian/Ubuntu:
 
 ```shell
-apt update && apt install build-essential cmake pkg-config unzip \
+apt update && apt install build-essential ca-certificates cmake curl pkg-config unzip \
     libibverbs-dev libnl-3-dev libnl-route-3-dev libclang-dev libnuma-dev
 ```
 
@@ -407,7 +409,7 @@ retrieval):
 | IP-address vocab | 10M | 10k | — | — |
 | Hashes per entity | 2 | 2 | 2 | 2 |
 | Semantic IDs | 6 × 256 (input feature) | 6 × 256 (input feature) | 6 × 256 (candidate identity) | 6 × 256 (candidate identity) |
-| Multimodal post embedding | v5 on `xrecsys_seqpack`; off on `home_direct_packed` | — | — | — |
+| Multimodal post embedding | off (`home_direct_packed` and `xrecsys_seqpack`) | — | — | — |
 | SID cross-attention | no | no | yes | yes |
 | Discrete action taxonomy | 64 | 64 | 64 (positives: favorite) | 64 (positives: favorite) |
 | Continuous-action heads (dwell) | 8 slots | 8 slots | — (dwell input on combined only) | — |
@@ -420,8 +422,8 @@ contract, and `emb_size=512` is the μP base width — the transformer trunk's
 width-dependent LR/scale multipliers are exactly 1 there. The ranking nano
 exercises the same input code paths as its production parent
 (`home_direct_packed`), feature prep included — the multimodal-embedding
-input is off in both, and is enabled only on the `xrecsys_seqpack` training
-config, as the table shows;
+input is off in both, and on every registered ranking config, as the table
+shows;
 the retrieval nano uses the flagship's `enable_linear_proj` candidate
 combine (a small concat-then-MLP) and trains unpacked (dense attention), as
 the table shows.

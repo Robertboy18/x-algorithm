@@ -97,19 +97,19 @@ _ENFORCEMENT_TEMPLATES = {
 }
 
 
-def build_enforcement_note(head_scores_list, action_hist_list):
+def build_enforcement_note(head_scores_list, action_hist_list, min_actions):
     """Build an enforcement note from head scores + action histogram.
 
     Returns None when no bot head is above 0.5 or the sequence is shorter
-    than 30 actions. In this public release the note is the sentinel
-    "<redacted>" plus a model-head suffix; production interpolates from a
-    private template table (prose and key_actions).
+    than `min_actions` (the policy min-actions gate). In this public release
+    the note is the sentinel "<redacted>" plus a model-head suffix; production
+    interpolates from a private template table (prose and key_actions).
     """
     if not head_scores_list:
         return None
 
     total = sum(h["cnt"] for h in (action_hist_list or ()))
-    if total < 30:
+    if total < min_actions:
         return None
 
     bot_heads = [
@@ -220,7 +220,7 @@ _CUSP_BUCKET_LABELS = _CHALLENGE_ARKOSE_CAPTCHA
 class SinkPolicy:
     version: str = "baked-in-defaults"
     source: str = "defaults"
-    min_actions_for_enforcement: int = 30
+    min_actions_for_enforcement: int = 999999
     thresholds: dict = field(
         default_factory=lambda: {
             "FollowBot": (9.99, 9.99),
@@ -358,9 +358,9 @@ def _parse_args():
     parser.add_argument(
         "--min-actions-for-long-cooldown",
         type=int,
-        default=30,
+        default=None,
         help="Action-count threshold separating short vs long cooldown buckets. "
-        "Default matches MIN_ACTIONS_FOR_ENFORCEMENT (30).",
+        "Defaults to the policy min-actions enforcement gate.",
     )
     parser.add_argument(
         "--bq-project", default="your-gcp-project", help="GCP project for the scores table."
@@ -1138,7 +1138,15 @@ def _spam_bounce_lane(
 
 
 def _build_bq_row(
-    uid_int, score_id, now_ts, user_head_scores, user_action_hist, user_labels, bsummary, args
+    uid_int,
+    score_id,
+    now_ts,
+    user_head_scores,
+    user_action_hist,
+    user_labels,
+    bsummary,
+    args,
+    min_note_actions,
 ):
     total_actions = None
     if user_action_hist:
@@ -1165,7 +1173,9 @@ def _build_bq_row(
         "head_scores": user_head_scores,
         "action_histogram": user_action_hist,
         "total_actions": total_actions,
-        "enforcement_note": build_enforcement_note(user_head_scores, user_action_hist),
+        "enforcement_note": build_enforcement_note(
+            user_head_scores, user_action_hist, min_note_actions
+        ),
         "labels": user_labels,
         "model_version": args.model_version,
         "pipeline_version": "gpu_scorer_kafka_v3",
@@ -1491,7 +1501,11 @@ def main():
     r = redis_lib.Redis(host=args.redis_host, port=args.redis_port)
     cooldown_low_sec = int(args.cooldown_low_hours * 3600)
     cooldown_high_sec = int(args.cooldown_high_hours * 3600)
-    cooldown_threshold = args.min_actions_for_long_cooldown
+    cooldown_threshold = (
+        args.min_actions_for_long_cooldown
+        if args.min_actions_for_long_cooldown is not None
+        else pol.min_actions_for_enforcement
+    )
     try:
         r.ping()
         log.info(
@@ -1637,6 +1651,7 @@ def main():
                     user_labels,
                     bsummary,
                     args,
+                    pol.min_actions_for_enforcement,
                 )
                 bq_buffer.append(row)
 

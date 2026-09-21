@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 X.AI Corp.
 use crate::model_config::ModelConfig;
-use arrow::array::{Array, AsArray, BooleanArray, Float32Array, Int32Array, Int64Array};
+use arrow::array::{
+    Array, AsArray, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
+};
 use arrow::ipc::reader::StreamReader;
 use half::f16;
 use lazy_static::lazy_static;
 use prometheus::{IntCounterVec, register_int_counter_vec};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xai_recsys_proto as pb;
@@ -26,13 +29,94 @@ lazy_static! {
     .unwrap();
 }
 
-fn record_sid_coverage(sequence: &str, present: u64, count: u64) {
+pub const WEB_CONV_FAKE_TWEET_ID: i64 = 4;
+
+pub fn conv_asset_map(ids: Option<&pb::ConvAssetIds>) -> HashMap<(i64, i64), i64> {
+    ids.filter(|ids| {
+        ids.asset_id.len() == ids.author_id.len()
+            && ids.asset_id.len() == ids.impressed_time_ms.len()
+    })
+    .map(|ids| {
+        (0..ids.asset_id.len())
+            .filter(|&i| ids.asset_id[i] > 0)
+            .map(|i| {
+                (
+                    (ids.author_id[i], ids.impressed_time_ms[i]),
+                    ids.asset_id[i],
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+pub fn is_web_conv_row(tweet_id: i64, has_conv_bit: bool) -> bool {
+    tweet_id == WEB_CONV_FAKE_TWEET_ID || has_conv_bit
+}
+
+pub fn conv_asset_ids_for_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    map: &HashMap<(i64, i64), i64>,
+) -> Vec<i64> {
+    let n = batch.num_rows();
+    let mut out = vec![0i64; n];
+    if map.is_empty() {
+        return out;
+    }
+    let col_i64 = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+    };
+    let (Some(tweet_ids), Some(author_ids), Some(impressed_ms)) = (
+        col_i64("tweetId"),
+        col_i64("authorId"),
+        col_i64("impressedTimeMs"),
+    ) else {
+        return out;
+    };
+    let conv_bit = pb::ActionName::AdsWebConversion as usize;
+    let multi_hot = batch
+        .column_by_name("actionNameMultiHot")
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
+        .filter(|fsl| conv_bit < fsl.value_length() as usize);
+    let (bools, vocab) = match multi_hot {
+        Some(fsl) => (
+            fsl.values().as_any().downcast_ref::<BooleanArray>(),
+            fsl.value_length() as usize,
+        ),
+        None => (None, 0),
+    };
+    for (row, slot) in out.iter_mut().enumerate() {
+        let has_conv_bit = bools.is_some_and(|b| b.value(row * vocab + conv_bit));
+        if is_web_conv_row(tweet_ids.value(row), has_conv_bit)
+            && let Some(&asset_id) = map.get(&(author_ids.value(row), impressed_ms.value(row)))
+        {
+            *slot = asset_id;
+        }
+    }
+    out
+}
+
+pub fn record_sid_coverage(sequence: &str, present: u64, count: u64) {
     SID_COVERAGE_TOTAL
         .with_label_values(&[sequence, "present"])
         .inc_by(present);
     SID_COVERAGE_TOTAL
         .with_label_values(&[sequence, "missing"])
         .inc_by(count.saturating_sub(present));
+}
+
+pub fn stamp_semantic_ids(dst: &mut [u16], entry_idx: usize, sid_num_levels: usize, codes: &[i32]) {
+    if sid_num_levels > 0 && codes.len() == sid_num_levels {
+        let base = entry_idx * sid_num_levels;
+        for (d, &c) in dst[base..base + sid_num_levels]
+            .iter_mut()
+            .zip(codes.iter())
+        {
+            *d = (c + 1) as u16;
+        }
+    }
 }
 
 use crate::feature_config::bool_feature::{
@@ -269,6 +353,7 @@ pub struct UserFeatures {
     pub installed_apps: Vec<bool>,
 }
 
+#[derive(Default)]
 pub struct InputBuffer {
     pub user_hashes: Vec<i32>,
     pub user_ip_hashes: Vec<i32>,
@@ -319,6 +404,30 @@ pub struct InputBuffer {
     pub num_history: usize,
 }
 
+pub fn repeat_query_into(dest: &mut [f32], query: &[f32], n_slots: usize) {
+    let dim = query.len();
+    if dim == 0 || dest.is_empty() || n_slots == 0 {
+        return;
+    }
+    let max_slots = dest.len() / dim;
+    let n = n_slots.min(max_slots);
+    for i in 0..n {
+        let off = i * dim;
+        dest[off..off + dim].copy_from_slice(query);
+    }
+}
+
+impl InputBuffer {
+    pub fn num_real_candidates(&self, num_item_hashes: usize, cap: usize) -> usize {
+        let w = num_item_hashes.max(1);
+        self.candidate_post_hashes
+            .chunks(w)
+            .take(cap)
+            .take_while(|ch| ch.first().is_some_and(|&h| h != 0))
+            .count()
+    }
+}
+
 struct CandidateData {
     post_hashes: Vec<i32>,
     auth_hashes: Vec<i32>,
@@ -346,7 +455,7 @@ impl InputBuffer {
         let num_author_hashes = model_config.hash_table.num_author_hashes();
         let num_item_hashes = model_config.hash_table.num_item_hashes();
         let candidate_seq_len = model_config.candidate_seq_len;
-        let search_query_embedding_dim = model_config.hash_table.search_query_embedding_dim;
+        let search_query_embedding_dim = model_config.search_query_embedding_dim;
 
         let mut candidate_post_hashes = vec![0i32; candidate_seq_len * num_item_hashes];
         let mut candidate_auth_hashes = vec![0i32; candidate_seq_len * num_author_hashes];
@@ -397,15 +506,12 @@ impl InputBuffer {
                 candidate_funding_instrument_ids[j] = ad.funding_instrument_id;
             }
 
-            if sid_num_levels > 0 && candidate.semantic_ids.len() == sid_num_levels {
-                let base = j * sid_num_levels;
-                for (d, &c) in candidate_semantic_ids[base..base + sid_num_levels]
-                    .iter_mut()
-                    .zip(candidate.semantic_ids.iter())
-                {
-                    *d = (c + 1) as u16;
-                }
-            }
+            stamp_semantic_ids(
+                &mut candidate_semantic_ids,
+                j,
+                sid_num_levels,
+                &candidate.semantic_ids,
+            );
         }
 
         if sid_num_levels > 0 {
@@ -415,19 +521,19 @@ impl InputBuffer {
             record_sid_coverage("candidate", present, candidates_to_process as u64);
         }
 
-        let mut candidate_search_query_embeddings =
-            vec![0.0f32; candidate_seq_len * search_query_embedding_dim];
-        if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
-            let provided_dim = candidate_set.search_query_embedding.len();
-            if provided_dim == search_query_embedding_dim {
-                for j in 0..candidates_to_process {
-                    let base_idx = j * search_query_embedding_dim;
-                    candidate_search_query_embeddings
-                        [base_idx..base_idx + search_query_embedding_dim]
-                        .copy_from_slice(&candidate_set.search_query_embedding);
-                }
+        let candidate_search_query_embeddings = if search_query_embedding_dim > 0
+            && candidate_set.search_query_embedding.len() == search_query_embedding_dim
+        {
+            candidate_set.search_query_embedding.clone()
+        } else {
+            if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
+                log::error!(
+                    "search_query_embedding dim {} != model {search_query_embedding_dim}; leaving empty",
+                    candidate_set.search_query_embedding.len()
+                );
             }
-        }
+            Vec::new()
+        };
 
         let n_post_cat = model_config.hash_table.num_post_categorical_features;
         let n_post_bool = model_config.hash_table.num_post_bool_features;
@@ -622,11 +728,7 @@ impl InputBuffer {
         if let Some(ctx) = user_ctx {
             categorical_features[USER_STATE] = ctx.user_state as i16;
             record_fill("user_state", ctx.user_state != 0);
-            categorical_features[USER_GENDER] = match pb::Gender::try_from(ctx.user_gender) {
-                Ok(pb::Gender::Male) => 2,
-                Ok(pb::Gender::Female) => 1,
-                _ => 0,
-            };
+            categorical_features[USER_GENDER] = ctx.user_gender as i16;
             record_fill("gender", categorical_features[USER_GENDER] != 0);
             categorical_features[USER_AGE_BRACKET] = ctx.user_age_bracket as i16;
             record_fill("age_bracket", ctx.user_age_bracket != 0);
@@ -732,6 +834,8 @@ impl InputBuffer {
         let mut history_is_author_following = vec![false; history_seq_len];
         let mut history_post_ids = vec![0i64; history_seq_len];
         let mut history_int64_features = vec![0i64; history_seq_len * n_post_int64];
+        let sid_num_levels = model_config.sid_num_levels;
+        let mut history_semantic_ids = vec![0u16; history_seq_len * sid_num_levels];
 
         let _empty = Vec::new();
         let agg_user_actions = match sequence {
@@ -772,6 +876,13 @@ impl InputBuffer {
                 }
 
                 history_post_ids[valid_entry_count] = tweet_id;
+
+                stamp_semantic_ids(
+                    &mut history_semantic_ids,
+                    valid_entry_count,
+                    sid_num_levels,
+                    &tweet_info.semantic_ids,
+                );
 
                 let base_idx = valid_entry_count * output_vocab_size;
                 let continuous_base_idx = valid_entry_count * num_continuous_actions;
@@ -866,6 +977,13 @@ impl InputBuffer {
 
                 valid_entry_count += 1;
             }
+        }
+
+        if sid_num_levels > 0 {
+            let present = (0..valid_entry_count)
+                .filter(|&i| history_semantic_ids[i * sid_num_levels] != 0)
+                .count() as u64;
+            record_sid_coverage("history", present, valid_entry_count as u64);
         }
 
         let user_features =
@@ -994,7 +1112,7 @@ impl InputBuffer {
             user_conversion_history_hashes,
             candidate_account_hashes,
             history_post_ids,
-            history_semantic_ids: vec![0u16; history_seq_len * model_config.sid_num_levels],
+            history_semantic_ids,
             candidate_semantic_ids,
             num_history: valid_entry_count,
         }
@@ -1236,19 +1354,17 @@ impl InputBuffer {
 
             history_post_ids[valid_entry_count] = tweet_id;
 
-            if sid_num_levels > 0
-                && let Some(sid_col) = col_semantic_id
-            {
+            if let Some(sid_col) = col_semantic_id {
                 let fsl = sid_col.as_fixed_size_list();
                 if !fsl.is_null(row_idx) {
                     let inner = fsl.value(row_idx);
-                    if let Some(codes) = inner.as_any().downcast_ref::<Int32Array>()
-                        && codes.len() == sid_num_levels
-                    {
-                        let base = valid_entry_count * sid_num_levels;
-                        for d in 0..sid_num_levels {
-                            history_semantic_ids[base + d] = (codes.value(d) + 1) as u16;
-                        }
+                    if let Some(codes) = inner.as_any().downcast_ref::<Int32Array>() {
+                        stamp_semantic_ids(
+                            &mut history_semantic_ids,
+                            valid_entry_count,
+                            sid_num_levels,
+                            codes.values(),
+                        );
                     }
                 }
             }
@@ -1499,6 +1615,78 @@ impl InputBuffer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn conv_asset_ids_for_batch_predicate_and_keys() {
+        use arrow::array::{ArrayRef, BooleanArray, FixedSizeListArray, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let rows = [
+            (11, 21, 111_000, false),
+            (WEB_CONV_FAKE_TWEET_ID, 7, 1_000, false),
+            (555, 8, 2_000, true),
+            (WEB_CONV_FAKE_TWEET_ID, 7, 3_000, false),
+            (WEB_CONV_FAKE_TWEET_ID, 7, 4_000, false),
+        ];
+        let vocab = 256usize;
+        let conv_bit = pb::ActionName::AdsWebConversion as usize;
+        assert!(conv_bit < vocab);
+        let mut bits = vec![false; rows.len() * vocab];
+        for (i, r) in rows.iter().enumerate() {
+            bits[i * vocab + conv_bit] = r.3;
+        }
+        let multi_hot = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            vocab as i32,
+            Arc::new(BooleanArray::from(bits)),
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tweetId", DataType::Int64, false),
+            Field::new("authorId", DataType::Int64, false),
+            Field::new("impressedTimeMs", DataType::Int64, false),
+            Field::new("actionNameMultiHot", multi_hot.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(multi_hot),
+            ],
+        )
+        .unwrap();
+
+        let ids = pb::ConvAssetIds {
+            impressed_time_ms: vec![111_000, 1_000, 2_000, 4_000],
+            author_id: vec![21, 7, 8, 7],
+            asset_id: vec![99, 42, 9, 0],
+        };
+        let map = conv_asset_map(Some(&ids));
+        assert_eq!(map.len(), 3, "asset_id 0 windows are dropped from the map");
+        assert_eq!(conv_asset_ids_for_batch(&batch, &map), vec![0, 42, 9, 0, 0]);
+
+        let ragged = pb::ConvAssetIds {
+            impressed_time_ms: vec![1_000],
+            author_id: vec![7, 8],
+            asset_id: vec![42],
+        };
+        assert!(conv_asset_map(Some(&ragged)).is_empty());
+        assert!(conv_asset_map(None).is_empty());
+        assert_eq!(
+            conv_asset_ids_for_batch(&batch, &HashMap::new()),
+            vec![0; 5]
+        );
+    }
     use super::*;
     use crate::feature_config::categorical_feature::{
         PRODUCT_SURFACE_SEQ, PRODUCT_SURFACE_SEQ_COLUMN, PRODUCT_SURFACE_SEQ_NAME,
@@ -1527,7 +1715,6 @@ mod tests {
                 ip_modulus: 1_073_741_789,
                 output_vocab_size: 64,
                 num_continuous_actions: 2,
-                search_query_embedding_dim: 0,
                 num_user_categorical_features: 0,
                 num_user_bool_features: 0,
                 num_user_float_features: 0,
@@ -1706,6 +1893,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn search_query_stays_one_vector() {
+        let mut model_config = test_model_config(1);
+        model_config.search_query_embedding_dim = 4;
+        let query = vec![1.0f32, 2.0, 3.0, 4.0];
+        let candidate_set = pb::CandidateSet {
+            search_query_embedding: query.clone(),
+            candidates: vec![
+                pb::TweetInfo {
+                    tweet_id: 1000,
+                    author_id: 2000,
+                    ..Default::default()
+                },
+                pb::TweetInfo {
+                    tweet_id: 1001,
+                    author_id: 2001,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
+        assert_eq!(cand.search_query_embeddings, query);
+        assert_eq!(cand.search_query_embeddings.len(), 4);
+    }
+
+    #[test]
+    fn repeat_query_into_writes_prefix_and_keeps_tail() {
+        let query = [1.0f32, 2.0];
+        let mut dest = vec![9.0f32; 8];
+        repeat_query_into(&mut dest, &query, 2);
+        assert_eq!(dest, vec![1.0, 2.0, 1.0, 2.0, 9.0, 9.0, 9.0, 9.0]);
+    }
+
     fn test_user_action_sequence(actions: &[(u64, u64)]) -> pb::UserActionSequence {
         use pb::user_action_sequence_data_container::Data;
         let aggregated_user_actions = actions
@@ -1778,6 +1999,123 @@ mod tests {
             None,
         );
         assert_eq!(0, buf.num_history);
+    }
+
+    #[test]
+    fn proto_history_semantic_ids_use_ranking_plus_one_shift() {
+        let mut model_config = test_history_model_config();
+        model_config.sid_num_levels = 3;
+        let sequence = Some(pb::UserActionSequence {
+            user_actions_data: Some(pb::UserActionSequenceDataContainer {
+                data: Some(
+                    pb::user_action_sequence_data_container::Data::OrderedAggregatedUserActionsList(
+                        pb::AggregatedUserActionList {
+                            aggregated_user_actions: vec![
+                                pb::AggregatedUserAction {
+                                    tweet_info: Some(pb::TweetInfo {
+                                        tweet_id: 11,
+                                        author_id: 21,
+                                        semantic_ids: vec![0, 7, -1],
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                },
+                                pb::AggregatedUserAction {
+                                    tweet_info: Some(pb::TweetInfo {
+                                        tweet_id: 12,
+                                        author_id: 22,
+                                        semantic_ids: vec![3, 4],
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        });
+
+        let buf = InputBuffer::compute_for_item(
+            &model_config,
+            &sequence,
+            &pb::CandidateSet::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            buf.history_semantic_ids,
+            vec![1, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(buf.history_post_ids, vec![11, 12, 0, 0]);
+    }
+
+    #[test]
+    fn stamp_semantic_ids_shifts_and_skips_wrong_arity() {
+        let mut dst = vec![0u16; 6];
+        stamp_semantic_ids(&mut dst, 0, 3, &[0, 7, -1]);
+        stamp_semantic_ids(&mut dst, 1, 3, &[3, 4]);
+        assert_eq!(dst, vec![1, 8, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn columnar_history_semantic_ids_read_semantic_id_column() {
+        use arrow::array::{FixedSizeListArray, Int32Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let item = Arc::new(Field::new("item", DataType::Int32, true));
+        let schema = Schema::new(vec![
+            Field::new("tweetId", DataType::Int64, false),
+            Field::new("authorId", DataType::Int64, false),
+            Field::new("semanticId", DataType::FixedSizeList(item.clone(), 3), true),
+        ]);
+        let sid = FixedSizeListArray::new(
+            item,
+            3,
+            Arc::new(Int32Array::from(vec![0, 7, -1, 3, 4, 5])),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![11i64, 12])),
+                Arc::new(Int64Array::from(vec![21i64, 22])),
+                Arc::new(sid),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let mut model_config = test_history_model_config();
+        model_config.sid_num_levels = 3;
+        let buf = InputBuffer::compute_from_columnar_bytes(
+            &model_config,
+            &bytes,
+            &pb::CandidateSet::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            buf.history_semantic_ids,
+            vec![1, 8, 0, 4, 5, 6, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -2013,5 +2351,21 @@ mod tests {
         assert_eq!(1, cand.int64_features[base1 + FAV_COUNT_SEQ]);
         assert_eq!(5, cand.int64_features[base1 + VIEW_COUNT_SEQ]);
         assert!(!cand.bool_features[n_post_bool + IS_STALE_POST14D]);
+    }
+
+    #[test]
+    fn user_gender_is_raw_proto_enum() {
+        let mut cfg = test_model_config(0).hash_table;
+        cfg.num_user_categorical_features = 7;
+        cfg.num_user_float_features = 4;
+        let gender_idx = crate::feature_config::user_categorical_feature::USER_GENDER;
+        for g in [pb::Gender::Male, pb::Gender::Female, pb::Gender::Unknown] {
+            let ctx = pb::UserContext {
+                user_gender: g as i32,
+                ..Default::default()
+            };
+            let f = InputBuffer::extract_user_features(&cfg, None, Some(&ctx));
+            assert_eq!(f.categorical_features[gender_idx], g as i16, "{g:?}");
+        }
     }
 }

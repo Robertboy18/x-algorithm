@@ -7,11 +7,12 @@ pub mod core_data_hydration_filter;
 pub mod dedup_conversation_filter;
 pub mod drop_duplicates_filter;
 
+pub mod fav_holdout_filter;
 pub mod following_retweet_deduplication_filter;
+pub mod following_viewer_muted_keyword_filter;
 pub mod ineligible_subscription_filter;
 pub mod invalid_conversation_module_filter;
 pub mod inventory_holdout_filter;
-pub mod muted_keyword_filter;
 pub mod new_user_min_engagement_filter;
 pub mod oon_nsfw_simclusters_filter;
 pub mod oon_retweet_reply_filter;
@@ -26,3 +27,4 @@ pub mod self_tweet_filter;
 pub mod topic_ids_filter;
 pub mod vf_filter;
 pub mod video_filter;
+pub mod viewer_muted_keyword_filter;

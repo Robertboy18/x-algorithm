@@ -15,7 +15,11 @@ from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.data.streaming.kafkaconsumer import ConsumerMode, _check_reset_sentinel
 from xrex.data.streaming.kafkaloader import (
     PhoenixKafkaDataset,
-    _resolve_sasl_password,
+    _rearm_catchup_request,
+    _take_catchup_request,
+    auto_detect_auth,
+    platform_ca_bundle_path,
+    system_ca_bundle_path,
 )
 
 
@@ -135,22 +139,38 @@ class RustKafkaDataset(PhoenixKafkaDataset):
         RecordBatchProvider = rust_ext.load("xai_recsys_kafka_reader").RecordBatchProvider
 
         provider: RecordBatchProvider | None = None
-        reset_watcher: threading.Thread | None = None
+        control_watcher: threading.Thread | None = None
 
         try:
-            sasl_password = _resolve_sasl_password(self.bootstrap_servers)
+            auth = auto_detect_auth(
+                self.bootstrap_servers,
+                self.sasl_mechanism,
+                self.sasl_plain_username,
+            )
+            if auth.mode == "mtls":
+                rust_bootstrap = self._resolve_bootstrap_servers(auth)
+            else:
+                rust_bootstrap = self.bootstrap_servers
 
             provider = RecordBatchProvider(
                 topic=self.topic_name,
-                bootstrap_servers=self.bootstrap_servers,
+                bootstrap_servers=rust_bootstrap,
                 group_id=self.group_id,
                 batch_size=batch_size,
                 num_shards=num_shards,
                 shard_index=shard_index,
                 num_partitions=self.num_kafka_partitions,
                 sasl_mechanism=self.sasl_mechanism,
-                sasl_username=self.sasl_plain_username,
-                sasl_password=sasl_password,
+                sasl_username=auth.sasl_username or self.sasl_plain_username,
+                sasl_password=auth.sasl_password or "",
+                security_protocol="SSL" if auth.mode == "mtls" else "SASL_SSL",
+                ssl_ca_location=(
+                    auth.ca_path
+                    if auth.mode != "mtls" or auth.ca_path
+                    else (platform_ca_bundle_path() or system_ca_bundle_path())
+                ),
+                ssl_certificate_location=auth.cert_path,
+                ssl_key_location=auth.key_path,
                 auto_offset_reset=self.auto_offset_reset,
                 queue_size=self.queue_size,
                 reset_to_latest=self.reset_to_latest,
@@ -178,7 +198,7 @@ class RustKafkaDataset(PhoenixKafkaDataset):
             )
 
             in_rebaseline = threading.Event()
-            reset_watcher = self._start_reset_watcher(
+            control_watcher = self._start_control_watcher(
                 provider, stop_event, reset_event, in_rebaseline
             )
 
@@ -240,8 +260,8 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                         line += f" | {drop_status}"
                     rank_logger.info("%s", line)
         finally:
-            if reset_watcher is not None:
-                reset_watcher.join(timeout=2.0)
+            if control_watcher is not None:
+                control_watcher.join(timeout=2.0)
             if reload_thread is not None:
                 reload_thread.join(timeout=5.0)
 
@@ -295,7 +315,7 @@ class RustKafkaDataset(PhoenixKafkaDataset):
         thread.start()
         return thread
 
-    def _start_reset_watcher(
+    def _start_control_watcher(
         self,
         provider,
         stop_event: threading.Event | None,
@@ -312,6 +332,25 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                 else:
                     http_hit = False
                     time.sleep(1.0)
+                catchup_request = _take_catchup_request()
+                if catchup_request is not None:
+                    catchup_generation, catchup_window_secs = catchup_request
+                    try:
+                        deadline_epoch_secs = provider.request_catchup(catchup_window_secs)
+                        rank_logger.info(
+                            "RustKafkaDataset: live catch-up via HTTP endpoint — "
+                            "temporarily engaging drop mode with T=%.0fs "
+                            "(request expires at epoch %.0f)",
+                            catchup_window_secs,
+                            deadline_epoch_secs,
+                        )
+                    except Exception as e:
+                        _rearm_catchup_request(catchup_generation)
+                        rank_logger.error(
+                            "Failed to forward live catch-up request to Rust "
+                            "reader (will retry next tick): %s",
+                            e,
+                        )
                 sentinel_mtime = _check_reset_sentinel(last_reset_ts)
                 if sentinel_mtime is not None:
                     last_reset_ts = sentinel_mtime
@@ -338,7 +377,7 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                         e,
                     )
 
-        thread = threading.Thread(target=watcher, name="rust-kafka-reset-watcher", daemon=True)
+        thread = threading.Thread(target=watcher, name="rust-kafka-control-watcher", daemon=True)
         thread.start()
         return thread
 

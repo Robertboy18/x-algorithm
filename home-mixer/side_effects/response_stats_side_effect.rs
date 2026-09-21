@@ -4,6 +4,10 @@ use crate::util::country_codes::bucket_country;
 use crate::util::feed_log::{count_ads, count_posts, feed_name};
 use std::sync::Arc;
 use tonic::async_trait;
+use xai_candidate_pipeline::component_library::utils::client_utils::{
+    ClientPlatform, RequestContext,
+};
+use xai_candidate_pipeline::component_library::utils::client_version;
 use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_core_entities::entities::SubscriptionLevel;
 use xai_home_mixer_proto::FeedItem;
@@ -40,6 +44,7 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for ResponseStatsSideEffect {
         };
         let feed = feed_name(query.request_type);
 
+        stat_request_context(feed, query);
         stat_response(
             feed,
             &input.selected_candidates,
@@ -117,4 +122,33 @@ fn stat_response(
             receiver.incr(metric, &[TYPE_SUFFICIENT_POSTS, STAGE_FETCHED, sub], 1);
         }
     }
+}
+
+fn stat_request_context(feed: &str, query: &ScoredPostsQuery) {
+    let Some(receiver) = global_stats_receiver() else {
+        return;
+    };
+    let platform = ClientPlatform::from_app_id(query.client_app_id);
+    let client = ("client", platform.stats_client());
+    let client_version = (
+        "client_version",
+        client_version::stats_label(client.1, &query.client_version),
+    );
+    let polling = if query.is_polling { "true" } else { "false" };
+    let request_context = RequestContext::parse(&query.request_context);
+    receiver.incr(
+        &format!("{feed}.request.polling"),
+        &[("polling", polling), client],
+        1,
+    );
+    receiver.incr(
+        &format!("{feed}.request.request_context"),
+        &[("request_context", request_context.as_ref()), client],
+        1,
+    );
+    receiver.incr(
+        &format!("{feed}.request.client"),
+        &[client, client_version],
+        1,
+    );
 }

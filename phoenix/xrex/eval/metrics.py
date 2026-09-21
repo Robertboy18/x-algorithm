@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from xai_configlib import Config, configclass
 
 
-@configclass
+@configclass(kw_only=True)
 class ForwardMetrics(Config):
     @abstractmethod
     def run_batch(self, logits, inputs, targets, mask=None):

@@ -1877,9 +1877,21 @@ class FlashAttentionForwardSm100:
                 )
 
             mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
+            mask_block_union = const_expr(
+                blocksparse_tensors is not None
+                and blocksparse_tensors.valid_block_upper is not None
+                and blocksparse_tensors.valid_block_lower is not None
+            )
             mask_fn = partial(
                 mask.apply_mask_sm100,
                 mask_mod=mask_mod,
+                mask_block_union=mask_block_union,
+                valid_block_upper=(
+                    blocksparse_tensors.valid_block_upper if mask_block_union else None
+                ),
+                valid_block_lower=(
+                    blocksparse_tensors.valid_block_lower if mask_block_union else None
+                ),
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 **shared_mask_kwargs,

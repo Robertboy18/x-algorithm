@@ -8,6 +8,7 @@ import jax
 class RematType(enum.IntEnum):
     WHOLE = 0
     SAVE_GB300_RECSYS = 29
+    SAVE_H100_RECSYS = 32
 
 
 def custom_remat_policy(policy: RematType):
@@ -23,6 +24,22 @@ def custom_remat_policy(policy: RematType):
             "attn",
             "gate_up_proj",
             "dense_up_proj",
+            "query_heads",
+            "key_heads",
+            "value_heads",
+            "scalar_stats",
+        )
+    elif policy == RematType.SAVE_H100_RECSYS:
+        return jax.checkpoint_policies.save_only_these_names(
+            "attn_outputs",
+            "dense_outputs",
+            "dense_outputs_individual",
+            "attn",
+            "gate_up_proj",
+            "dense_up_proj",
+            "query_heads_rope",
+            "key_heads_rope",
+            "cutedsl_attn_outputs",
             "query_heads",
             "key_heads",
             "value_heads",

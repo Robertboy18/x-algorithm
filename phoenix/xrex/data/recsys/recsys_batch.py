@@ -16,11 +16,18 @@ from numpy import typing as npt
 
 from xrex.data.recsys.constants import action_type_map
 from xrex.data.recsys.feature_config import (
+    ADS_PRODUCT_KEY_HASH_BIAS,
+    ADS_PRODUCT_KEY_HASH_BIAS_2,
+    ADS_PRODUCT_KEY_HASH_MODULUS,
+    ADS_PRODUCT_KEY_HASH_SCALE,
+    ADS_PRODUCT_KEY_HASH_SCALE_2,
+    ADS_PRODUCT_KEY_TABLE_SIZE,
     AUTHOR_NSFW_BIT,
     BOOL_FEATURES,
     CATEGORICAL_FEATURES,
     FLOAT_FEATURES,
     INT64_FEATURES,
+    STALE_POST_14D_TTL_SEC,
     BoolFeature,
     CategoricalFeature,
     FloatFeature,
@@ -174,7 +181,10 @@ def _col(
     batch_size: int,
     t: type[_T],
 ) -> npt.NDArray[_T]:
-    arr = (rb.column(col).values.to_numpy(zero_copy_only=False).reshape(batch_size, -1)).astype(t)
+    values = rb.column(col).values
+    if values.null_count:
+        values = values.fill_null(False if pa.types.is_boolean(values.type) else 0)
+    arr = values.to_numpy(zero_copy_only=False).reshape(batch_size, -1).astype(t)
     return typing.cast(npt.NDArray[_T], arr)
 
 
@@ -203,6 +213,9 @@ class PostSeq(TypedDict):
     continuous_actions: npt.NDArray[np.float32]
     promoted_ids: npt.NDArray[np.int64] | None
     line_item_objective: npt.NDArray[np.int16] | None
+    trained_candidate_mask: NotRequired[npt.NDArray[np.bool_] | None]
+    value_label_valid: NotRequired[npt.NDArray[np.bool_]]
+    value_baseline_mean_usd: NotRequired[npt.NDArray[np.float32]]
     safety_label_mask: npt.NDArray[np.int64] | None
     embedding: npt.NDArray[np.float32] | jax.Array | None
     search_query_embeddings: npt.NDArray[np.float32] | None
@@ -296,7 +309,47 @@ class RecsysFeaturesBatch(TypedDict):
     user_installed_apps_multihot: npt.NDArray[np.bool_]
     num_positive_candidates: npt.NDArray[np.int32] | None
     sample_weights: NotRequired[npt.NDArray[np.float32] | None]
+    sample_source: NotRequired[npt.NDArray[np.int8] | None]
     packing_layout: NotRequired[SequencePackedLayout | None]
+
+
+VALUE_LABEL_DTYPES = {
+    "value_label_valid": np.bool_,
+    "value_baseline_mean_usd": np.float32,
+}
+
+
+def _read_value_labels(
+    record_batch: pa.RecordBatch, shape: tuple[int, int]
+) -> dict[str, np.ndarray]:
+    labels: dict[str, np.ndarray] = {
+        key: np.zeros(shape, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()
+    }
+    for key, column, arrow_type in (
+        ("value_label_valid", "valueLabelValidSeq", pa.bool_()),
+        ("value_baseline_mean_usd", "valueBaselineMeanUsdSeq", pa.float32()),
+    ):
+        if column not in record_batch.schema.names:
+            continue
+        col = record_batch.column(column)
+        if col.type != pa.list_(arrow_type, shape[1]):
+            raise ValueError(f"{column} must have type {pa.list_(arrow_type, shape[1])}")
+        values = col.values.slice(col.offset * shape[1], shape[0] * shape[1])
+        values = values.fill_null(False if key == "value_label_valid" else 0.0)
+        labels[key] = (
+            values.to_numpy(zero_copy_only=False).reshape(shape).astype(VALUE_LABEL_DTYPES[key])
+        )
+        labels[key][col.is_null().to_numpy(zero_copy_only=False)] = 0
+    return labels
+
+
+def _extend_value_labels(post_seq: PostSeq, shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    labels = {key: np.zeros(shape, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()}
+    for key in labels:
+        values = post_seq.get(key)
+        if isinstance(values, np.ndarray):
+            labels[key][:, : values.shape[1]] = values
+    return labels
 
 
 def _extract_feature_columns(
@@ -347,6 +400,7 @@ def from_record_batch(
     global_post_sids: np.ndarray | None = None,
     sid_num_levels: int = 0,
     compute_post_unexplored_label: bool = False,
+    zero_stale_post_14d_candidate_counts: bool = False,
 ) -> RecsysFeaturesBatch:
     start = time.time()
     batch_size = record_batch.num_rows
@@ -391,11 +445,21 @@ def from_record_batch(
             (batch_size, seq_len, num_continuous_actions), dtype=np.float32
         )
 
+    value_labels = _read_value_labels(record_batch, (batch_size, actions.shape[1]))
+
     if "clientAppIdSeq" in record_batch.schema.names:
         client_app_id = _col(record_batch, "clientAppIdSeq", batch_size, np.int32)
     else:
         seq_len = actions.shape[1]
         client_app_id = np.zeros((batch_size, seq_len), dtype=np.int32)
+    if "conversionKeepMask" in record_batch.schema.names:
+        conversion_keep = _col(record_batch, "conversionKeepMask", batch_size, np.bool_)
+        null_rows = ~record_batch.column("conversionKeepMask").is_valid().to_numpy(
+            zero_copy_only=False
+        )
+        conversion_keep[null_rows] = True
+    else:
+        conversion_keep = None
 
     post_creation_ts_sec = (((tweet_ids >> 22) + TWITTER_EPOCH_MS) // 1000).astype(np.int32)
     post_creation_ts_sec = np.where(tweet_ids == 0, 0, post_creation_ts_sec)
@@ -560,6 +624,10 @@ def from_record_batch(
     candidate_impr_ts = np.zeros(cand_shape_2d, dtype=np.int32)
     candidate_product_surface = np.zeros(cand_shape_2d, dtype=np.int32)
     candidate_client_app_id = np.zeros(cand_shape_2d, dtype=np.int32)
+    candidate_trained_mask = np.ones(cand_shape_2d, dtype=np.bool_)
+    candidate_value_labels: dict[str, np.ndarray] = {
+        key: np.zeros(cand_shape_2d, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()
+    }
     candidate_post_creation_ts_sec = np.zeros(cand_shape_2d, dtype=np.int32)
     candidate_actions = np.zeros(cand_shape_3d, dtype=actions.dtype)
     candidate_continuous_actions = np.zeros(
@@ -719,9 +787,13 @@ def from_record_batch(
             candidate_impr_ts[*cslice] = ts_values.astype(np.int32)
             candidate_product_surface[*cslice] = product_surface[*dslice]
             candidate_client_app_id[*cslice] = client_app_id[*dslice]
+            if conversion_keep is not None:
+                candidate_trained_mask[*cslice] = conversion_keep[*dslice]
             candidate_post_creation_ts_sec[*cslice] = post_creation_ts_sec[*dslice]
             candidate_actions[*cslice] = actions[*dslice, :]
             candidate_continuous_actions[*cslice] = continuous_actions[*dslice, :]
+            for key, values in value_labels.items():
+                candidate_value_labels[key][*cslice] = values[*dslice]
             candidate_promoted_ids[*cslice] = promoted_ids[*dslice]
             candidate_line_item_objective[*cslice] = line_item_objective[*dslice]
             candidate_safety_label_mask[*cslice] = safety_label_mask[*dslice]
@@ -807,6 +879,8 @@ def from_record_batch(
             candidate_post_creation_ts_sec[not_found] = 0
             candidate_actions[not_found] = 0
             candidate_continuous_actions[not_found] = 0
+            for values in candidate_value_labels.values():
+                values[not_found] = 0
             candidate_promoted_ids[not_found] = 0
             candidate_line_item_objective[not_found] = 0
             candidate_safety_label_mask[not_found] = 0
@@ -831,6 +905,41 @@ def from_record_batch(
             _INT32_MAX,
             out=cand_int64_features[:, :, _ec_idx],
         )
+
+    _dpa_idx = Int64Feature.firstDpaProductKey.value
+
+    def _hash_dpa_keys(keys: npt.NDArray[np.int64], scale: int, bias: int) -> npt.NDArray:
+        hashed = (
+            (keys * scale + bias) % ADS_PRODUCT_KEY_HASH_MODULUS % (ADS_PRODUCT_KEY_TABLE_SIZE - 1)
+        ) + 1
+        return np.where(keys == 0, 0, hashed)
+
+    _dpa_idx2 = Int64Feature.firstDpaProductKeyHash2.value
+    for _dpa_arr in (hist_int64_features, cand_int64_features):
+        _dpa_keys = _dpa_arr[:, :, _dpa_idx].copy()
+        _dpa_arr[:, :, _dpa_idx2] = _hash_dpa_keys(
+            _dpa_keys, ADS_PRODUCT_KEY_HASH_SCALE_2, ADS_PRODUCT_KEY_HASH_BIAS_2
+        )
+        _dpa_arr[:, :, _dpa_idx] = _hash_dpa_keys(
+            _dpa_keys, ADS_PRODUCT_KEY_HASH_SCALE, ADS_PRODUCT_KEY_HASH_BIAS
+        )
+
+    if zero_stale_post_14d_candidate_counts:
+        ttl_sec = np.int64(STALE_POST_14D_TTL_SEC)
+        original_age_sec = candidate_impr_ts.astype(
+            np.int64
+        ) - candidate_post_creation_ts_sec.astype(np.int64)
+        stale_post_14d = (
+            (candidate_impr_ts > 0)
+            & (candidate_post_creation_ts_sec > 0)
+            & (original_age_sec > ttl_sec)
+        )
+        for _ec_idx in _ENGAGEMENT_COUNT_INT64_INDICES:
+            cand_int64_features[:, :, _ec_idx] = np.where(
+                stale_post_14d, 0, cand_int64_features[:, :, _ec_idx]
+            )
+        if cand_bool_features.shape[2] > BoolFeature.isStalePost14d.value:
+            cand_bool_features[:, :, BoolFeature.isStalePost14d.value] = stale_post_14d
 
     history_seq = PostSeq(
         impr_ts=history_impr_ts,
@@ -863,6 +972,8 @@ def from_record_batch(
         product_surface=candidate_product_surface,
         client_app_id=candidate_client_app_id,
         post_ids=candidate_post_ids if include_candidate_post_ids else None,
+        trained_candidate_mask=candidate_trained_mask,
+        **candidate_value_labels,
         continuous_actions=candidate_continuous_actions,
         promoted_ids=candidate_promoted_ids,
         line_item_objective=candidate_line_item_objective,
@@ -920,6 +1031,15 @@ def from_record_batch(
             if "sampleWeight" in record_batch.schema.names
             else np.ones((batch_size, 1), dtype=np.float32)
         ),
+        sample_source=(
+            record_batch.column("sample_source")
+            .fill_null(0)
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int8)
+            .reshape(-1, 1)
+            if "sample_source" in record_batch.schema.names
+            else np.zeros((batch_size, 1), dtype=np.int8)
+        ),
     )
     batch["num_positive_candidates"] = (
         num_positive_per_user.reshape(-1, 1)
@@ -948,6 +1068,7 @@ def apply_negative_sampling(
     post_ids = post_seq["post_ids"]
     product_surface = post_seq["product_surface"]
     client_app_id = post_seq["client_app_id"]
+    trained_candidate_mask = post_seq.get("trained_candidate_mask")
     post_creation_ts_sec = post_seq["post_creation_ts_sec"]
     continuous_actions = post_seq["continuous_actions"]
     promoted_ids = post_seq["promoted_ids"]
@@ -997,6 +1118,7 @@ def apply_negative_sampling(
     )
     new_product_surface = np.zeros((batch_size, total_candidate_slots), dtype=product_surface.dtype)
     new_client_app_id = np.zeros((batch_size, total_candidate_slots), dtype=client_app_id.dtype)
+    new_trained_mask = np.ones((batch_size, total_candidate_slots), dtype=np.bool_)
     new_post_creation_ts_sec = np.zeros(
         (batch_size, total_candidate_slots), dtype=post_creation_ts_sec.dtype
     )
@@ -1027,6 +1149,8 @@ def apply_negative_sampling(
     new_ip_hashes[:, positive_slice, :] = ip_hashes
     new_product_surface[:, positive_slice] = product_surface
     new_client_app_id[:, positive_slice] = client_app_id
+    if trained_candidate_mask is not None:
+        new_trained_mask[:, positive_slice] = trained_candidate_mask
     new_post_creation_ts_sec[:, positive_slice] = post_creation_ts_sec
     if new_post_sids is not None and _post_sids is not None:
         new_post_sids[:, positive_slice, :] = _post_sids
@@ -1193,6 +1317,8 @@ def apply_negative_sampling(
         product_surface=new_product_surface,
         client_app_id=new_client_app_id,
         post_ids=new_post_ids,
+        trained_candidate_mask=new_trained_mask,
+        **_extend_value_labels(post_seq, (batch_size, total_candidate_slots)),
         continuous_actions=new_continuous_actions,
         promoted_ids=new_promoted_ids,
         line_item_objective=new_line_item_objective,
@@ -1264,6 +1390,8 @@ def apply_global_negative_sampling(
         (batch_size, expanded_candidate_slots),
         dtype=client_app_id.dtype,
     )
+    _gn_trained_mask = post_seq.get("trained_candidate_mask")
+    new_gn_trained_mask = np.ones((batch_size, expanded_candidate_slots), dtype=np.bool_)
     new_post_creation_ts_sec = np.zeros(
         (batch_size, expanded_candidate_slots),
         dtype=post_creation_ts_sec.dtype,
@@ -1297,6 +1425,8 @@ def apply_global_negative_sampling(
     new_ip_hashes[:, original_slice, :] = ip_hashes
     new_product_surface[:, original_slice] = product_surface
     new_client_app_id[:, original_slice] = client_app_id
+    if _gn_trained_mask is not None:
+        new_gn_trained_mask[:, original_slice] = _gn_trained_mask
     new_post_creation_ts_sec[:, original_slice] = post_creation_ts_sec
     new_continuous_actions[:, original_slice, :] = continuous_actions
     if categorical_features.shape[2] > 0:
@@ -1420,6 +1550,8 @@ def apply_global_negative_sampling(
         product_surface=new_product_surface,
         client_app_id=new_client_app_id,
         post_ids=new_post_ids,
+        trained_candidate_mask=new_gn_trained_mask,
+        **_extend_value_labels(post_seq, (batch_size, expanded_candidate_slots)),
         continuous_actions=new_continuous_actions,
         promoted_ids=new_promoted_ids,
         line_item_objective=new_line_item_objective,

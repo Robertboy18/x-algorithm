@@ -215,14 +215,18 @@ ffi::Error LookupDone(
   });
 }
 
-ApplyUpdateRule makeRowwiseAdagradRule(AdagradParams params, float* row_state) {
+ApplyUpdateRule makeRowwiseAdagradRule(
+    AdagradParams params, float* row_state, int32_t* last_step = nullptr
+) {
   return [params,
-          row_state](const ReducedGradients& reduced, const UpdateJob& job, cudaStream_t stream) {
+          row_state,
+          last_step](const ReducedGradients& reduced, const UpdateJob& job, cudaStream_t stream) {
     launch_rowwise_adagrad_apply(
         reduced.row_grads,
         reduced.row_sq_sums,
         job.unique_tokens,
         row_state,
+        last_step,
         job.table,
         job.vocab_rows,
         reduced.scalars,
@@ -263,10 +267,55 @@ ffi::Error RowwiseAdagradUpdateStartInit(
       return invalid("rowwise_adagrad_update_start: context not initialized");
     }
     std::call_once(rowwise_adagrad_warmup_once, [&] {
-      ctx->warmupUpdateRule(makeRowwiseAdagradRule(AdagradParams{0.f, 1.f, 1.f, 1.f}, nullptr));
+      ctx->warmupUpdateRule(
+          makeRowwiseAdagradRule(AdagradParams{0.f, 1.f, 1.f, 1.f, 1.f, 0.f, 0.f}, nullptr)
+      );
     });
     return ffi::Error::Success();
   });
+}
+
+ffi::Error validateRowwiseAdagradBuffers(
+    AsyncEmbContext* ctx,
+    const ffi::AnyBuffer& grads,
+    const ffi::AnyBuffer& segment_ids,
+    const ffi::AnyBuffer& unique_tokens,
+    const ffi::AnyBuffer& table,
+    const ffi::AnyBuffer& row_state,
+    const ffi::AnyBuffer& pending
+) {
+  const auto& spec = ctx->spec();
+  if (32 % spec.shard_width != 0) {
+    return invalid("rowwise_adagrad_update_start: shard_width must divide 32 (warp broadcast)");
+  }
+  if (grads.element_type() != ffi::DataType::BF16 ||
+      grads.element_count() != size_t(spec.tokens_per_rank * spec.shard_width * ctx->worldSize())) {
+    return invalid("rowwise_adagrad_update_start: bad grads");
+  }
+  if (segment_ids.element_type() != ffi::DataType::S32 ||
+      segment_ids.element_count() != size_t(spec.tokens_per_rank)) {
+    return invalid("rowwise_adagrad_update_start: bad indices");
+  }
+  if (unique_tokens.element_type() != ffi::DataType::S32 ||
+      unique_tokens.element_count() != size_t(spec.num_unique)) {
+    return invalid("rowwise_adagrad_update_start: bad unique tokens");
+  }
+  if (table.element_type() != ffi::DataType::BF16 || table.dimensions().size() != 2 ||
+      table.dimensions()[1] != spec.shard_width) {
+    return invalid("rowwise_adagrad_update_start: bad table");
+  }
+  if (row_state.element_type() != ffi::DataType::F32 ||
+      row_state.element_count() != size_t(table.dimensions()[0])) {
+    return invalid("rowwise_adagrad_update_start: bad row state");
+  }
+  if (pending.element_type() != ffi::DataType::S32 || pending.element_count() != 1) {
+    return invalid("rowwise_adagrad_update_start: pending must be s32[1]");
+  }
+  return ffi::Error::Success();
+}
+
+bool bufferAliased(const ffi::AnyBuffer& in, ffi::Result<ffi::AnyBuffer>& out) {
+  return out->untyped_data() == in.untyped_data();
 }
 
 ffi::Error RowwiseAdagradUpdateStart(
@@ -298,55 +347,34 @@ ffi::Error RowwiseAdagradUpdateStart(
     auto learning_rate = attrs.get<double>("learning_rate");
     auto eps = attrs.get<double>("eps");
     auto decay_factor = attrs.get<double>("decay_factor");
-    if (!learning_rate.has_value() || !eps.has_value() || !decay_factor.has_value()) {
+    auto weight_decay_factor = attrs.get<double>("weight_decay_factor");
+    if (!learning_rate.has_value() || !eps.has_value() || !decay_factor.has_value() ||
+        !weight_decay_factor.has_value()) {
       return invalid("rowwise_adagrad_update_start: missing optimizer attrs");
     }
     const float lr_f = float(*learning_rate);
     const float eps_f = float(*eps);
     const float decay_f = float(*decay_factor);
+    const float wd_f = float(*weight_decay_factor);
     if (!std::isfinite(lr_f) || !std::isfinite(eps_f) || !std::isfinite(decay_f) || eps_f <= 0.f ||
-        decay_f < 0.f || decay_f > 1.f) {
+        decay_f < 0.f || decay_f > 1.f || !std::isfinite(wd_f) || wd_f <= 0.f || wd_f > 1.f) {
       return invalid("rowwise_adagrad_update_start: invalid optimizer parameters");
     }
-    const auto& spec = ctx->spec();
-    if (32 % spec.shard_width != 0) {
-      return invalid("rowwise_adagrad_update_start: shard_width must divide 32 (warp broadcast)");
+    ffi::Error buffers_error = validateRowwiseAdagradBuffers(
+        ctx.get(), grads, segment_ids, unique_tokens, table, row_state, pending
+    );
+    if (buffers_error.failure()) {
+      return buffers_error;
     }
-    if (grads.element_type() != ffi::DataType::BF16 ||
-        grads.element_count() !=
-            size_t(spec.tokens_per_rank * spec.shard_width * ctx->worldSize())) {
-      return invalid("rowwise_adagrad_update_start: bad grads");
-    }
-    if (segment_ids.element_type() != ffi::DataType::S32 ||
-        segment_ids.element_count() != size_t(spec.tokens_per_rank)) {
-      return invalid("rowwise_adagrad_update_start: bad indices");
-    }
-    if (unique_tokens.element_type() != ffi::DataType::S32 ||
-        unique_tokens.element_count() != size_t(spec.num_unique)) {
-      return invalid("rowwise_adagrad_update_start: bad unique tokens");
-    }
-    if (table.element_type() != ffi::DataType::BF16 || table.dimensions().size() != 2 ||
-        table.dimensions()[1] != spec.shard_width) {
-      return invalid("rowwise_adagrad_update_start: bad table");
-    }
-    if (row_state.element_type() != ffi::DataType::F32 ||
-        row_state.element_count() != size_t(table.dimensions()[0])) {
-      return invalid("rowwise_adagrad_update_start: bad row state");
-    }
-    if (pending.element_type() != ffi::DataType::S32 || pending.element_count() != 1) {
-      return invalid("rowwise_adagrad_update_start: pending must be s32[1]");
-    }
-    auto aliased = [](const ffi::AnyBuffer& in, ffi::Result<ffi::AnyBuffer>& out) -> bool {
-      return out->untyped_data() == in.untyped_data();
-    };
-    if (!aliased(grads, grads_pin) || !aliased(segment_ids, segment_ids_pin) ||
-        !aliased(unique_tokens, unique_tokens_pin) || !aliased(table, table_out) ||
-        !aliased(row_state, state_out)) {
+    if (!bufferAliased(grads, grads_pin) || !bufferAliased(segment_ids, segment_ids_pin) ||
+        !bufferAliased(unique_tokens, unique_tokens_pin) || !bufferAliased(table, table_out) ||
+        !bufferAliased(row_state, state_out)) {
       return invalid(
           "rowwise_adagrad_update_start: outputs must alias inputs (check input_output_aliases)"
       );
     }
-    const AdagradParams adagrad{lr_f, eps_f, decay_f, 1.f / float(spec.emb_width)};
+    const auto& spec = ctx->spec();
+    const AdagradParams adagrad{lr_f, eps_f, decay_f, 1.f / float(spec.emb_width), wd_f, 0.f, 0.f};
     UpdateJob job{
         static_cast<const __nv_bfloat16*>(grads.untyped_data()),
         static_cast<const int32_t*>(segment_ids.untyped_data()),
@@ -359,6 +387,137 @@ ffi::Error RowwiseAdagradUpdateStart(
         static_cast<const int32_t*>(pending.untyped_data()),
         makeRowwiseAdagradRule(adagrad, static_cast<float*>(row_state.untyped_data())),
         stream
+    );
+    return ffi::Error::Success();
+  });
+}
+
+ffi::Error RowwiseAdagradLazyUpdateStartInit(
+    cudaStream_t,
+    ffi::CollectiveParamsPartial params,
+    ffi::AnyBuffer,
+    ffi::AnyBuffer,
+    ffi::AnyBuffer,
+    ffi::AnyBuffer,
+    ffi::AnyBuffer,
+    ffi::AnyBuffer,
+    ffi::AnyBuffer,
+    ffi::AnyBuffer,
+    ffi::AnyBuffer,
+    ffi::Dictionary attrs,
+    ffi::Result<ffi::AnyBuffer>,
+    ffi::Result<ffi::AnyBuffer>,
+    ffi::Result<ffi::AnyBuffer>,
+    ffi::Result<ffi::AnyBuffer>,
+    ffi::Result<ffi::AnyBuffer>,
+    ffi::Result<ffi::AnyBuffer>
+) {
+  return ffiGuard([&]() -> ffi::Error {
+    ffi::Error error = initializeContext(attrs, params);
+    if (error.failure()) {
+      return error;
+    }
+    auto ctx = readyContext(*attrs.get<int64_t>("context_id"));
+    if (ctx == nullptr) {
+      return invalid("rowwise_adagrad_lazy_update_start: context not initialized");
+    }
+    std::call_once(rowwise_adagrad_warmup_once, [&] {
+      ctx->warmupUpdateRule(
+          makeRowwiseAdagradRule(AdagradParams{0.f, 1.f, 1.f, 1.f, 1.f, 0.f, 0.f}, nullptr)
+      );
+    });
+    return ffi::Error::Success();
+  });
+}
+
+ffi::Error RowwiseAdagradLazyUpdateStart(
+    cudaStream_t stream,
+    ffi::CollectiveParamsPartial,
+    ffi::AnyBuffer grads,
+    ffi::AnyBuffer segment_ids,
+    ffi::AnyBuffer unique_tokens,
+    ffi::AnyBuffer table,
+    ffi::AnyBuffer row_state,
+    ffi::AnyBuffer last_step,
+    ffi::AnyBuffer logical_step,
+    ffi::AnyBuffer pending,
+    ffi::AnyBuffer ,
+    ffi::Dictionary attrs,
+    ffi::Result<ffi::AnyBuffer> grads_pin,
+    ffi::Result<ffi::AnyBuffer> segment_ids_pin,
+    ffi::Result<ffi::AnyBuffer> unique_tokens_pin,
+    ffi::Result<ffi::AnyBuffer> table_out,
+    ffi::Result<ffi::AnyBuffer> state_out,
+    ffi::Result<ffi::AnyBuffer> last_step_out
+) {
+  return ffiGuard([&]() -> ffi::Error {
+    auto context_id = attrs.get<int64_t>("context_id");
+    if (!context_id.has_value()) {
+      return invalid("rowwise_adagrad_lazy_update_start: missing context_id");
+    }
+    auto ctx = readyContext(*context_id);
+    if (ctx == nullptr) {
+      return invalid("rowwise_adagrad_lazy_update_start: context not initialized");
+    }
+    auto learning_rate = attrs.get<double>("learning_rate");
+    auto eps = attrs.get<double>("eps");
+    auto accum_decay_rate = attrs.get<double>("accum_decay_rate");
+    auto weight_decay_rate = attrs.get<double>("weight_decay_rate");
+    if (!learning_rate.has_value() || !eps.has_value() || !accum_decay_rate.has_value() ||
+        !weight_decay_rate.has_value()) {
+      return invalid("rowwise_adagrad_lazy_update_start: missing optimizer attrs");
+    }
+    const float lr_f = float(*learning_rate);
+    const float eps_f = float(*eps);
+    const float accum_rate_f = float(*accum_decay_rate);
+    const float wd_rate_f = float(*weight_decay_rate);
+    if (!std::isfinite(lr_f) || !std::isfinite(eps_f) || eps_f <= 0.f ||
+        !std::isfinite(accum_rate_f) || accum_rate_f < 0.f || !std::isfinite(wd_rate_f) ||
+        wd_rate_f < 0.f) {
+      return invalid("rowwise_adagrad_lazy_update_start: invalid optimizer parameters");
+    }
+    ffi::Error buffers_error = validateRowwiseAdagradBuffers(
+        ctx.get(), grads, segment_ids, unique_tokens, table, row_state, pending
+    );
+    if (buffers_error.failure()) {
+      return buffers_error;
+    }
+    if (last_step.element_type() != ffi::DataType::S32 ||
+        last_step.element_count() != size_t(table.dimensions()[0])) {
+      return invalid("rowwise_adagrad_lazy_update_start: bad last_step");
+    }
+    if (logical_step.element_type() != ffi::DataType::S32 || logical_step.element_count() != 1) {
+      return invalid("rowwise_adagrad_lazy_update_start: step must be s32[1]");
+    }
+    if (!bufferAliased(grads, grads_pin) || !bufferAliased(segment_ids, segment_ids_pin) ||
+        !bufferAliased(unique_tokens, unique_tokens_pin) || !bufferAliased(table, table_out) ||
+        !bufferAliased(row_state, state_out) || !bufferAliased(last_step, last_step_out)) {
+      return invalid(
+          "rowwise_adagrad_lazy_update_start: outputs must alias inputs (check "
+          "input_output_aliases)"
+      );
+    }
+    const auto& spec = ctx->spec();
+    const AdagradParams adagrad{
+        lr_f, eps_f, 1.f, 1.f / float(spec.emb_width), 1.f, accum_rate_f, wd_rate_f
+    };
+    UpdateJob job{
+        static_cast<const __nv_bfloat16*>(grads.untyped_data()),
+        static_cast<const int32_t*>(segment_ids.untyped_data()),
+        static_cast<const int32_t*>(unique_tokens.untyped_data()),
+        static_cast<__nv_bfloat16*>(table.untyped_data()),
+        table.dimensions()[0]
+    };
+    ctx->armUpdate(
+        job,
+        static_cast<const int32_t*>(pending.untyped_data()),
+        makeRowwiseAdagradRule(
+            adagrad,
+            static_cast<float*>(row_state.untyped_data()),
+            static_cast<int32_t*>(last_step.untyped_data())
+        ),
+        stream,
+        static_cast<const int32_t*>(logical_step.untyped_data())
     );
     return ffi::Error::Success();
   });
@@ -485,6 +644,54 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    kRowwiseAdagradLazyUpdateStartInit,
+    RowwiseAdagradLazyUpdateStartInit,
+    ffi::Ffi::Bind<ffi::ExecutionStage::kInitialize>()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<ffi::CollectiveParamsPartial>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Attrs<ffi::Dictionary>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    kRowwiseAdagradLazyUpdateStart,
+    RowwiseAdagradLazyUpdateStart,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<ffi::CollectiveParamsPartial>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Attrs<ffi::Dictionary>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
     kRowwiseAdagradUpdateDone,
     RowwiseAdagradUpdateDone,
     ffi::Ffi::Bind()
@@ -575,6 +782,12 @@ NB_MODULE(async_emb_api, m) {
     return encapsulate(kRowwiseAdagradUpdateStartInit);
   });
   m.def("rowwise_adagrad_update_start", [] { return encapsulate(kRowwiseAdagradUpdateStart); });
+  m.def("rowwise_adagrad_lazy_update_start_init", [] {
+    return encapsulate(kRowwiseAdagradLazyUpdateStartInit);
+  });
+  m.def("rowwise_adagrad_lazy_update_start", [] {
+    return encapsulate(kRowwiseAdagradLazyUpdateStart);
+  });
   m.def("rowwise_adagrad_update_done", [] { return encapsulate(kRowwiseAdagradUpdateDone); });
   m.def(
       "wait_step_ready",

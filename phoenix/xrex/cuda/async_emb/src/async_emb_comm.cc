@@ -705,7 +705,11 @@ void AsyncEmbContext::armLookup(LookupJob job, cudaStream_t main_stream) {
 }
 
 void AsyncEmbContext::armUpdate(
-    UpdateJob job, const int32_t* pending, ApplyUpdateRule apply, cudaStream_t main_stream
+    UpdateJob job,
+    const int32_t* pending,
+    ApplyUpdateRule apply,
+    cudaStream_t main_stream,
+    const int32_t* logical_step
 ) {
   std::lock_guard<std::mutex> arm_lock(arm_mu_);
   ensureHealthy();
@@ -727,6 +731,15 @@ void AsyncEmbContext::armUpdate(
       cudaMemcpyDeviceToDevice,
       main_stream
   ));
+  if (logical_step != nullptr) {
+    XAI_CUDA_CHECK(cudaMemcpyAsync(
+        arena() + layout_.scalars + offsetof(UpdateScalars, step),
+        logical_step,
+        sizeof(int32_t),
+        cudaMemcpyDeviceToDevice,
+        main_stream
+    ));
+  }
   recordInputReady(update_, main_stream);
   enqueueUpdate(job, apply);
   {

@@ -23,7 +23,6 @@ pub mod multimodal_retrieval;
 pub mod proto_parser;
 pub mod request_metrics;
 pub mod request_queue;
-pub mod sid_client;
 pub mod storage_util;
 pub mod tls;
 pub mod util;

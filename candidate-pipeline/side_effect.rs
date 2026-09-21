@@ -1,4 +1,4 @@
-use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery};
+use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery, PipelineStage};
 use crate::util;
 use std::any::type_name_of_val;
 use std::sync::Arc;
@@ -22,7 +22,11 @@ where
     }
 
     #[xai_stats_macro::receive_stats]
-    async fn run(&self, input: Arc<SideEffectInput<Q, C>>) -> Result<(), String> {
+    async fn run(
+        &self,
+        input: Arc<SideEffectInput<Q, C>>,
+        _stage: PipelineStage,
+    ) -> Result<(), String> {
         self.side_effect(input).await
     }
 

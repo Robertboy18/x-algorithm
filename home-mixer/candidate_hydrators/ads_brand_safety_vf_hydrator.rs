@@ -1,9 +1,10 @@
 use crate::models::brand_safety::{
-    botmaker_rule_category, botmaker_rule_id_from, compute_verdict, truncate_description,
-    worst_verdict, BrandSafetyVerdict,
+    botmaker_rule_category, botmaker_rule_id_from, compute_verdict, compute_verdict_v2,
+    truncate_description, worst_verdict, BrandSafetyVerdict,
 };
 use crate::models::candidate::{PostCandidate, SafetyLabelInfo};
 use crate::models::query::ScoredPostsQuery;
+use crate::params::EnableAdsBrandSafetyVerdictV2;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tonic::async_trait;
@@ -30,7 +31,7 @@ fn to_safety_label_infos(labels: &SafetyLabelMap) -> impl Iterator<Item = Safety
 impl Hydrator<ScoredPostsQuery, PostCandidate> for AdsBrandSafetyVfHydrator {
     async fn hydrate(
         &self,
-        _query: &ScoredPostsQuery,
+        query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
     ) -> Vec<Result<PostCandidate, String>> {
         let mut all_ids: HashSet<u64> = HashSet::new();
@@ -54,6 +55,12 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for AdsBrandSafetyVfHydrator {
         let failed_ids: HashSet<u64> = batch.failures.keys().copied().collect();
         let label_map = batch.labels;
 
+        let compute = if query.params.get(EnableAdsBrandSafetyVerdictV2) {
+            compute_verdict_v2
+        } else {
+            compute_verdict
+        };
+
         let mut nsfw_author_seen: u64 = 0;
         let mut nsfw_author_dropped: u64 = 0;
 
@@ -68,7 +75,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for AdsBrandSafetyVfHydrator {
 
                 let empty = HashMap::new();
                 let primary_labels = label_map.get(&primary_id).unwrap_or(&empty);
-                let mut verdict = compute_verdict(primary_labels, primary_id);
+                let mut verdict = compute(primary_labels, primary_id);
                 let mut safety_labels: Vec<SafetyLabelInfo> =
                     to_safety_label_infos(primary_labels).collect();
 
@@ -77,7 +84,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for AdsBrandSafetyVfHydrator {
                         verdict = worst_verdict(&verdict, &BrandSafetyVerdict::MediumRisk);
                     } else {
                         let qt_labels = label_map.get(&qt_id).unwrap_or(&empty);
-                        verdict = worst_verdict(&verdict, &compute_verdict(qt_labels, qt_id));
+                        verdict = worst_verdict(&verdict, &compute(qt_labels, qt_id));
                         safety_labels.extend(to_safety_label_infos(qt_labels));
                     }
                 }
@@ -87,8 +94,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for AdsBrandSafetyVfHydrator {
                         verdict = worst_verdict(&verdict, &BrandSafetyVerdict::MediumRisk);
                     } else {
                         let ancestor_labels = label_map.get(&ancestor_id).unwrap_or(&empty);
-                        verdict =
-                            worst_verdict(&verdict, &compute_verdict(ancestor_labels, ancestor_id));
+                        verdict = worst_verdict(&verdict, &compute(ancestor_labels, ancestor_id));
                         safety_labels.extend(to_safety_label_infos(ancestor_labels));
                     }
                 }
@@ -96,7 +102,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for AdsBrandSafetyVfHydrator {
                 if c.nsfw_author_ads == Some(true) {
                     nsfw_author_seen += 1;
                     let before = verdict;
-                    verdict = worst_verdict(&verdict, &BrandSafetyVerdict::MediumRisk);
+                    verdict = worst_verdict(&verdict, &BrandSafetyVerdict::HighRisk);
                     if verdict != before {
                         nsfw_author_dropped += 1;
                     }
@@ -138,6 +144,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for AdsBrandSafetyVfHydrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::query::ScoredPostsQuery;
     use xai_safety_label_store::types::SafetyLabelMap;
     use xai_visibility_filtering::tweet_safety_label::{SafetyLabelFailure, SafetyLabelsBatch};
     use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelType};
@@ -314,7 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ancestor_medium_risk_escalates_verdict() {
+    async fn ancestor_high_risk_escalates_verdict() {
         let mut safe_labels: SafetyLabelMap = HashMap::new();
         safe_labels.insert(SafetyLabelType::GROK_SFA, SafetyLabel::default());
         let mut risky_labels: SafetyLabelMap = HashMap::new();
@@ -340,7 +347,7 @@ mod tests {
         let hydrated = results[0].as_ref().unwrap();
         assert_eq!(
             hydrated.brand_safety_verdict,
-            Some(BrandSafetyVerdict::MediumRisk)
+            Some(BrandSafetyVerdict::HighRisk)
         );
         assert!(hydrated
             .safety_labels
@@ -474,7 +481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nsfw_author_escalates_to_medium_risk() {
+    async fn nsfw_author_escalates_to_high_risk() {
         let mut labels: SafetyLabelMap = HashMap::new();
         labels.insert(SafetyLabelType::GROK_SFA, SafetyLabel::default());
         let client = Arc::new(FakeVfClient {
@@ -497,7 +504,7 @@ mod tests {
         let hydrated = results[0].as_ref().unwrap();
         assert_eq!(
             hydrated.brand_safety_verdict,
-            Some(BrandSafetyVerdict::MediumRisk)
+            Some(BrandSafetyVerdict::HighRisk)
         );
     }
 

@@ -51,7 +51,7 @@ comments or docstrings, so no in-file banner survives to say it there).
 
 | File | What it is |
 | --- | --- |
-| `train_step.py` | The canonical single-device training step — the released composition (dense AdamW + sparse rowwise-AdaGrad) with the sharding infrastructure removed. See [`TRAINING.md`](../TRAINING.md). |
+| `train_step.py` | The canonical single-device training step — the released composition (dense optimizer + sparse rowwise-AdaGrad; this reference composes the AdamW arm, while the ranking flagship/nano configs train the shipped Muon recipe) with the sharding infrastructure removed. See [`TRAINING.md`](../TRAINING.md). |
 | `train_synth.py` | The public launcher: points the shipped trainer config at a `dump_gen.py` dump and trains the nano model end to end. |
 | `repack_checkpoint.py` | Repacks a trained checkpoint into a publishable artifact: keeps load/infer tensors, drops optimizer state, scrubs internal metadata, regenerates checksums. |
 | `retrieve_then_rank.py` | The QUICKSTART §5 driver: sends real dump sessions through the two live servers — `RetrieveTopKCandidates` on retrieval, then `PredictNextActions` on ranking — over the production gRPC contract. |

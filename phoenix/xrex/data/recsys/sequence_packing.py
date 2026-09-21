@@ -166,6 +166,11 @@ def pack_batch(
     rng: np.random.Generator | None,
     block_size: int = 128,
 ) -> RecsysFeaturesBatch:
+    _tcm = batch["candidate_seq"].get("trained_candidate_mask")
+    assert _tcm is None or bool(np.asarray(_tcm).all()), (
+        "trained_candidate_mask with masked candidates is not supported with sequence packing"
+    )
+
     read_bsz_per_process = batch["user_hashes"].shape[0]
     history_seq_len = batch["history_seq"]["post_hashes"].shape[1]
     candidate_seq_len = batch["candidate_seq"]["post_hashes"].shape[1]
@@ -252,8 +257,13 @@ def pack_batch(
                 else None
             ),
             sample_weights=(
-                batch["sample_weights"].reshape(D, B, *batch["sample_weights"].shape[1:])
-                if batch.get("sample_weights") is not None
+                sw.reshape(D, B, *sw.shape[1:])
+                if (sw := batch.get("sample_weights")) is not None
+                else None
+            ),
+            sample_source=(
+                ss.reshape(D, B, *ss.shape[1:])
+                if (ss := batch.get("sample_source")) is not None
                 else None
             ),
             packing_layout=layout,

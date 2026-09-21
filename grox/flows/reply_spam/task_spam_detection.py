@@ -43,7 +43,7 @@ class TaskSpamDetection(TaskWithPost):
         follower_bucket_string = cls.get_follower_bucket_string(post)
         if score == 0.0:
             logger.info(
-                f"Reply Spam Found for lower than 1000 follower bucket. The post_id is {post.id} and the follower bucket is {follower_bucket_string}"
+                f"Reply Spam Found in the Gemma bucket. The post_id is {post.id} and the follower bucket is {follower_bucket_string}"
             )
             Metrics.counter("task.spam_comment_detection.positive.count").add(
                 1, attributes={"reason": follower_bucket_string}

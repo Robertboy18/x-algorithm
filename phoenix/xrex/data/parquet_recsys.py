@@ -767,6 +767,18 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
         )
 
     def pad_post_seq(post_seq: PostSeq) -> PostSeq:
+        padded = _pad_post_seq_fields(post_seq)
+        if (_tcm := post_seq.get("trained_candidate_mask")) is not None:
+            padded["trained_candidate_mask"] = np.pad(
+                _tcm, ((0, batch_size - num_rows), (0, 0)), constant_values=True
+            )
+        if (value_valid := post_seq.get("value_label_valid")) is not None:
+            padded["value_label_valid"] = pad_array(value_valid)
+        if (value_baseline := post_seq.get("value_baseline_mean_usd")) is not None:
+            padded["value_baseline_mean_usd"] = pad_array(value_baseline)
+        return padded
+
+    def _pad_post_seq_fields(post_seq: PostSeq) -> PostSeq:
         return PostSeq(
             impr_ts=pad_array(post_seq["impr_ts"]) if post_seq["impr_ts"] is not None else None,
             actions=pad_array(post_seq["actions"]) if post_seq["actions"] is not None else None,
@@ -818,6 +830,9 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
         "sample_weights": pad_array(sw)
         if (sw := batch_unpadded.get("sample_weights")) is not None
         else None,
+        "sample_source": pad_array(ss)
+        if (ss := batch_unpadded.get("sample_source")) is not None
+        else None,
     }
 
     extras = cast(dict[str, np.ndarray], batch_unpadded)
@@ -868,6 +883,7 @@ class PhoenixDataset(Dataset):
     sid_num_levels: int = 0
 
     compute_post_unexplored_label: bool = False
+    enable_stale_post: bool = False
 
     multimodal_embedding_type: EmbeddingType | None = None
 
@@ -1153,6 +1169,7 @@ class PhoenixDataset(Dataset):
                         global_post_sids=global_post_sids,
                         sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
                         compute_post_unexplored_label=self.compute_post_unexplored_label,
+                        zero_stale_post_14d_candidate_counts=self.enable_stale_post,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:
@@ -1273,6 +1290,9 @@ class PhoenixDataset(Dataset):
             "sample_weights": jax.ShapeDtypeStruct(sw.shape, sw.dtype)
             if (sw := example_data.get("sample_weights")) is not None
             else None,
+            "sample_source": jax.ShapeDtypeStruct(ss.shape, ss.dtype)
+            if (ss := example_data.get("sample_source")) is not None
+            else None,
         }
 
         return batch_shape
@@ -1345,6 +1365,9 @@ class PhoenixDataset(Dataset):
                 ),
                 product_surface=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
                 client_app_id=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
+                trained_candidate_mask=np.ones((batch_size, candidate_seq_len), dtype=np.bool_),
+                value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
+                value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
                 post_ids=np.zeros((batch_size, candidate_seq_len), dtype=np.int64)
                 if self.include_candidate_post_ids
                 else None,
@@ -1379,6 +1402,7 @@ class PhoenixDataset(Dataset):
             and self.candidate_negative_filter != CandidateNegativeFilter.NONE
             else None,
             sample_weights=np.ones((batch_size, 1), dtype=np.float32),
+            sample_source=np.zeros((batch_size, 1), dtype=np.int8),
         )
         return batch
 
@@ -1474,6 +1498,9 @@ class PhoenixToyDataset(PhoenixDataset):
                 auth_hashes=self.hash_table.get_author_hash(candidate_author_ids),
                 product_surface=candidate_product_surface,
                 client_app_id=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
+                trained_candidate_mask=np.ones((batch_size, candidate_seq_len), dtype=np.bool_),
+                value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
+                value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
                 post_ids=candidate_tweet_ids.astype(np.int64)
                 if self.include_candidate_post_ids
                 else None,

@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-08-12T04:09:22Z
+// mirrored from config feature-switch defaults; last sync 2026-09-18T16:21:20Z
 use xai_feature_switches::param;
 
 param!(
@@ -12,6 +12,12 @@ param!(
     bool,
     "rust_home_mixer_enable_phoenix_source",
     true
+);
+param!(
+    PhoenixColdStartMaxResults,
+    u32,
+    "rust_home_mixer_phoenix_cold_start_max_results",
+    0
 );
 
 param!(
@@ -80,7 +86,7 @@ param!(
     ShadowTrafficPhoenixClusterRates,
     Vec<String>,
     "rust_home_mixer_shadow_traffic_phoenix_cluster_rates",
-    vec!["Experiment6Fou:1.5".to_string()]
+    vec![]
 );
 param!(
     ShadowTrafficDefaultPercent,
@@ -92,6 +98,18 @@ param!(
     EnablePhoenixRetrievalStatsExperimentBucket,
     bool,
     "rust_home_mixer_enable_phoenix_retrieval_stats_experiment_bucket",
+    false
+);
+param!(
+    EnablePhoenixScoreStatsExperimentBucket,
+    bool,
+    "rust_home_mixer_enable_phoenix_score_stats_experiment_bucket",
+    false
+);
+param!(
+    EnableResponseDiversityStatsExperimentBucket,
+    bool,
+    "rust_home_mixer_enable_response_diversity_stats_experiment_bucket",
     false
 );
 param!(
@@ -122,13 +140,13 @@ param!(
     PhoenixAggregationType,
     String,
     "rust_home_mixer_phoenix_aggregation_type",
-    "DENSE_WITH_SHORT_DWELL"
+    "DENSE_WITH_LONG_DWELL"
 );
 param!(
     PhoenixRetrievalAggregationType,
     String,
     "rust_home_mixer_phoenix_retrieval_aggregation_type",
-    "DENSE_WITH_SHORT_DWELL"
+    "DENSE_WITH_LONG_DWELL"
 );
 
 param!(
@@ -153,7 +171,7 @@ param!(
     PhoenixRetrievalMOEInferenceClusterId,
     String,
     "rust_home_mixer_phoenix_retrieval_moe_inference_cluster_id",
-    "Experiment1Fou"
+    "Experiment3Memy04"
 );
 param!(
     PhoenixMOEMaxResults,
@@ -243,17 +261,17 @@ param!(
     "rust_home_mixer_log_slate_context",
     false
 );
+param!(RerankerHeadTag, i64, "rust_home_mixer_reranker_head_tag", 0);
 param!(
     OonWeightFactor,
     f64,
     "rust_home_mixer_oon_weight_factor",
     0.75
 );
-
 param!(
-    EnableMpnScoring,
+    MultiplierPreOffset,
     bool,
-    "rust_home_mixer_enable_mpn_scoring",
+    "rust_home_mixer_multiplier_pre_offset",
     false
 );
 
@@ -330,7 +348,7 @@ param!(
     VideoOpenWeight,
     f64,
     "rust_home_mixer_video_open_weight",
-    0.05
+    0.07
 );
 param!(ClickWeight, f64, "rust_home_mixer_click_weight", 0.4);
 param!(OpenLinkWeight, f64, "rust_home_mixer_open_link_weight", 0.2);
@@ -340,7 +358,7 @@ param!(
     "rust_home_mixer_profile_click_weight",
     0.0
 );
-param!(VqvWeight, f64, "rust_home_mixer_vqv_weight", 0.05);
+param!(VqvWeight, f64, "rust_home_mixer_vqv_weight", 0.0);
 param!(ShareWeight, f64, "rust_home_mixer_share_weight", 2.0);
 param!(
     ShareViaDmWeight,
@@ -354,7 +372,7 @@ param!(
     "rust_home_mixer_share_via_copy_link_weight",
     20.0
 );
-param!(DwellWeight, f64, "rust_home_mixer_dwell_weight", 0.0);
+param!(DwellWeight, f64, "rust_home_mixer_dwell_weight", 0.05);
 param!(QuoteWeight, f64, "rust_home_mixer_quote_weight", 5.0);
 param!(
     QuotedClickWeight,
@@ -411,34 +429,10 @@ param!(
     0.0
 );
 param!(
-    EnableClickDwellLowFavRatePenalty,
+    EnableCdwellOnImpr,
     bool,
-    "rust_home_mixer_enable_click_dwell_low_fav_rate_penalty",
+    "rust_home_mixer_enable_cdwell_on_impr",
     false
-);
-param!(
-    ClickDwellLowFavRatePenaltyBaseline,
-    f64,
-    "rust_home_mixer_click_dwell_low_fav_rate_penalty_baseline",
-    0.01
-);
-param!(
-    ClickDwellLowFavRatePenaltyAlpha,
-    f64,
-    "rust_home_mixer_click_dwell_low_fav_rate_penalty_alpha",
-    0.5
-);
-param!(
-    ClickDwellLowFavRatePenaltyFloor,
-    f64,
-    "rust_home_mixer_click_dwell_low_fav_rate_penalty_floor",
-    0.01
-);
-param!(
-    ClickDwellLowFavRatePenaltyCap,
-    f64,
-    "rust_home_mixer_click_dwell_low_fav_rate_penalty_cap",
-    1.0
 );
 param!(
     ContActiveSecs5mResidualNormWeight,
@@ -474,112 +468,16 @@ param!(
 );
 
 param!(
-    ValueModelMode,
-    String,
-    "rust_home_mixer_value_model_mode",
-    "weighted"
-);
-param!(
-    DwellRegretTemperature,
+    WeightPerturbationSigma,
     f64,
-    "rust_home_mixer_dwell_regret_temperature",
-    10.0
-);
-param!(
-    DwellRegretDwellFloor,
-    f64,
-    "rust_home_mixer_dwell_regret_dwell_floor",
-    1.0
-);
-param!(
-    DwellRegretAlphaFavorite,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_favorite",
-    1.0
-);
-param!(
-    DwellRegretAlphaReply,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_reply",
-    1.0
-);
-param!(
-    DwellRegretAlphaRetweet,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_retweet",
-    1.0
-);
-param!(
-    DwellRegretAlphaQuote,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_quote",
-    1.0
-);
-param!(
-    DwellRegretAlphaShare,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_share",
-    1.0
-);
-param!(
-    DwellRegretAlphaShareViaDm,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_share_via_dm",
-    1.0
-);
-param!(
-    DwellRegretAlphaShareViaCopyLink,
-    f64,
-    "rust_home_mixer_dwell_regret_alpha_share_via_copy_link",
-    1.0
-);
-param!(
-    DwellRegretNegNotInterested,
-    f64,
-    "rust_home_mixer_dwell_regret_neg_not_interested",
-    -10000.0
-);
-param!(
-    DwellRegretNegBlockAuthor,
-    f64,
-    "rust_home_mixer_dwell_regret_neg_block_author",
-    -8000.0
-);
-param!(
-    DwellRegretNegMuteAuthor,
-    f64,
-    "rust_home_mixer_dwell_regret_neg_mute_author",
-    -15000.0
-);
-param!(
-    DwellRegretNegReport,
-    f64,
-    "rust_home_mixer_dwell_regret_neg_report",
-    -60000.0
-);
-param!(
-    DwellRegretGateWeights,
-    String,
-    "rust_home_mixer_dwell_regret_gate_weights",
-    "seq_len:0.530298,n_fav:-0.082139,n_reply:0.485541,n_rt_quote:0.056561,n_vqv:-0.072778,n_click:-0.176675,n_bm_share:-0.167574,n_profile_follow:-0.221285,n_photo:-0.106004,n_negfb:0.031839,n_7d:-0.075799,n_1d:-0.241730,active_days:0.047017,active_days_7d:-0.126896,days_since_last:-0.034238,span_days:-0.052186,followers:-0.066642,followings:0.064140,account_age_years:-0.045455"
-);
-param!(
-    DwellRegretGateBias,
-    f64,
-    "rust_home_mixer_dwell_regret_gate_bias",
-    1.033918
-);
-param!(
-    DwellRegretGateThreshold,
-    f64,
-    "rust_home_mixer_dwell_regret_gate_threshold",
-    -0.634264
-);
-param!(
-    DwellRegretGateHysteresisBand,
-    f64,
-    "rust_home_mixer_dwell_regret_gate_hysteresis_band",
+    "rust_home_mixer_weight_perturbation_sigma",
     0.0
+);
+param!(
+    WeightPerturbationSalt,
+    String,
+    "rust_home_mixer_weight_perturbation_salt",
+    ""
 );
 
 param!(
@@ -620,16 +518,10 @@ param!(
     "Experiment3"
 );
 param!(
-    VMRankerValueModelId,
+    PhoenixExperimentOverrides,
     String,
-    "rust_home_mixer_vm_ranker_value_model_id",
-    "dpp"
-);
-param!(
-    VMRankerSendHeadWeights,
-    bool,
-    "rust_home_mixer_vm_ranker_send_head_weights",
-    false
+    "rust_home_mixer_phoenix_experiment_overrides",
+    ""
 );
 param!(
     VMRankerDppTheta,
@@ -671,7 +563,7 @@ param!(
     ColdStartMaxPostAgeSecs,
     u64,
     "rust_home_mixer_cold_start_max_post_age_secs",
-    86400
+    172800
 );
 
 param!(
@@ -709,7 +601,7 @@ param!(
     ColdStartTsTopK,
     u32,
     "rust_home_mixer_cold_start_ts_top_k",
-    5
+    2
 );
 param!(
     ColdStartImpressionScale,
@@ -915,7 +807,14 @@ param!(
     AdsBlenderType,
     String,
     "rust_home_mixer_ads_blender",
-    "partition_organic_low_risk"
+    "multi_risk"
+);
+
+param!(
+    EnableAdsBrandSafetyVerdictV2,
+    bool,
+    "rust_home_mixer_ads_bs_v2_exp_enabled",
+    false
 );
 param!(
     AdsTimeGapTSec,
@@ -1000,6 +899,13 @@ param!(
 );
 
 param!(
+    EnableFavHoldout,
+    bool,
+    "rust_home_mixer_enable_fav_holdout",
+    false
+);
+
+param!(
     EnableEntryIdRandomHash,
     bool,
     "rust_home_mixer_enable_entry_id_random_hash",
@@ -1010,6 +916,13 @@ param!(
     EnableTopicFeedbackContext,
     bool,
     "rust_home_mixer_enable_topic_feedback_context",
+    false
+);
+
+param!(
+    EnableAiTrendFeedbackContext,
+    bool,
+    "rust_home_mixer_enable_ai_trend_feedback_context",
     false
 );
 

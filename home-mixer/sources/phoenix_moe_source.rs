@@ -45,6 +45,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixMOESource {
                 sequence.clone(),
                 query.columnar_retrieval_sequence.clone(),
                 quality_factor::apply(query.params.get(PhoenixMOEMaxResults)),
+                0,
                 vec![],
                 None,
                 None,

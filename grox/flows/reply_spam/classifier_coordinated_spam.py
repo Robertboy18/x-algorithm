@@ -123,7 +123,11 @@ class CoordinatedSpamScorer:
             else:
                 tag = ""
             content.append(f"\n\n#### Post {i}{tag}\n\n")
-            content.extend(PostRenderer.render(p, max_media=MAX_MEDIA_PER_POST))
+            content.extend(
+                PostRenderer.render(
+                    p, max_media=MAX_MEDIA_PER_POST, include_follower_count=True
+                )
+            )
             content.append("\n\n------\n\n")
         convo.messages.append(Message(role=Role.HUMAN, content=content))
         return convo

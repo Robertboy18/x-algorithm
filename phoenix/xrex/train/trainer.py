@@ -244,6 +244,13 @@ class Trainer(Config):
     )
     current_ckpt_index: int = field(init=False, repr=False, compare=False, default=0)
 
+    @property
+    def step(self) -> int:
+        state = self.state[0] if isinstance(self.state, list) else self.state
+        step = state.step + 0
+        step = step.item()
+        return step
+
     data_first_read_timeout = 60
     data_read_timeout = 30
 
@@ -722,9 +729,10 @@ class Trainer(Config):
         if jax.default_backend() != "gpu":
             host_memory_kind = "unpinned_host"
 
-        self.host_sharding = self.adjust_host_sharding(
-            jax.tree.map(lambda s: s.with_memory_kind(host_memory_kind), self.state_sharding)
+        self.reload_host_sharding = jax.tree.map(
+            lambda s: s.with_memory_kind(host_memory_kind), self.state_sharding
         )
+        self.host_sharding = self.adjust_host_sharding(self.reload_host_sharding)
 
         def h2d_copy(src, dst):
             dst = jax.device_put(src, self.state_sharding)
@@ -736,8 +744,8 @@ class Trainer(Config):
         self.reload_state = JittedOrCompiled(
             jax.jit(
                 h2d_copy,
-                in_shardings=(self.host_sharding, self.state_sharding),
-                out_shardings=(self.host_sharding, self.state_sharding),
+                in_shardings=(self.reload_host_sharding, self.state_sharding),
+                out_shardings=(self.reload_host_sharding, self.state_sharding),
                 donate_argnums=(0, 1),
                 keep_unused=True,
             )
@@ -1149,6 +1157,19 @@ class Trainer(Config):
         mask = checkpointing_common.get_load_mask(axes, srcs, self.mesh)
         return axes, srcs, mask
 
+    def purge_opt_state_on_load(self, host_state):
+        rank_logger.info("Not loading optimizer state from checkpoint")
+        return host_state.purge_opt_state()
+
+    def warm_start_staging_spec(self):
+        keep_fields = {"opt_state"}
+        if hasattr(self.state, "emb_table_state"):
+            keep_fields.add("emb_table_state")
+        return (lambda tree: tree.purge_opt_state()), keep_fields
+
+    def _uses_tensorstore_save(self) -> bool:
+        return self.checkpoint_config.save_method == "tensorstore"
+
     def maybe_load_checkpoint(
         self, ctx: TrainerContext, tag: str | None = None
     ) -> tuple[bool, int, int]:
@@ -1156,28 +1177,74 @@ class Trainer(Config):
             rank_logger.info("Not loading checkpoint; starting from scratch")
             return False, 0, 0
 
+        _src = Path(ctx.checkpoint.path)
+        self._restored_encrypted = any(
+            (p / "_DEK").exists() or checkpointing_load._is_encrypted_tree(p)
+            for p in (_src, _src / "orbax-ckpt")
+        )
+
+        do_not_load_opt_state = (
+            self.checkpoint_config.no_opt_state or self.reinit_on_load
+        ) and ctx.checkpoint.is_manual_load()
+
+        use_streamed_restore = (
+            self.checkpoint_config.restore_streamed
+            and ctx.checkpoint.format == "orbax"
+            and not self._uses_tensorstore_save()
+        )
+        if self.checkpoint_config.restore_streamed and not use_streamed_restore:
+            rank_logger.info(
+                "restore_streamed=True but falling back to whole-state staging "
+                "(format=%s, save_method=%s)",
+                ctx.checkpoint.format,
+                self.checkpoint_config.save_method,
+            )
+
+        if use_streamed_restore:
+            self.state = checkpointing_load.copy_aliased_arrays(self.state)
+
         restore_kind = next(
             k for k in jax.tree.leaves(jax.tree.map(lambda s: s.memory_kind, self.host_sharding))
         )
         restore_staging_sharding = jax.tree.map(
             lambda s: s.with_memory_kind(restore_kind), self.state_sharding
         )
-        self.host_state = jax.device_put(self.state, restore_staging_sharding)
+        warm_purge = None
+        warm_keep_fields: set[str] = set()
+        if do_not_load_opt_state and hasattr(self.state, "purge_opt_state"):
+            warm_purge, warm_keep_fields = self.warm_start_staging_spec()
+            rank_logger.info(
+                "Not loading optimizer state from checkpoint (params-only %s staging)",
+                "streamed" if use_streamed_restore else "pinned-host",
+            )
+            staged_state = warm_purge(self.state)
+            staged_sharding = warm_purge(restore_staging_sharding)
+        else:
+            do_not_load_opt_state = False
+            staged_state = self.state
+            staged_sharding = restore_staging_sharding
+
+        if use_streamed_restore:
+            self.host_state = None
+        else:
+            self.host_state = jax.device_put(staged_state, staged_sharding)
 
         rename = None
 
         loads: dict[str, dict[str, jax.Array]] = {}
 
         if ctx.checkpoint.format == "orbax":
-            host_state = unwrap_tree(self.host_state)
-
-            do_not_load_opt_state = (
-                self.checkpoint_config.no_opt_state or self.reinit_on_load
-            ) and ctx.checkpoint.is_manual_load()
+            if use_streamed_restore:
+                host_state = jax.tree.map(
+                    lambda p: p.x if isinstance(p, Parameter) else p,
+                    staged_state,
+                    is_leaf=lambda x: isinstance(x, Parameter),
+                )
+            else:
+                host_state = unwrap_tree(self.host_state)
 
             if do_not_load_opt_state:
-                rank_logger.info("Not loading optimizer state from checkpoint")
-                host_state = host_state.purge_opt_state()
+                host_state = self.purge_opt_state_on_load(host_state)
 
             host_state = tree_to_dict(host_state)
             domains = None
@@ -1219,20 +1286,75 @@ class Trainer(Config):
                             name = checkpointing_load.rename_tensor(name, rename_state_patterns)
                             loads[checkpoint_path][name] = tensor
 
-            for checkpoint_path, partial_host_state in loads.items():
-                checkpointing_load.load_checkpoint(
-                    checkpoint_path,
-                    partial_host_state,
-                    load_mask=mask,
-                    rename=rename,
-                    domains=domains,
-                    tag=tag,
-                    timeout=self.checkpoint_config.timeout_secs,
-                )
+            if use_streamed_restore:
+                del staged_state
 
-            self.state = None
-            self.state = jax.device_put(self.host_state, self.state_sharding)
-            self.host_state = jax.device_put(self.state, self.host_sharding)
+                def _graft_replaced(pairs: list[tuple[jax.Array, jax.Array]]) -> None:
+                    id_map = {id(old): new for old, new in pairs}
+                    assert len(id_map) == len(pairs), (
+                        "restore_streamed does not support aliased state leaves: "
+                        "multiple loaded tensors share one device array"
+                    )
+                    grafted: set[int] = set()
+
+                    def _graft(x):
+                        new = id_map.get(id(x))
+                        if new is None:
+                            return x
+                        grafted.add(id(x))
+                        return new
+
+                    self.state = jax.tree.map(_graft, self.state)
+                    missing = len(id_map) - len(grafted)
+                    assert not missing, (
+                        f"{missing} loaded tensors were not grafted back into the state tree"
+                    )
+
+            for checkpoint_path, partial_host_state in loads.items():
+                if use_streamed_restore:
+                    checkpointing_load.load_checkpoint_streamed(
+                        checkpoint_path,
+                        partial_host_state,
+                        load_mask=mask,
+                        rename=rename,
+                        domains=domains,
+                        tag=tag,
+                        timeout=self.checkpoint_config.timeout_secs,
+                        window_gb=self.checkpoint_config.restore_window_gb,
+                        window_cap_gb=(
+                            self.checkpoint_config.restore_concurrent_gb
+                            if self.checkpoint_config.restore_window_gb is None
+                            else None
+                        ),
+                        on_replaced=_graft_replaced,
+                    )
+                else:
+                    checkpointing_load.load_checkpoint(
+                        checkpoint_path,
+                        partial_host_state,
+                        load_mask=mask,
+                        rename=rename,
+                        domains=domains,
+                        tag=tag,
+                        timeout=self.checkpoint_config.timeout_secs,
+                        concurrent_gb=self.checkpoint_config.restore_concurrent_gb,
+                    )
+
+            if not use_streamed_restore:
+                if do_not_load_opt_state:
+                    loaded = jax.device_put(self.host_state, warm_purge(self.state_sharding))
+                    self.state = self.state._replace(
+                        **{
+                            field: getattr(loaded, field)
+                            for field in self.state._fields
+                            if field not in warm_keep_fields
+                        }
+                    )
+                    self.host_state = None
+                else:
+                    self.state = None
+                    self.state = jax.device_put(self.host_state, self.state_sharding)
+                    self.host_state = jax.device_put(self.state, self.host_sharding)
 
             if mask:
                 axes_sizes = {}
@@ -1245,8 +1367,23 @@ class Trainer(Config):
                 )
 
                 _, treedef = jax.tree.flatten(self.state_shape)
-                axes = jax.tree.unflatten(treedef, jax.tree.flatten(axes)[0])
-                srcs = jax.tree.unflatten(treedef, jax.tree.flatten(srcs)[0])
+                keep = [
+                    len(jax.tree.leaves(node)) > 0
+                    for node in jax.tree.leaves(
+                        self.state_shape, is_leaf=lambda x: isinstance(x, Parameter)
+                    )
+                ]
+
+                def _align_to_state(tree):
+                    kept = [
+                        leaf
+                        for leaf, keep_leaf in zip(jax.tree.leaves(tree), keep, strict=True)
+                        if keep_leaf
+                    ]
+                    return jax.tree.unflatten(treedef, kept)
+
+                axes = _align_to_state(axes)
+                srcs = _align_to_state(srcs)
                 self.state = checkpointing_load.broadcast_replicated(
                     self.state, axes, srcs, self.mesh
                 )
@@ -1430,20 +1567,19 @@ class Trainer(Config):
         mfu = self.model_config.compute_mfu(num_seq_per_sec_per_device)
         tflops = self.model_config.compute_tflops(num_seq_per_sec_per_device)
 
+        etas: list[float] = []
+        fractions: list[float] = []
         if self.max_steps is not None:
-            eta = (self.max_steps - self.prev_step) * step_time / 3600
-            metrics["finished_percent"] = int(metrics["step"]) / self.max_steps
-        elif self.max_samples is not None:
-            eta = (
-                (self.max_samples - self.elapsed_samples)
-                / float(metrics["examples_per_batch"])
-                * step_time
-                / 3600
+            etas.append((self.max_steps - self.prev_step) * step_time / 3600)
+            fractions.append(int(metrics["step"]) / self.max_steps)
+        if self.max_samples is not None:
+            remaining_steps = (self.max_samples - self.elapsed_samples) / float(
+                metrics["examples_per_batch"]
             )
-            metrics["finished_percent"] = self.elapsed_samples / self.max_samples
-        else:
-            eta = -1
-            metrics["finished_percent"] = -1
+            etas.append(remaining_steps * step_time / 3600)
+            fractions.append(self.elapsed_samples / self.max_samples)
+        eta = min(etas) if etas else -1
+        metrics["finished_percent"] = max(fractions) if fractions else -1
         self.prev_step = int(metrics["step"])
 
         metrics["soft_step"] = soft_step

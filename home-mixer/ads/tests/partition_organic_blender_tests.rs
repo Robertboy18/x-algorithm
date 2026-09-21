@@ -51,6 +51,17 @@ fn make_sensitive_ad(post_id: i64) -> AdIndexInfo {
     }
 }
 
+fn make_bsr_high_ad(post_id: i64) -> AdIndexInfo {
+    AdIndexInfo {
+        post_id,
+        ad_adjacency_control: Some(AdAdjacencyControl {
+            brand_safety_risk: BrandSafetyRiskLevel::BsrHigh.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn ad_count(items: &[FeedItem]) -> usize {
     items
         .iter()
@@ -1105,4 +1116,23 @@ fn serving_limitation_ties_break_supply_then_spacing() {
     assert_eq!(serving_limitation(5, 5, 5), "ads_supply");
     assert_eq!(serving_limitation(9, 5, 5), "spacing");
     assert_eq!(serving_limitation(5, 9, 5), "ads_supply");
+}
+
+#[test]
+fn bsr_high_ad_sits_next_to_safe_not_medium() {
+    let mut posts: Vec<_> = (1..=6).map(make_avoid_post).collect();
+    posts.extend((7..=12).map(make_post));
+    let result = blend_impl(posts, vec![make_bsr_high_ad(100)], 5);
+    assert_eq!(ad_count(&result), 1);
+    let (above, below) = ad_neighbour_verdicts(&result)[0];
+    assert_ne!(above, BrandSafetyVerdict::MediumRisk);
+    assert_ne!(below, BrandSafetyVerdict::MediumRisk);
+    assert_eq!(ad_bsr_levels(&result)[0], BrandSafetyRiskLevel::BsrHigh);
+}
+
+#[test]
+fn bsr_high_ad_dropped_when_only_medium_posts() {
+    let posts: Vec<_> = (1..=8).map(make_avoid_post).collect();
+    let result = blend_impl(posts, vec![make_bsr_high_ad(100)], 5);
+    assert_eq!(ad_count(&result), 0);
 }

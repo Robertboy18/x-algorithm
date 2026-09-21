@@ -9,12 +9,13 @@ from grox.core.data_loaders.data_types import Post
 from grox.core.data_loaders.strato_loader import UserStratoLoader
 from grox.core.schedules.types import TaskContext
 from grox.core.tasks.task_filters import TaskFilterWithPost
+from grox.flows.reply_spam.constants import GROK_GEMMA_FOLLOWER_SPLIT
 
 logger = logging.getLogger(__name__)
 
 
 class TaskSpamFilter(TaskFilterWithPost):
-    FOLLOWER_COUNT_THRESHOLD_FOR_SPAM_DETECTION = 30000
+    FOLLOWER_COUNT_THRESHOLD_FOR_SPAM_DETECTION = GROK_GEMMA_FOLLOWER_SPLIT
 
     @override
     @classmethod
@@ -94,7 +95,7 @@ class TaskSpamFilter(TaskFilterWithPost):
 
 
 class TaskCoordinatedSpamFilter(TaskFilterWithPost):
-    FOLLOWER_COUNT_THRESHOLD_FOR_SPAM_DETECTION = 1000
+    FOLLOWER_COUNT_THRESHOLD_FOR_SPAM_DETECTION = 50000
     FILTER_NAME = "coordinated_spam"
 
     @override
@@ -182,7 +183,7 @@ class TaskCoordinatedSpamFilter(TaskFilterWithPost):
 
 
 class TaskReplyRankingFilter(TaskFilterWithPost):
-    FOLLOWER_COUNT_THRESHOLD_FOR_REPLY_RANKING = 30000
+    FOLLOWER_COUNT_THRESHOLD_FOR_REPLY_RANKING = GROK_GEMMA_FOLLOWER_SPLIT
 
     @override
     @classmethod

@@ -235,6 +235,7 @@ class TaskWriteSafetyPostAnnotationsResultSink(Task):
                 if policy_type in (
                     SafetyPolicyType.SpamEngagementBaiting,
                     SafetyPolicyType.SpamEngagementFarming,
+                    SafetyPolicyType.SpamCardManipulation,
                 ):
                     should_label_for_spam = True
                 elif policy_type != SafetyPolicyType.NoViolation:

@@ -5,7 +5,7 @@ use futures::future::join_all;
 use futures::{StreamExt, TryStreamExt};
 use google_cloud_storage::client::{Storage, StorageControl};
 
-use crate::checkpoint_store::get_checkpoint_store;
+use crate::checkpoint_store::{get_checkpoint_store, get_store};
 use log::{debug, error, info};
 use numpy::PyReadwriteArray1;
 use object_store::aws::AmazonS3Builder;
@@ -76,8 +76,9 @@ fn o2_store_from_url(
         ..Default::default()
     };
 
-    let endpoint =
-        env::var("O2_ENDPOINT_URL").unwrap_or_else(|_| "http://o2.example.invalid".into());
+    let endpoint = env::var("O2_ENDPOINT_URL").map_err(|_| {
+        "O2 endpoint not set: set XAI_O2_ENDPOINT_URL or O2_ENDPOINT_URL".to_string()
+    })?;
     let access_key = env::var("O2_ACCESS_KEY_ID").unwrap_or_else(|_| "anonymous".to_string());
     let secret_key = env::var("O2_SECRET_ACCESS_KEY").unwrap_or_else(|_| "anonymous".to_string());
 
@@ -223,7 +224,7 @@ pub fn upload_files_to_storage(
         num_files, storage_url,
     );
     let upload_start = std::time::Instant::now();
-    let store_result = get_checkpoint_store(&storage_url, Some(upload_runtime));
+    let store_result = get_store(&storage_url, Some(upload_runtime));
     match store_result {
         Ok((store, base_path)) => {
             let base = base_path.as_ref().to_string();

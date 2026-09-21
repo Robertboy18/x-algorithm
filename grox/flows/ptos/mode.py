@@ -12,7 +12,7 @@ class SafetyPtosMode(str, Enum):
     @classmethod
     def from_task_type(cls, task_type: str | None) -> "SafetyPtosMode":
         match task_type:
-            case constants.SAFETY_PTOS_DELUXE:
+            case t if t in constants.DELUXE_TIER_TASK_TYPES:
                 return cls.DELUXE
             case constants.SAFETY_PTOS_RECOVERY:
                 return cls.RECOVERY

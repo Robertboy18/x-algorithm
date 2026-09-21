@@ -7,17 +7,15 @@ import urllib.error
 import urllib.request
 import uuid
 
+from grox.config.config import grox_config
 from grox.core.lib.utils import detect_image_content_type
 from grox.core.data_loaders.data_types import Image, Post, Video
-from grox.flows.ptos.state import (
-    SafetyPolicyCategory,
-    SafetyPolicyType,
-    SafetyPtosState,
-)
+from grox.flows.ptos.state import SafetyPolicyCategory, SafetyPtosState
 from grox.core.schedules.types import TaskContext
 from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
 from monitor.metrics import Metrics
-from grox.flows.ptos.constants import SAFETY_PTOS_DELUXE
+from grox.flows.ptos.constants import DELUXE_TIER_TASK_TYPES
+from grox.flows.ptos.prior_nsfw import post_is_already_flagged_nsfw
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +29,7 @@ _MAX_RETRIES = 3
 _MAX_FRAMES_PER_VIDEO = 8
 _MAX_PAYLOADS_PER_POST = 12
 _ADULT_POSITIVE_BUCKETS = {"R", "X"}
+_FRAME_KINDS = {"video_frame", "broadcast_frame"}
 _METRIC_PREFIX = "task.safety_ptos_safemodel_sex_nudity"
 
 
@@ -62,12 +61,18 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
 
     @classmethod
     async def _run(cls, ctx: TaskContext, post: Post) -> None:
-        is_deluxe = ctx.payload.task_type == SAFETY_PTOS_DELUXE
+        is_deluxe = ctx.payload.task_type in DELUXE_TIER_TASK_TYPES
         flow = "deluxe" if is_deluxe else "standard"
 
         if not is_deluxe and not cls._has_adult_content_suspicion(ctx):
             Metrics.counter(f"{_METRIC_PREFIX}.skipped.count").add(
                 1, attributes={"reason": "no_adult_content_suspicion", "flow": flow}
+            )
+            return
+
+        if is_deluxe and await post_is_already_flagged_nsfw(ctx, post):
+            Metrics.counter(f"{_METRIC_PREFIX}.skipped.count").add(
+                1, attributes={"reason": "prior_nsfw", "flow": flow}
             )
             return
 
@@ -78,10 +83,10 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
             )
             return
 
-        has_video = any(kind == "video_frame" for kind, _ in payloads)
+        has_video = any(kind in _FRAME_KINDS for kind, _ in payloads)
         has_video_attr = "true" if has_video else "false"
         n_images = sum(1 for kind, _ in payloads if kind == "image")
-        n_video_frames = sum(1 for kind, _ in payloads if kind == "video_frame")
+        n_video_frames = sum(1 for kind, _ in payloads if kind in _FRAME_KINDS)
 
         Metrics.counter(f"{_METRIC_PREFIX}.invoked.count").add(
             1, attributes={"has_video": has_video_attr, "flow": flow}
@@ -123,42 +128,17 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
             )
             return
 
-        annotations = ctx.state(SafetyPtosState).annotations
-        violations = (annotations.violatedPolicies or []) if annotations else []
-        ptos_positive = any(
-            v.category == SafetyPolicyCategory.AdultContent
-            and v.safetyPolicy is not None
-            and v.safetyPolicy.policyType == SafetyPolicyType.AdultContentSexualHard
-            for v in violations
-        )
-
-        outcome = cls._compare_outcome(safemodel_positive, ptos_positive)
-        Metrics.counter(f"{_METRIC_PREFIX}.compare.count").add(
-            1,
-            attributes={"outcome": outcome, "has_video": has_video_attr, "flow": flow},
-        )
-
         logger.info(
             f"Post {post.id} ({flow}): safemodel={'positive' if safemodel_positive else 'negative'} "
-            f"(buckets={buckets_seen}, n_errors={n_errors}, n_images={n_images}, n_video_frames={n_video_frames}) "
-            f"ptos={'positive' if ptos_positive else 'negative'} outcome={outcome}"
+            f"(buckets={buckets_seen}, n_errors={n_errors}, n_images={n_images}, n_video_frames={n_video_frames})"
         )
 
+        ctx.state(SafetyPtosState).safemodel_sex_nudity.scored = True
         if safemodel_positive:
             ctx.state(SafetyPtosState).safemodel_sex_nudity.positive = True
             ctx.state(
                 SafetyPtosState
             ).safemodel_sex_nudity.confidence = max_positive_confidence
-
-    @staticmethod
-    def _compare_outcome(safemodel_positive: bool, ptos_positive: bool) -> str:
-        if safemodel_positive and ptos_positive:
-            return "both_positive"
-        if not safemodel_positive and not ptos_positive:
-            return "both_negative"
-        if safemodel_positive:
-            return "safemodel_only_positive"
-        return "ptos_only_positive"
 
     @classmethod
     def _collect_payloads(cls, post: Post) -> list[tuple[str, bytes]]:
@@ -175,6 +155,14 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
                         payloads.append(("video_frame", frame))
             if len(payloads) >= _MAX_PAYLOADS_PER_POST:
                 return payloads[:_MAX_PAYLOADS_PER_POST]
+        if grox_config.media_hydration.enable_local_broadcast_frame_extraction:
+            for video in cls._iter_broadcast_videos(post):
+                for frame in cls._sample_uniform(
+                    video.convo_video.frames, _MAX_FRAMES_PER_VIDEO
+                ):
+                    payloads.append(("broadcast_frame", frame))
+                if len(payloads) >= _MAX_PAYLOADS_PER_POST:
+                    return payloads[:_MAX_PAYLOADS_PER_POST]
         return payloads
 
     @staticmethod
@@ -185,6 +173,15 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
         if post.quoted_post and post.quoted_post.media:
             for m in post.quoted_post.media:
                 yield m
+
+    @staticmethod
+    def _iter_broadcast_videos(post: Post):
+        for owner in (post, post.quoted_post):
+            if owner is None or owner.broadcast_metadata is None:
+                continue
+            video = owner.broadcast_metadata.video
+            if video and video.convo_video and video.convo_video.frames:
+                yield video
 
     @staticmethod
     def _sample_uniform(items: list[bytes], k: int) -> list[bytes]:

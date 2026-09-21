@@ -11,7 +11,7 @@ use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 use xai_vm_ranker_proto::vm_ranker_service_client::VmRankerServiceClient;
 use xai_vm_ranker_proto::{RankRequest, RankResponse};
 use xai_x_rpc::balanced_channel::{LbPolicy, LoadBalancedChannel};
-use xai_x_rpc::grpc_client::insecure_tls_config;
+use xai_x_rpc::grpc_client::{insecure_tls_config, Dscp};
 use xai_x_rpc::service_probe::KeepAlive;
 use xai_x_rpc::xds_endpoint_source::XdsEndpointSource;
 use xai_xds_client::{ServiceState, StartFrom, XdsClient};
@@ -185,6 +185,7 @@ impl XdsVMRankerClient {
                             Some(h2_initial_connection_window),
                         )
                         .socket_buffer_bytes(Some(socket_buffer_bytes))
+                        .dscp(Some(Dscp::InferenceCritical))
                         .keep_alive(KeepAlive {
                             interval: Some(Duration::from_secs(30)),
                             timeout: Some(Duration::from_secs(10)),

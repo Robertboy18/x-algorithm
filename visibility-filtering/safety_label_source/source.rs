@@ -33,7 +33,7 @@ fn ttl_for_tweet(tweet_id: u64, now: SystemTime) -> Option<Duration> {
 }
 
 pub struct SafetyLabelSource {
-    cache: ExpiringCache<u64, vf_pb::SafetyLabelMap>,
+    cache: ExpiringCache<u64, Arc<vf_pb::SafetyLabelMap>>,
     remote: Arc<RemoteSource>,
 }
 
@@ -59,17 +59,16 @@ impl SafetyLabelSource {
     pub async fn get(
         &self,
         ids: &[u64],
-    ) -> HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>> {
+    ) -> HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> {
         let total = ids.len();
-        let mut results: HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>> =
+        let mut results: HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>> =
             HashMap::with_capacity(total);
 
         let (local_misses, expired) = self.get_local(ids, &mut results);
         let batch_size = local_misses.len();
 
         let remote_results = self.remote.get(&local_misses).await;
-        self.backfill_local(&remote_results);
-        results.extend(remote_results);
+        self.backfill_local(remote_results, &mut results);
 
         self.emit_stats(total - batch_size, batch_size, expired);
 
@@ -79,7 +78,7 @@ impl SafetyLabelSource {
     fn get_local(
         &self,
         ids: &[u64],
-        results: &mut HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>,
+        results: &mut HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
     ) -> (Vec<u64>, usize) {
         let mut misses = Vec::with_capacity(ids.len());
         let mut expired = 0;
@@ -98,14 +97,20 @@ impl SafetyLabelSource {
         (misses, expired)
     }
 
-    fn backfill_local(&self, results: &HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>) {
+    fn backfill_local(
+        &self,
+        remote_results: HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>,
+        results: &mut HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
+    ) {
         let wall_now = SystemTime::now();
-        for (&id, result) in results {
-            if let Ok(label_map) = result
+        for (id, result) in remote_results {
+            let result = result.map(Arc::new);
+            if let Ok(label_map) = &result
                 && let Some(ttl) = ttl_for_tweet(id, wall_now)
             {
-                self.cache.insert(id, label_map.clone(), ttl);
+                self.cache.insert(id, Arc::clone(label_map), ttl);
             }
+            results.insert(id, result);
         }
     }
 
@@ -121,9 +126,9 @@ impl SafetyLabelSource {
 mod tests {
     use super::*;
 
-    use crate::twemcache::{Key, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::async_trait;
+    use xai_cache::{KVCacheError, Key, Value};
     use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
     use crate::safety_label_source::codec::{LkeyBytes, MvalBytes, RawSafetyLabel};
@@ -133,7 +138,7 @@ mod tests {
     use crate::safety_label_source::twemcache::{CacheRead, TwemcacheSource};
 
     struct FakeTwemcache {
-        results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         fetched_keys: Arc<AtomicUsize>,
     }
 
@@ -142,7 +147,7 @@ mod tests {
         async fn multi_get(
             &self,
             keys: &[Key],
-        ) -> HashMap<Key, crate::twemcache::Result<Option<Value>>> {
+        ) -> HashMap<Key, std::result::Result<Option<Value>, KVCacheError>> {
             self.fetched_keys.fetch_add(keys.len(), Ordering::SeqCst);
             self.results.clone()
         }
@@ -166,14 +171,14 @@ mod tests {
     }
 
     fn make_source(
-        cache_results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         mh_items: HashMap<i64, Vec<RawSafetyLabel>>,
     ) -> SafetyLabelSource {
         make_source_with_clock(cache_results, mh_items, Clock::new())
     }
 
     fn make_source_with_clock(
-        cache_results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         mh_items: HashMap<i64, Vec<RawSafetyLabel>>,
         clock: Clock,
     ) -> SafetyLabelSource {
@@ -181,14 +186,14 @@ mod tests {
     }
 
     fn make_counting_source(
-        cache_results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         mh_items: HashMap<i64, Vec<RawSafetyLabel>>,
     ) -> (SafetyLabelSource, Arc<AtomicUsize>) {
         make_counting_source_with_clock(cache_results, mh_items, Clock::new())
     }
 
     fn make_counting_source_with_clock(
-        cache_results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         mh_items: HashMap<i64, Vec<RawSafetyLabel>>,
         clock: Clock,
     ) -> (SafetyLabelSource, Arc<AtomicUsize>) {
@@ -257,12 +262,15 @@ mod tests {
         );
 
         let results1 = source.get(&[42]).await;
-        let first = results1.get(&42).unwrap().as_ref().unwrap().clone();
+        let first = Arc::clone(results1.get(&42).unwrap().as_ref().unwrap());
         assert_eq!(remote_keys.load(Ordering::SeqCst), 1);
         assert!(source.cache.expiry_of(&42).is_some());
 
         let results2 = source.get(&[42]).await;
-        assert_eq!(results2.get(&42).unwrap().as_ref().unwrap(), &first);
+        assert!(Arc::ptr_eq(
+            results2.get(&42).unwrap().as_ref().unwrap(),
+            &first
+        ));
         assert_eq!(remote_keys.load(Ordering::SeqCst), 1);
     }
 
@@ -285,10 +293,7 @@ mod tests {
         let source = make_source(
             HashMap::from([
                 (cache_key(10), Ok(Some(cached_one_label()))),
-                (
-                    cache_key(20),
-                    Err(crate::twemcache::TwemcacheError::Io("shard timeout".into())),
-                ),
+                (cache_key(20), Err(KVCacheError::Io("shard timeout".into()))),
                 (cache_key(30), Ok(None)),
             ]),
             HashMap::from([(

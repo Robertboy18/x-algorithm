@@ -1,5 +1,6 @@
 use crate::ads::{
-    AdsBlender, PartitionOrganicAdsBlender, SafeGapAdsBlender, TimeGapAdsBlender, TimeGapConfig,
+    AdsBlender, MultiRiskAdsBlender, PartitionOrganicAdsBlender, SafeGapAdsBlender,
+    TimeGapAdsBlender, TimeGapConfig,
 };
 use crate::frames;
 use crate::models::query::ScoredPostsQuery;
@@ -16,6 +17,7 @@ use xai_recsys_proto::AdIndexInfo;
 pub struct BlenderSelector {
     safe_gap_blender: SafeGapAdsBlender,
     partition_organic_blender: PartitionOrganicAdsBlender,
+    multi_risk_blender: MultiRiskAdsBlender,
 }
 
 impl BlenderSelector {
@@ -23,6 +25,7 @@ impl BlenderSelector {
         Self {
             safe_gap_blender: SafeGapAdsBlender::default(),
             partition_organic_blender: PartitionOrganicAdsBlender,
+            multi_risk_blender: MultiRiskAdsBlender,
         }
     }
 }
@@ -48,7 +51,9 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
 
         let time_gap_blender;
         let blender: &dyn AdsBlender = match query.params.get(AdsBlenderType).as_str() {
+            "partition_organic_low_risk" => &self.partition_organic_blender,
             "safe_gap" => &self.safe_gap_blender,
+            "multi_risk" => &self.multi_risk_blender,
             "time_gap" => {
                 time_gap_blender = TimeGapAdsBlender {
                     config: TimeGapConfig {

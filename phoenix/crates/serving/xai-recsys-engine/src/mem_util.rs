@@ -89,9 +89,13 @@ pub fn madvise_hugepage_internal(slice: &mut [u8]) -> Result<(), io::Error> {
         use std::ffi::c_void;
 
         let offset = (!(slice.as_ptr() as usize) + 1) & (HUGE_PAGE_SIZE - 1);
+        let len = slice.len().saturating_sub(offset) & !(HUGE_PAGE_SIZE - 1);
+        if len == 0 {
+            return Ok(());
+        }
         let ret = madvise(
             slice.as_mut_ptr().add(offset) as *mut c_void,
-            (slice.len() - offset) & !(HUGE_PAGE_SIZE - 1),
+            len,
             MADV_HUGEPAGE,
         );
         if ret != 0 {

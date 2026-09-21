@@ -39,6 +39,7 @@ class User(BaseModel):
     urls: list[str] | None = None
     affiliated_business: AffiliatedBusiness | None = None
     recent_posts: list["Post"] | None = None
+    profile_image: "Image | None" = None
 
     @classmethod
     def from_thrift_model(cls, author_metadata: t.AuthorMetadata) -> "User":
@@ -85,6 +86,9 @@ class User(BaseModel):
                 url=author_metadata.affiliatedBusinessMetadata.url,
             )
             if author_metadata.affiliatedBusinessMetadata
+            else None,
+            profile_image=Image(url=author_metadata.profileImageUrl)
+            if getattr(author_metadata, "profileImageUrl", None)
             else None,
         )
 
@@ -217,6 +221,7 @@ class Video(BaseModel):
     videoInfo: VideoInfo | None = None
     animatedGifInfo: VideoInfo | None = None
     convo_video: ConvoVideo | None = None
+    crop_seconds: float | None = None
 
     @classmethod
     def from_thrift_model(cls, media_entity: t.MediaEntity) -> "Video":
@@ -367,30 +372,47 @@ class LegacyCard(BaseModel):
         )
 
     def to_convo(self) -> list[str | ConvoImage]:
-        res: list[str | ConvoImage] = ["\n\n[Card] ", " "]
+        body: list[str | ConvoImage] = []
         if self.title:
-            res.append(f"\n\nTitle: {self.title}")
+            body.append(f"\n\n[Card Title] {self.title}")
         if self.description:
-            res.append(f"\n\nDescription: {self.description}")
+            body.append(f"\n\nDescription: {self.description}")
         if self.domain:
-            res.append(f"\n\nDomain: {self.domain}")
+            body.append(f"\n\nDomain: {self.domain}")
         if self.thumbnail_image and self.thumbnail_image.convo_image:
-            res.extend(["\n\n[Card Image] ", self.thumbnail_image.convo_image, " "])
+            body.extend(["\n\n[Card Image] ", self.thumbnail_image.convo_image, " "])
         if self.poll_cards:
-            res.append(
+            body.append(
                 "\n\nThis post includes a poll where user can vote their choices. The choices are as rendered below:"
             )
             for poll_card in self.poll_cards:
-                res.extend(poll_card.to_convo())
-        if self.grok_share_cards:
-            share_parts: list[str | ConvoImage] = []
-            for grok_share_card in self.grok_share_cards:
-                share_parts.extend(grok_share_card.to_convo())
-            if share_parts:
-                res.append(
-                    "\n\nThis post includes a shared Grok conversation. The conversation messages are as rendered below:"
-                )
-                res.extend(share_parts)
+                body.extend(poll_card.to_convo())
+        if not body:
+            return []
+        return ["\n\n[Card] ", " "] + body
+
+
+class GrokShare(BaseModel):
+    sender: str | None = None
+    message: str | None = None
+
+    @classmethod
+    def from_thrift_model(cls, metadata: t.GrokShareMetadata) -> "GrokShare":
+        sender = (
+            t.GrokShareConversationSender._VALUES_TO_NAMES.get(metadata.sender)
+            if metadata.sender is not None
+            else None
+        )
+        return cls(sender=sender, message=metadata.message)
+
+    def to_convo(self) -> list[str | ConvoImage]:
+        if not self.sender and not self.message:
+            return []
+        res: list[str | ConvoImage] = ["\n\n[Grok Share Message] ", " "]
+        if self.sender:
+            res.append(f"\n\nSender: {self.sender}")
+        if self.message:
+            res.append(f"\n\nMessage: {self.message}")
         return res
 
 
@@ -424,7 +446,7 @@ class UnifiedCard(BaseModel):
     def to_convo(self) -> list[str | ConvoImage | ConvoVideo]:
         res: list[str | ConvoImage | ConvoVideo] = ["\n\n[Card] ", " "]
         if self.title:
-            res.append(f"\n\nTitle: {self.title}")
+            res.append(f"\n\n[Card Title] {self.title}")
         if self.description:
             res.append(f"\n\nDescription: {self.description}")
         if self.url:
@@ -507,6 +529,7 @@ class BroadcastMetadata(BaseModel):
     media_key: str | None = None
     thumbnail_image: Image | None = None
     video: Video | None = None
+    crop_seconds: float | None = None
 
     @classmethod
     def from_thrift_model(
@@ -520,8 +543,8 @@ class BroadcastMetadata(BaseModel):
             else None,
         )
 
-    def to_convo(self) -> list[str | ConvoImage]:
-        res: list[str | ConvoImage] = [
+    def to_convo(self) -> list[str | ConvoImage | ConvoVideo]:
+        res: list[str | ConvoImage | ConvoVideo] = [
             "\n\nThis post has the following broadcast metadata attached:"
         ]
         if self.thumbnail_image and self.thumbnail_image.convo_image:
@@ -576,6 +599,22 @@ class ChatGroupMetadata(BaseModel):
                 "\n\nThis post has the following chat group invite metadata attached:"
             ] + res
         return res
+
+
+class SpaceMetadata(BaseModel):
+    title: str | None = None
+
+    @classmethod
+    def from_thrift_model(cls, metadata: t.SpaceMetadata) -> "SpaceMetadata":
+        return cls(title=metadata.title)
+
+    def to_convo(self) -> list[str]:
+        if not self.title:
+            return []
+        return [
+            "\n\nThis post has the following audio space card attached:",
+            f"\nAudio Space title: {self.title}",
+        ]
 
 
 class ArticleMetadata(BaseModel):
@@ -648,6 +687,7 @@ class Post(BaseModel):
     screenshot: Image | None = None
     reply: Reply | None = None
     cardsV2: list[CardV2] | None = None
+    grok_share_metadatas: list[GrokShare] | None = None
     article_metadata: ArticleMetadata | None = None
     descendants: list["Post"] | None = None
     user_agent: str | None = None
@@ -657,6 +697,7 @@ class Post(BaseModel):
     safety_labels: list[str] | None = None
     list_metadata: ListMetadata | None = None
     chat_group_metadata: ChatGroupMetadata | None = None
+    space_metadata: SpaceMetadata | None = None
 
     def get_images(self) -> list[Image]:
         images: list[Image] = []
@@ -679,8 +720,6 @@ class Post(BaseModel):
 
     def _collect_urls(self) -> list[str]:
         urls: list[str] = list(self.urls or [])
-        if self.user and self.user.urls:
-            urls.extend(self.user.urls)
         if self.card and hasattr(self.card, "url") and self.card.url:
             urls.append(self.card.url)
         if self.cardsV2:
@@ -689,6 +728,8 @@ class Post(BaseModel):
                     for uc in cv.unified_cards:
                         if hasattr(uc, "url") and uc.url:
                             urls.append(uc.url)
+        if self.user and self.user.urls:
+            urls.extend(self.user.urls)
         return urls
 
     def extract_domains(self) -> list[str]:
@@ -698,11 +739,11 @@ class Post(BaseModel):
             except Exception:
                 return None
 
-        domains = set()
+        domains: dict[str, None] = {}
         for url in self._collect_urls():
             h = (hostname(url) or "").strip().lower()
             if h and re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", h):
-                domains.add(h)
+                domains[h] = None
         return list(domains)
 
     @classmethod
@@ -744,6 +785,12 @@ class Post(BaseModel):
             ]
         else:
             cardsV2 = None
+        if post_metadata.grokShareMetadatas:
+            grok_share_metadatas = [
+                GrokShare.from_thrift_model(m) for m in post_metadata.grokShareMetadatas
+            ]
+        else:
+            grok_share_metadatas = None
         if post_metadata.articleMetadata:
             article_metadata = ArticleMetadata.from_thrift_model(
                 post_metadata.articleMetadata
@@ -760,6 +807,12 @@ class Post(BaseModel):
             )
         else:
             chat_group_metadata = None
+        if post_metadata.spaceMetadata:
+            space_metadata = SpaceMetadata.from_thrift_model(
+                post_metadata.spaceMetadata
+            )
+        else:
+            space_metadata = None
 
         return cls(
             id=str(post_metadata.postId),
@@ -778,6 +831,7 @@ class Post(BaseModel):
             ancestors=[],
             screenshot=None,
             cardsV2=cardsV2,
+            grok_share_metadatas=grok_share_metadatas,
             article_metadata=article_metadata,
             user_agent=post_metadata.userAgent
             if hasattr(post_metadata, "userAgent")
@@ -793,6 +847,7 @@ class Post(BaseModel):
             else None,
             list_metadata=list_metadata,
             chat_group_metadata=chat_group_metadata,
+            space_metadata=space_metadata,
         )
 
     @classmethod

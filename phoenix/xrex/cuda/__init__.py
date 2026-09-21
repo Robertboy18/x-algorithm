@@ -20,21 +20,29 @@ shape:
   compiled extension is present, and it is what an installation without
   ``nvcc`` gets;
 * the **CUDA/C++ source** under ``<kernel>/src/``, with the shared XLA-FFI
-  helpers under ``xla_utils/``. Building it produces a nanobind extension named
-  after the file (``adler32_api``, ``unique_api``, ``top_k_by_key_api``, ...),
-  and each subpackage tries to import that extension from its own ``src/`` at
-  import time. When the import succeeds the kernel is registered as an XLA FFI
-  target and used instead of the reference; when it fails the reference stands.
+  helpers under ``xla_utils/``. Each subpackage tries to import a nanobind
+  extension named after the file (``adler32_api``, ``unique_api``,
+  ``top_k_by_key_api``) at import time. When the import succeeds the kernel
+  is registered as an XLA FFI target and used instead of the reference; when
+  it fails (``ModuleNotFoundError``) the reference stands.
+
+  All three are built: each ``<kernel>/src/BUILD`` feeds the
+  ``xrex-cuda-kernels`` wheel and the loader imports
+  ``xrex_cuda_kernels.<api>``, so an environment with the package runs the
+  compiled kernel and one without it runs the reference — and logs a warning
+  saying so, because a venv quietly on the reference path is the failure mode
+  this layout exists to prevent. ``wheel_inventory_test.py`` fails if a kernel
+  is added here without its build, its wheel entry and its loader import.
 
 The FFI target names are prefixed ``xrex_``.
 
-**The extensions are built out of tree, never by ``uv sync``.** The compiled
-path is optional by design, so the package installs and the reference kernels
-run on a box with no ``nvcc``. To compile one yourself you need ``nvcc``, the
-XLA FFI headers (``xla/ffi/api/ffi.h``, from jaxlib), nanobind, and — for
-``unique`` and ``top_k_by_key`` — CUB/Thrust/CUTLASS from the CUDA toolkit.
-Compile ``<kernel>/src/*.cu`` and ``*.cc`` into a shared object named for its
-``NB_MODULE`` and drop it in ``<kernel>/src/``, with the repository root on the
-include path so ``xrex/cuda/xla_utils/...`` resolves (``async_emb`` localizes
-its includes and needs only its own ``src/``).
+Kernels with a compiled-only contract (``async_emb``, ``fa3``) import their
+extension as ``xrex_cuda_kernels.<kernel>_api`` at module import time. Only a
+missing extension becomes that kernel's named ``ImportError``; a
+present-but-broken one raises its own error. The ``xrex-cuda-kernels`` package
+is defined by ``xrex/cuda/wheel/BUILD``, a bazel wheel of those extensions.
+Installing the ``xrex/cuda/wheel`` directory with ``pip``/``uv`` runs that
+bazel build through the PEP-517 backend in ``wheel/backend.py`` (needs
+bazelisk and git; the CUDA toolchain is fetched hermetically). An index may
+also carry prebuilt wheels of the same target.
 """

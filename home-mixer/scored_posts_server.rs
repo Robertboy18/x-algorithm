@@ -117,6 +117,8 @@ fn candidates_to_scored_posts(candidates: &[PostCandidate]) -> Vec<ScoredPost> {
                     .map(|d| d as f32),
                 topic_feedback_topic: candidate.topic_feedback_topic.clone(),
                 topic_feedback_topic_id: candidate.topic_feedback_topic_id.clone(),
+                ai_trend_name: candidate.ai_trend_name.clone(),
+                ai_trend_id: candidate.ai_trend_id.clone(),
             }
         })
         .collect()
@@ -220,6 +222,11 @@ fn safety_label_to_proto(label: SafetyLabelType) -> Option<i32> {
         SafetyLabelType::NSFA_HIGH_RECALL => HM::NsfaHighRecall,
         SafetyLabelType::GROK_SFA => HM::GrokSfa,
         SafetyLabelType::MALICIOUS_URL => HM::MaliciousUrl,
+        SafetyLabelType::GROK_SFA_V2 => HM::GrokSfaV2,
+        SafetyLabelType::GROK_NSFA_LIMITED_V2 => HM::GrokNsfaLimitedV2,
+        SafetyLabelType::GROK_NSFA_V2 => HM::GrokNsfaV2,
+        SafetyLabelType::GROK_NSFA_EXPANDED_V2 => HM::GrokNsfaExpandedV2,
+        SafetyLabelType::PTOS_REVIEWED => HM::PtosReviewed,
         _ => return None,
     };
     Some(v.into())

@@ -28,7 +28,7 @@ class AsyncEmbOptimizer(Protocol):
         table: jax.Array,
         state: Any,
         gate: jax.Array,
-    ) -> tuple[tuple[jax.Array, ...], jax.Array, Any]:
+    ) -> tuple[tuple[jax.Array, ...], jax.Array, Any, dict[str, jax.Array]]:
         raise NotImplementedError(
             f"use_async_emb requires an embedding optimizer implementing "
             f"AsyncEmbOptimizer, and {type(self).__name__} has no fused table update"

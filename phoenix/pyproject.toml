@@ -15,6 +15,7 @@ dependencies = [
     "optax>=0.2.4",
     "chex>=0.1.86",
     "numba>=0.60.0",
+    "flatbuffers",
 
     "grpcio>=1.66.0",
     "protobuf>=5.28.0",

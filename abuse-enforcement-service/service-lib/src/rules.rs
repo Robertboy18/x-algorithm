@@ -51,6 +51,7 @@ enum ActionStep {
 enum SpecialOutcome {
                     Skip { reason: String },
                         ActAll { actions: Vec<ActionStep> },
+                        ActRequestedActions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -172,6 +173,7 @@ fn outcome_to_decision(o: &Outcome) -> Decision {
         Outcome::Special(SpecialOutcome::ActAll { actions }) => {
             Decision::Act(actions.iter().map(step_to_spec).collect())
         }
+        Outcome::Special(SpecialOutcome::ActRequestedActions) => Decision::ActRequestedActions,
         Outcome::Action(step) => Decision::Act(vec![step_to_spec(step)]),
     }
 }
@@ -182,6 +184,18 @@ struct ScoreCel<'a> {
                 labels: &'a [String],
     model_version: &'a str,
                         skip_author_credibility_prechecks: bool,
+                        requested_actions: Vec<RequestedActionCel<'a>>,
+            policy_version: &'a str,
+}
+
+#[derive(Serialize)]
+struct RequestedActionCel<'a> {
+    kind: &'a str,
+    perm: bool,
+    policy: &'a str,
+    labels: &'a [String],
+    ttl_msec: i64,
+    head: &'a str,
 }
 
 #[derive(Serialize)]
@@ -217,6 +231,20 @@ fn project_score(facts: &Facts) -> ScoreCel<'_> {
         labels: &facts.score.labels,
         model_version: &facts.score.model_version,
         skip_author_credibility_prechecks: facts.score.skip_author_credibility_prechecks,
+        requested_actions: facts
+            .score
+            .requested_actions
+            .iter()
+            .map(|a| RequestedActionCel {
+                kind: &a.kind,
+                perm: a.perm,
+                policy: &a.policy,
+                labels: &a.labels,
+                ttl_msec: a.ttl_msec,
+                head: &a.head,
+            })
+            .collect(),
+        policy_version: &facts.score.policy_version,
     }
 }
 
@@ -642,6 +670,7 @@ mod tests {
         for id in [
             "user_in_allowlist",
             "user_not_found",
+            "very_high_follower_count",
             "high_follower_count",
             "pagerank_skipped",
         ] {
@@ -651,6 +680,17 @@ mod tests {
                 user.rule_ids
             );
         }
+        let pos = |id: &str| {
+            user.rule_ids
+                .iter()
+                .position(|r| r == id)
+                .unwrap_or_else(|| panic!("user pipeline missing {id:?}"))
+        };
+        assert!(
+            pos("very_high_follower_count") < pos("high_follower_count"),
+            "very_high_follower_count must precede high_follower_count; got {:?}",
+            user.rule_ids
+        );
         for id in [
             "post_in_allowlist",
             "user_in_allowlist",
@@ -1065,6 +1105,249 @@ rules:
                 },
                 ActionSpec::Captcha,
             ]),
+        );
+    }
+
+
+            fn facts_with_requested_action() -> Facts {
+        let mut f = base_facts();
+        f.score.requested_actions = vec![crate::facts::RequestedActionFacts {
+            kind: "suspend".into(),
+            perm: false,
+            policy: "PlatformManipulation".into(),
+            labels: vec!["SpamHighRecall".into()],
+            ttl_msec: 1000,
+            head: "IsSpammer".into(),
+        }];
+        f.score.policy_version = "3".into();
+        f
+    }
+
+    #[test]
+    fn act_requested_actions_outcome_parses_and_maps_to_decision() {
+        let rules = one_rule_pipeline(
+            r#"
+rules:
+  - id: generic_test
+    when: "size(score.requested_actions) > 0"
+    then:
+      kind: act_requested_actions
+  - id: fallthrough
+    when: "true"
+    then: {kind: skip, reason: no_requested_actions}
+"#,
+        );
+        assert_eq!(
+            decide_with(&rules, &base_facts()).expect("eval should succeed"),
+            Decision::Skip("no_requested_actions".into())
+        );
+        assert_eq!(
+            decide_with(&rules, &facts_with_requested_action()).expect("eval should succeed"),
+            Decision::ActRequestedActions
+        );
+    }
+
+    #[test]
+    fn requested_actions_entries_and_policy_version_are_cel_readable() {
+        let rules = one_rule_pipeline(
+            r#"
+rules:
+  - id: entry_fields
+    when: >
+      score.policy_version == "3"
+      && score.requested_actions.exists(a,
+           a.kind == "suspend"
+           && a.policy == "PlatformManipulation"
+           && !a.perm
+           && a.ttl_msec == 1000
+           && a.head == "IsSpammer"
+           && "SpamHighRecall" in a.labels)
+    then: {kind: skip, reason: matched}
+  - id: fallthrough
+    when: "true"
+    then: {kind: skip, reason: unmatched}
+"#,
+        );
+        assert_eq!(
+            decide_with(&rules, &facts_with_requested_action()).expect("eval should succeed"),
+            Decision::Skip("matched".into())
+        );
+        assert_eq!(
+            decide_with(&rules, &base_facts()).expect("eval should succeed"),
+            Decision::Skip("unmatched".into())
+        );
+    }
+
+    #[test]
+    fn act_requested_actions_is_rejected_inside_act_all() {
+        let yaml = "rules:\n  - id: x\n    when: \"true\"\n    then: {kind: act_all, actions: [{kind: act_requested_actions}]}\n";
+        let err = CompiledRules::from_yaml(yaml).unwrap_err();
+        assert!(matches!(err, RuleCompileError::Yaml(_)), "{err:?}");
+    }
+
+
+            fn rule_index(ids: &[String], id: &str) -> usize {
+        ids.iter()
+            .position(|r| r == id)
+            .unwrap_or_else(|| panic!("rule {id:?} missing; got {ids:?}"))
+    }
+
+    #[test]
+    fn baked_in_generic_rule_sits_directly_above_each_terminal_rule() {
+        let cache = RulesCache::new();
+        let user_ids = cache.status(EntityType::User, None).rule_ids;
+        let generic = rule_index(&user_ids, "act_requested_actions");
+        let guard = rule_index(&user_ids, "platform_row_without_requested_actions");
+        let terminal = rule_index(&user_ids, "act_suspend");
+        assert_eq!(terminal, user_ids.len() - 1, "act_suspend must be last");
+        assert_eq!(
+            generic,
+            terminal - 1,
+            "generic rule must sit directly above act_suspend"
+        );
+        assert_eq!(
+            guard,
+            generic - 1,
+            "empty-list guard must sit directly above the generic rule"
+        );
+        assert!(generic > rule_index(&user_ids, "pagerank_skipped"));
+
+        let post_ids = cache.status(EntityType::Post, None).rule_ids;
+        let generic = rule_index(&post_ids, "act_requested_actions");
+        let terminal = rule_index(&post_ids, "post_no_actionable_label");
+        assert_eq!(
+            terminal,
+            post_ids.len() - 1,
+            "post terminal skip must be last"
+        );
+        assert_eq!(
+            generic,
+            terminal - 1,
+            "generic rule must sit directly above the post terminal skip"
+        );
+        assert!(generic > rule_index(&post_ids, "pagerank_skipped"));
+    }
+
+    #[test]
+    fn baked_in_user_pipeline_routes_requested_actions_to_generic_dispatch() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        assert_eq!(
+            decide_with(&rules, &facts_with_requested_action()).expect("eval should succeed"),
+            Decision::ActRequestedActions
+        );
+        assert_eq!(
+            decide_with(&rules, &base_facts()).expect("eval should succeed"),
+            Decision::Act(vec![ActionSpec::SuspendUser {
+                perm: false,
+                policy: "PlatformManipulation".into(),
+            }])
+        );
+    }
+
+    #[test]
+    fn baked_in_user_platform_label_with_empty_list_skips_not_suspends() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        let mut f = base_facts();
+        f.score
+            .labels
+            .push("abuse_platform_requested_actions".into());
+        assert_eq!(
+            decide_with(&rules, &f).expect("eval should succeed"),
+            Decision::Skip("platform_row_without_requested_actions".into())
+        );
+        let mut f = facts_with_requested_action();
+        f.score
+            .labels
+            .push("abuse_platform_requested_actions".into());
+        assert_eq!(
+            decide_with(&rules, &f).expect("eval should succeed"),
+            Decision::ActRequestedActions
+        );
+    }
+
+    #[test]
+    fn baked_in_user_guardrails_still_win_over_generic_dispatch() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        let mut f = facts_with_requested_action();
+        f.user_allowlist_mut().is_allowlisted = true;
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("user_in_allowlist".into())
+        );
+        let mut f = facts_with_requested_action();
+        f.cred_mut().follower_count = Some(5_000);
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("high_follower_count".into())
+        );
+    }
+
+    #[test]
+    fn baked_in_user_pipeline_splits_follower_bands_at_the_ceiling() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        let mut f = facts_with_requested_action();
+        f.cred_mut().follower_count = Some(250_000);
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("very_high_follower_count".into())
+        );
+        f.cred_mut().follower_count = Some(50_000);
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("high_follower_count".into())
+        );
+        f.cred_mut().follower_count = Some(500);
+        assert_ne!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("high_follower_count".into())
+        );
+        assert_ne!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("very_high_follower_count".into())
+        );
+    }
+
+    #[test]
+    fn baked_in_user_ceiling_ignores_skip_author_credibility_prechecks() {
+        let rules = RulesCache::new().resolve(EntityType::User, None);
+        let mut f = facts_with_requested_action();
+        f.cred_mut().follower_count = Some(250_000);
+        f.score.skip_author_credibility_prechecks = true;
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("very_high_follower_count".into())
+        );
+    }
+
+    #[test]
+    fn baked_in_post_pipeline_routes_requested_actions_to_generic_dispatch() {
+        let rules = RulesCache::new().resolve(EntityType::Post, None);
+        let mut f = post_facts(safe_author(), vec![]);
+        f.score.requested_actions = vec![crate::facts::RequestedActionFacts {
+            kind: "post_label".into(),
+            labels: vec!["SpamHighRecall".into()],
+            head: "IsSpamPost".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            decide_with(&rules, &f).expect("eval should succeed"),
+            Decision::ActRequestedActions
+        );
+        assert_eq!(
+            decide_with(&rules, &post_facts(safe_author(), vec![])).unwrap(),
+            Decision::Skip("post_no_actionable_label".into())
+        );
+        let mut author = safe_author();
+        author.cred.is_high = Some(true);
+        let mut f = post_facts(author, vec![]);
+        f.score.requested_actions = vec![crate::facts::RequestedActionFacts {
+            kind: "post_label".into(),
+            labels: vec!["SpamHighRecall".into()],
+            ..Default::default()
+        }];
+        assert_eq!(
+            decide_with(&rules, &f).unwrap(),
+            Decision::Skip("pagerank_skipped".into())
         );
     }
 

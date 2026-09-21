@@ -179,6 +179,22 @@ notification_engagement_to_action_types = {
     ],
 }
 
+SEARCH_RELEVANCE_ACTION_INDICES = [
+    recsys_pb2.ActionName.CLIENT_TWEET_RELEVANT_TO_SEARCH,
+    recsys_pb2.ActionName.CLIENT_TWEET_NOT_RELEVANT_TO_SEARCH,
+]
+
+search_engagement_to_action_types = {
+    **primary_engagement_to_action_types,
+    "IsRelevantToSearch": [
+        "ClientTweetRelevantToSearch",
+    ],
+    "IsNotRelevantToSearch": [
+        "ClientTweetNotRelevantToSearch",
+    ],
+    "IsSearchQueryReformulated": ["ClientTweetSearchQueryReformulated"],
+}
+
 ads_conversion_engagement_to_action_types = {
     **primary_engagement_to_action_types,
     "IsPurchaseConversion": [
@@ -209,6 +225,42 @@ ads_p_conv_click_engagement_to_action_types = {
     "IsAttributedMactClickInstall": [
         "AdsAttributedMactClickInstall",
     ],
+    "IsAttributedMactPurchase": [
+        "AdsAttributedMactPurchase",
+    ],
+    "IsAttributedMactAddToCart": [
+        "AdsAttributedMactAddToCart",
+    ],
+    "IsAttributedMactLevelAchieved": [
+        "AdsAttributedMactLevelAchieved",
+    ],
+    "IsAttributedMactTutorialComplete": [
+        "AdsAttributedMactTutorialComplete",
+    ],
+    "IsAttributedMactSignUp": [
+        "AdsAttributedMactSignUp",
+    ],
+    "IsAttributedMactCustom": [
+        "AdsAttributedMactCustom",
+    ],
+    "IsAttributedMactViewPurchase": [
+        "AdsAttributedMactViewPurchase",
+    ],
+    "IsAttributedMactViewAddToCart": [
+        "AdsAttributedMactViewAddToCart",
+    ],
+    "IsAttributedMactViewLevelAchieved": [
+        "AdsAttributedMactViewLevelAchieved",
+    ],
+    "IsAttributedMactViewTutorialComplete": [
+        "AdsAttributedMactViewTutorialComplete",
+    ],
+    "IsAttributedMactViewSignUp": [
+        "AdsAttributedMactViewSignUp",
+    ],
+    "IsAttributedMactViewCustom": [
+        "AdsAttributedMactViewCustom",
+    ],
     "IsPurchaseConversion": [
         "AdsPurchaseConversion",
     ],
@@ -230,12 +282,95 @@ ads_p_conv_click_engagement_to_action_types = {
     "IsSearchConversion": [
         "AdsSearchConversion",
     ],
+    "IsAttributedKeyClickConversionDelayed": [
+        "AdsAttributedKeyClickConversionDelayed",
+    ],
+    "IsAttributedClickConversionDelayed": [
+        "AdsAttributedClickConversionDelayed",
+    ],
+    "IsPurchaseConversionDelayed": [
+        "AdsPurchaseConversionDelayed",
+    ],
+    "IsMidFunnelConversionDelayed": [
+        "AdsMidFunnelConversionDelayed",
+    ],
+    "IsAddToCartConversionDelayed": [
+        "AdsAddToCartConversionDelayed",
+    ],
+    "IsUpperFunnelConversionDelayed": [
+        "AdsUpperFunnelConversionDelayed",
+    ],
+    "IsWebConversionDelayed": [
+        "AdsWebConversionDelayed",
+    ],
+    "IsSearchConversionDelayed": [
+        "AdsSearchConversionDelayed",
+    ],
+    "IsSignupConversionDelayed": [
+        "AdsSignUpConversionDelayed",
+    ],
+    "IsCheckoutInitiatedConversionDelayed": [
+        "AdsCheckoutInitiatedConversionDelayed",
+    ],
     "IsAttributedKeyViewConversion": [
         "AdsAttributedKeyViewConversion",
     ],
     "IsAttributedViewConversion": [
         "AdsAttributedViewConversion",
     ],
+    "IsPurchaseConversionViewThrough": [
+        "AdsPurchaseConversionViewThrough",
+    ],
+    "IsAddToCartConversionViewThrough": [
+        "AdsAddToCartConversionViewThrough",
+    ],
+    "IsCheckoutInitiatedConversionViewThrough": [
+        "AdsCheckoutInitiatedConversionViewThrough",
+    ],
+    "IsSignUpConversionViewThrough": [
+        "AdsSignUpConversionViewThrough",
+    ],
+    "IsSiteVisitConversionViewThrough": [
+        "AdsSiteVisitConversionViewThrough",
+    ],
+    "IsSessionConversionViewThrough": [
+        "AdsSessionConversionViewThrough",
+    ],
+    "IsLandingPageViewConversionViewThrough": [
+        "AdsLandingPageViewConversionViewThrough",
+    ],
+    "IsUpperFunnelConversionViewThrough": [
+        "AdsUpperFunnelConversionViewThrough",
+    ],
+}
+
+ads_slim_engagement_to_action_types = {
+    "IsOpenLink": [
+        "ClientTweetOpenLink",
+    ],
+    "IsExternalLinkLongDwelled": [
+        "ClientTweetExternalLinkLongDwelled",
+    ],
+    "IsVideoQualityViewed": [
+        "ClientTweetVideoQualityView",
+    ],
+    "IsNotInterestedIn": [
+        "ClientTweetNotInterestedIn",
+    ],
+    "IsBlockAuthor": [
+        "ClientTweetBlockAuthor",
+    ],
+    "IsReported": [
+        "ClientTweetReport",
+    ],
+    "IsMuteAuthor": [
+        "ClientTweetMuteAuthor",
+    ],
+    **{
+        eng: actions
+        for eng, actions in ads_p_conv_click_engagement_to_action_types.items()
+        if eng not in primary_engagement_to_action_types
+    },
 }
 
 
@@ -243,8 +378,10 @@ eng_to_action_types = {
     "default": primary_engagement_to_action_types,
     "all": engagement_to_action_types,
     "notifications": notification_engagement_to_action_types,
+    "search": search_engagement_to_action_types,
     "ads_conversion": ads_conversion_engagement_to_action_types,
     "ads_p_conv_click": ads_p_conv_click_engagement_to_action_types,
+    "ads_slim": ads_slim_engagement_to_action_types,
     "none": {},
 }
 
@@ -269,7 +406,51 @@ CLICK_CONDITIONED_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_SIGN_UP_CONVERSION,
     recsys_pb2.ActionName.ADS_CHECKOUT_INITIATED_CONVERSION,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_CLICK_INSTALL,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_PURCHASE,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_ADD_TO_CART,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_LEVEL_ACHIEVED,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_TUTORIAL_COMPLETE,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_SIGN_UP,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_CUSTOM,
 ]
+
+MACT_IN_APP_LOSS_ACTION_INDICES = [
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_PURCHASE,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_ADD_TO_CART,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_LEVEL_ACHIEVED,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_TUTORIAL_COMPLETE,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_SIGN_UP,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_CUSTOM,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_PURCHASE,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_ADD_TO_CART,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_LEVEL_ACHIEVED,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_TUTORIAL_COMPLETE,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_SIGN_UP,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_CUSTOM,
+]
+
+VIEW_THROUGH_ACTION_INDICES = [
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_KEY_VIEW_CONVERSION,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_VIEW_CONVERSION,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_PURCHASE,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_ADD_TO_CART,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_LEVEL_ACHIEVED,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_TUTORIAL_COMPLETE,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_SIGN_UP,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_CUSTOM,
+    recsys_pb2.ActionName.ADS_PURCHASE_CONVERSION_VIEW_THROUGH,
+    recsys_pb2.ActionName.ADS_ADD_TO_CART_CONVERSION_VIEW_THROUGH,
+    recsys_pb2.ActionName.ADS_CHECKOUT_INITIATED_CONVERSION_VIEW_THROUGH,
+    recsys_pb2.ActionName.ADS_SIGN_UP_CONVERSION_VIEW_THROUGH,
+    recsys_pb2.ActionName.ADS_SITE_VISIT_CONVERSION_VIEW_THROUGH,
+    recsys_pb2.ActionName.ADS_SESSION_CONVERSION_VIEW_THROUGH,
+    recsys_pb2.ActionName.ADS_LANDING_PAGE_VIEW_CONVERSION_VIEW_THROUGH,
+    recsys_pb2.ActionName.ADS_UPPER_FUNNEL_CONVERSION_VIEW_THROUGH,
+]
+
+STANDARD_CONVERSION_HEAD_INDICES = CLICK_CONDITIONED_ACTION_INDICES + VIEW_THROUGH_ACTION_INDICES
+
+PURCHASE_VALUE_ACTION_INDEX = recsys_pb2.ContinuousActionName.ADS_WEB_CT_PURCHASE_VALUE
 
 NEGATIVE_FEEDBACK_HEAD_INDICES = [
     recsys_pb2.ActionName.CLIENT_TWEET_REPORT,
@@ -280,4 +461,5 @@ NEGATIVE_FEEDBACK_HEAD_INDICES = [
     recsys_pb2.ActionName.CLIENT_TWEET_NOT_RELEVANT,
     recsys_pb2.ActionName.CLIENT_TWEET_MUTE_CONVERSATION,
     recsys_pb2.ActionName.CLIENT_NOTIFICATION_SEE_LESS_OFTEN,
+    recsys_pb2.ActionName.CLIENT_TWEET_SEARCH_QUERY_REFORMULATED,
 ]

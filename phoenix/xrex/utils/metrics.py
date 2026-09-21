@@ -98,6 +98,21 @@ def _find_moment_state(state):
     return None
 
 
+def _moment_metrics(first_state) -> dict:
+    metrics = {}
+    for field, suffix in (("mu", "_mu"), ("nu", "_nu")):
+        tree = getattr(first_state, field, None)
+        if tree is None:
+            continue
+        flat = {
+            k: v
+            for k, v in flatten_dict(tree).items()
+            if isinstance(v, Parameter) and hasattr(v.x, "ndim")
+        }
+        metrics.update(split_metrics(flat, suffix))
+    return metrics
+
+
 def norm_metrics(params, opt_state, gradients, updates):
     from xrex.optimizers.optim import InjectHyperparamsState
 
@@ -105,12 +120,14 @@ def norm_metrics(params, opt_state, gradients, updates):
     metrics = {}
 
     if not isinstance(opt_state.inner_state, optax._src.combine.MultiTransformState):
-        _adam_state = _find_moment_state(opt_state.inner_state)
-        if _adam_state is not None:
-            mu_metric = split_metrics(flatten_dict(_adam_state.mu), "_mu")
-            metrics.update(mu_metric)
-            nu_metric = split_metrics(flatten_dict(_adam_state.nu), "_nu")
-            metrics.update(nu_metric)
+        optimizer_state = opt_state.inner_state[1]
+        if isinstance(optimizer_state, optax._src.combine.MultiTransformState):
+            for masked in optimizer_state.inner_states.values():
+                metrics.update(_moment_metrics(masked.inner_state[0]))
+        else:
+            _adam_state = _find_moment_state(opt_state.inner_state)
+            if _adam_state is not None:
+                metrics.update(_moment_metrics(_adam_state))
 
     weight_norm_metric = split_metrics(flatten_dict(params), "_norm")
     metrics.update(weight_norm_metric)

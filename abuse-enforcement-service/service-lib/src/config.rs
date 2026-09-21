@@ -38,25 +38,14 @@ pub struct Config {
     #[arg(long, env = "SOCKS_PROXY")]
     pub socks_proxy: Option<String>,
 
-    #[arg(
-        long,
-        default_value = "/s/kafka/phoenix-kafka-scram-bootstrap",
-        env = "KAFKA_DEST"
-    )]
-    pub kafka_dest: String,
+    #[arg(long, default_value_t = false, env = "KAFKA_CONSUMER_ENABLED")]
+    pub kafka_consumer_enabled: bool,
 
-    #[arg(long, default_value = "SCRAM-SHA-512", env = "KAFKA_SASL_MECHANISM")]
-    pub kafka_sasl_mechanism: String,
+    #[arg(long, default_value = "phoenix", env = "KAFKA_CONSUMER_MTLS_CLUSTER")]
+    pub kafka_consumer_mtls_cluster: String,
 
-    #[arg(
-        long,
-        default_value = "scram-client-phoenix",
-        env = "KAFKA_SASL_USERNAME"
-    )]
-    pub kafka_sasl_username: String,
-
-    #[arg(long, env = "KAFKA_SASL_PASSWORD")]
-    pub kafka_sasl_password: Option<String>,
+    #[arg(long, default_value = "atla", env = "KAFKA_CONSUMER_MTLS_ZONE")]
+    pub kafka_consumer_mtls_zone: String,
 
     #[arg(
         long,
@@ -68,40 +57,17 @@ pub struct Config {
     #[arg(long, env = "KAFKA_CONSUMER_GROUP_ID")]
     pub kafka_consumer_group_id: Option<String>,
 
-    #[arg(long, env = "KAFKA_CONSUMER_DEST")]
-    pub kafka_consumer_dest: Option<String>,
-
-    #[arg(long, env = "KAFKA_CONSUMER_SASL_MECHANISM")]
-    pub kafka_consumer_sasl_mechanism: Option<String>,
-
-    #[arg(long, env = "KAFKA_CONSUMER_SASL_USERNAME")]
-    pub kafka_consumer_sasl_username: Option<String>,
-
-    #[arg(long, env = "KAFKA_CONSUMER_SASL_PASSWORD")]
-    pub kafka_consumer_sasl_password: Option<String>,
-
     #[arg(long, default_value_t = 256, env = "KAFKA_MAX_MESSAGES_PER_POLL")]
     pub kafka_max_messages_per_poll: usize,
 
     #[arg(long, default_value_t = 64, env = "KAFKA_MAX_IN_FLIGHT")]
     pub kafka_max_in_flight: usize,
 
-    #[arg(long, env = "KAFKA_PRODUCER_DEST")]
-    pub kafka_producer_dest: Option<String>,
-
-    #[arg(long, env = "KAFKA_PRODUCER_SASL_MECHANISM")]
-    pub kafka_producer_sasl_mechanism: Option<String>,
-
-    #[arg(long, env = "KAFKA_PRODUCER_SASL_USERNAME")]
-    pub kafka_producer_sasl_username: Option<String>,
-
-    #[arg(long, env = "KAFKA_PRODUCER_SASL_PASSWORD")]
-    pub kafka_producer_sasl_password: Option<String>,
-
-    #[arg(long, default_value_t = false, env = "KAFKA_PRODUCER_MTLS_ENABLED")]
-    pub kafka_producer_mtls_enabled: bool,
-
-    #[arg(long, default_value = "coredata", env = "KAFKA_PRODUCER_MTLS_CLUSTER")]
+    #[arg(
+        long,
+        default_value = "mltraining",
+        env = "KAFKA_PRODUCER_MTLS_CLUSTER"
+    )]
     pub kafka_producer_mtls_cluster: String,
 
     #[arg(long, default_value = "atla", env = "KAFKA_PRODUCER_MTLS_ZONE")]
@@ -257,61 +223,7 @@ pub struct Config {
     pub api_keys_json: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct KafkaConnConfig {
-    pub dest: String,
-    pub sasl_mechanism: String,
-    pub sasl_username: String,
-    pub sasl_password: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct KafkaConnOverride {
-    dest: Option<String>,
-    sasl_mechanism: Option<String>,
-    sasl_username: Option<String>,
-    sasl_password: Option<String>,
-}
-
-impl KafkaConnConfig {
-    fn with_overrides(self, overrides: KafkaConnOverride) -> KafkaConnConfig {
-        KafkaConnConfig {
-            dest: overrides.dest.unwrap_or(self.dest),
-            sasl_mechanism: overrides.sasl_mechanism.unwrap_or(self.sasl_mechanism),
-            sasl_username: overrides.sasl_username.unwrap_or(self.sasl_username),
-            sasl_password: overrides.sasl_password.or(self.sasl_password),
-        }
-    }
-}
-
 impl Config {
-    fn kafka_common(&self) -> KafkaConnConfig {
-        KafkaConnConfig {
-            dest: self.kafka_dest.clone(),
-            sasl_mechanism: self.kafka_sasl_mechanism.clone(),
-            sasl_username: self.kafka_sasl_username.clone(),
-            sasl_password: self.kafka_sasl_password.clone(),
-        }
-    }
-
-    pub fn kafka_consumer(&self) -> KafkaConnConfig {
-        self.kafka_common().with_overrides(KafkaConnOverride {
-            dest: self.kafka_consumer_dest.clone(),
-            sasl_mechanism: self.kafka_consumer_sasl_mechanism.clone(),
-            sasl_username: self.kafka_consumer_sasl_username.clone(),
-            sasl_password: self.kafka_consumer_sasl_password.clone(),
-        })
-    }
-
-    pub fn kafka_producer(&self) -> KafkaConnConfig {
-        self.kafka_common().with_overrides(KafkaConnOverride {
-            dest: self.kafka_producer_dest.clone(),
-            sasl_mechanism: self.kafka_producer_sasl_mechanism.clone(),
-            sasl_username: self.kafka_producer_sasl_username.clone(),
-            sasl_password: self.kafka_producer_sasl_password.clone(),
-        })
-    }
-
     pub fn kafka_group_id(&self) -> String {
         self.kafka_consumer_group_id
             .clone()
@@ -326,11 +238,28 @@ mod tests {
     use super::Config;
 
     #[test]
-    fn coredata_producer_mtls_defaults_pin_atla() {
+    fn kafka_defaults_preserve_consumer_and_watchdog_behavior() {
         let config = Config::parse_from(["xai-abuse-enforcement-service"]);
 
-        assert!(!config.kafka_producer_mtls_enabled);
-        assert_eq!(config.kafka_producer_mtls_cluster, "coredata");
+        assert!(!config.kafka_consumer_enabled);
+        assert_eq!(config.kafka_consumer_mtls_cluster, "phoenix");
+        assert_eq!(config.kafka_consumer_mtls_zone, "atla");
+        assert_eq!(config.kafka_group_id(), "xai-abuse-enforcement-service");
+        assert_eq!(config.kafka_max_messages_per_poll, 256);
+        assert_eq!(config.kafka_max_in_flight, 64);
+        assert!(config.kafka_self_delete_enabled);
+        assert_eq!(config.kafka_watchdog_interval_secs, 15);
+        assert_eq!(config.kafka_watchdog_stale_secs, 120);
+        assert_eq!(config.kafka_watchdog_self_delete_secs, 240);
+        assert_eq!(config.kafka_watchdog_error_rate_per_sec, 2.0);
+        assert_eq!(config.kafka_watchdog_error_self_delete_secs, 60);
+    }
+
+    #[test]
+    fn mltraining_producer_defaults_use_mtls() {
+        let config = Config::parse_from(["xai-abuse-enforcement-service"]);
+
+        assert_eq!(config.kafka_producer_mtls_cluster, "mltraining");
         assert_eq!(config.kafka_producer_mtls_zone, "atla");
     }
 }

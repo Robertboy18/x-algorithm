@@ -57,6 +57,10 @@ def _filter_wandb_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in metrics.items() if not _should_omit_wandb_metric(k)}
 
 
+def _write_filtered_wandb_metrics(metrics: Mapping[str, Any]) -> None:
+    write_wandb_log(_filter_wandb_metrics(metrics))
+
+
 _CLICKHOUSE_HOST = settings.CLICKHOUSE_HOST
 _CLICKHOUSE_RUN_URL = settings.CLICKHOUSE_RUN_URL
 
@@ -405,10 +409,7 @@ class WandbHook(DriverHook):
     @log_elapsed_time
     def on_step(self, metrics: Mapping[str, Any]):
         self.future.result()
-
-        metrics = _filter_wandb_metrics(metrics)
-
-        self.future = self.threadpool.submit(write_wandb_log, metrics=metrics)
+        self.future = self.threadpool.submit(_write_filtered_wandb_metrics, metrics)
 
     def on_train_rollback(self):
         wandb = _import_wandb()
@@ -584,8 +585,10 @@ class CheckpointMonitoringState(Enum):
 _should_keep_cache = {}
 
 
-def _should_keep(checkpoint_dir: str, run_id: str, keep_every_n: int) -> bool:
-    cache_key = (checkpoint_dir, run_id, keep_every_n)
+def _should_keep(
+    checkpoint_dir: str, run_id: str, keep_every_n: int, checkpoint_every_n: int = 0
+) -> bool:
+    cache_key = (checkpoint_dir, run_id, keep_every_n, checkpoint_every_n)
     if cache_key in _should_keep_cache:
         return _should_keep_cache[cache_key]
 
@@ -595,13 +598,17 @@ def _should_keep(checkpoint_dir: str, run_id: str, keep_every_n: int) -> bool:
 
     checkpoint_path = Path(os.path.join(checkpoint_dir, run_id))
     completion_data = read_metadata_file(checkpoint_path)
-    if completion_data is None or completion_data[1] is None:
-        logger.info(f"No checkpoint index found in {checkpoint_dir}. Keep it.")
+    if completion_data is None:
         return True
-
-    global_ckpt_index = completion_data[1]
-    if keep_every_n > 0 and global_ckpt_index % keep_every_n == 0:
-        logger.info(f"Keep candidate (ckpt_index: {global_ckpt_index}): {checkpoint_path}")
+    if completion_data.step is not None:
+        every_n = checkpoint_every_n if checkpoint_every_n > 0 else 1
+        ckpt_index = completion_data.step // every_n
+    else:
+        ckpt_index = completion_data.checkpoint_index
+        if ckpt_index is None:
+            return True
+    if ckpt_index % keep_every_n == 0:
+        logger.info(f"Keep candidate (ckpt_index: {ckpt_index}): {checkpoint_path}")
         _should_keep_cache[cache_key] = True
         return True
 
@@ -631,7 +638,13 @@ def _rm_rf_batch(paths: list[str]):
     )
 
 
-def _checkpoint_cleaner(checkpoint_dir: str, keep_last_n: int, keep_every_n: int, run_id: str):
+def _checkpoint_cleaner(
+    checkpoint_dir: str,
+    keep_last_n: int,
+    keep_every_n: int,
+    run_id: str,
+    checkpoint_every_n: int = 0,
+):
     if not os.path.exists(checkpoint_dir):
         logger.debug(f"Checkpoint {checkpoint_dir} does not exist.")
         return
@@ -663,7 +676,7 @@ def _checkpoint_cleaner(checkpoint_dir: str, keep_last_n: int, keep_every_n: int
         for i, candidate in enumerate(entries):
             if i >= len(entries) - keep_last_n:
                 break
-            if _should_keep(candidate.path, run_id, keep_every_n):
+            if _should_keep(candidate.path, run_id, keep_every_n, checkpoint_every_n):
                 continue
             to_remove.append(candidate)
 
@@ -729,6 +742,7 @@ class CheckpointMonitoringHook(DriverHook):
         )
         keep_last_n = ckpt_config.checkpoint_keep_last_n
         keep_every_n = ckpt_config.checkpoint_keep_every_nth
+        checkpoint_every_n = ckpt_config.checkpoint_every_n
 
         while True:
             try:
@@ -739,7 +753,7 @@ class CheckpointMonitoringHook(DriverHook):
                 continue
 
             if signal == CheckpointMonitoringState.RUN_CLEANUP:
-                _checkpoint_cleaner(ckpt_dir, keep_last_n, keep_every_n, run_id)
+                _checkpoint_cleaner(ckpt_dir, keep_last_n, keep_every_n, run_id, checkpoint_every_n)
             elif signal == CheckpointMonitoringState.SHUTDOWN:
                 logger.info("Checkpoint monitoring thread got shutdown signal. Shutting down.")
                 return

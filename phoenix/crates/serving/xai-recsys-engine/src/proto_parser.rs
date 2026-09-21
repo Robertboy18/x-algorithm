@@ -248,6 +248,7 @@ type FuncU32<'a> = Box<dyn FnMut(u32) + Send + 'a>;
 type FuncU64<'a> = Box<dyn FnMut(u64) + Send + 'a>;
 type FuncInt<'a> = Box<dyn FnMut(usize) + Send + 'a>;
 type FuncStr<'a> = Box<dyn FnMut(usize, &[u8]) + Send + 'a>;
+type FuncBytes<'a> = Box<dyn FnMut(usize, Bytes) + Send + 'a>;
 
 pub enum Func<'a> {
     Msg(Vec<(u64, Func<'a>)>),
@@ -256,6 +257,7 @@ pub enum Func<'a> {
     U64(FuncU64<'a>),
     Int(FuncInt<'a>),
     Str(FuncStr<'a>),
+    Bytes(FuncBytes<'a>),
 }
 
 pub trait FuncConvertible<'a, Args> {
@@ -301,6 +303,13 @@ impl<'a, F: FnMut(usize, &[u8]) + Send + 'a> FuncConvertible<'a, (usize, &[u8])>
     fn into(self, x: u64) -> (u64, Func<'a>) {
         assert_ne!(x, 0);
         ((x << 3) | 2, Func::Str(Box::new(self)))
+    }
+}
+
+impl<'a, F: FnMut(usize, Bytes) + Send + 'a> FuncConvertible<'a, (usize, Bytes)> for F {
+    fn into(self, x: u64) -> (u64, Func<'a>) {
+        assert_ne!(x, 0);
+        ((x << 3) | 2, Func::Bytes(Box::new(self)))
     }
 }
 
@@ -501,6 +510,8 @@ pub async fn parse<'a, T: Body<Data = Bytes, Error = Status> + Send + Unpin>(
                                     let len = min(left, chunk.len() - pos);
                                     if let Func::Str(f) = func {
                                         f(left, &chunk[pos..pos + len]);
+                                    } else if let Func::Bytes(f) = func {
+                                        f(left, chunk.slice(pos..pos + len));
                                     }
                                     pos += len;
                                     left -= len;

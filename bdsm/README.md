@@ -106,15 +106,19 @@ The scorer publishes an 8-wide row in `heads.HEAD_NAMES` order.
   in `score_results_sink_focal.py`) — are **redacted** in this public release:
   they ship as an out-of-range `9.99` sentinel (the fields are probabilities in
   `[0, 1]`, so `9.99` never fires and is plainly a placeholder, not a real
-  value). Publishing exact operating points would hand adversaries the
-  detector's evasion boundary. The policy *structure*, head names, and gate
-  logic are real and unredacted; only the tuned numbers are withheld. Supply
-  your own via `--policy-file` / `BDSM_SINK_POLICY`.
+  value). The min-actions enforcement gate (a count, not a probability) is
+  redacted the same way with an impossible `999999` sentinel — far longer
+  than any scoreable sequence. Publishing exact operating points would hand
+  adversaries the detector's evasion boundary — including the account-size
+  floor below which scoring never fires. The policy *structure*, head names,
+  and gate logic are real and unredacted; only the tuned numbers are
+  withheld. Supply your own via `--policy-file` / `BDSM_SINK_POLICY`.
 - Per-head **appeal-note templates**: the production sink interpolates a
   short prose paragraph from the dominant bot head and selected histogram
   counts (`build_enforcement_note` in `runtime/score_results_sink_focal.py`).
-  The public package keeps the **gates** (MIN_ACTIONS, dominant-head pick)
-  and the `enforcement_note` proto field. The template *strings* and the
+  The public package keeps the **gates** (the min-actions gate — value
+  redacted, wired from the policy — and the dominant-head pick) and the
+  `enforcement_note` proto field. The template *strings* and the
   per-head `key_actions` interpolator are the sentinel `"<redacted>"` —
   same idea as the `9.99` operating points. When a note would have fired
   it carries that sentinel plus the model-head suffix, not the internal

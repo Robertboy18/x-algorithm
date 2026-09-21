@@ -15,11 +15,11 @@ from xrex.models.recsys_embedding import HashKeys, HashTable
 from xrex.models.recsys_gen_recs_model import RecsysGenRecsModelConfig
 from xrex.models.scaling import ScaleConfig
 from xrex.models.transformer import FeedForwardConfig, RematType, TransformerConfig
-from xrex.optimizers.optim import OptimConfig
+from xrex.optimizers.recsys.dense_optim import RecsysDenseOptimConfig
 from xrex.optimizers.schedule import ConstantSampleSchedule
 from xrex.train.parallel_config import ParallelConfig
-from xrex.train.trainer import CheckpointConfig
 from xrex.train.trainer_gen_recs import GenRecsTrainer
+from xrex.train.trainer_recsys import RecsysCheckpointConfig
 
 PAD_TOKEN = 0
 INPUT_VOCAB_K = 512
@@ -307,7 +307,7 @@ for config in configs:
             ep=mparams["ep"],
             dp=mparams["dp"],
         ),
-        optim_config=OptimConfig(
+        optim_config=RecsysDenseOptimConfig(
             optim="adam",
             weight_decay=1e-3,
             b1=0.95,
@@ -318,7 +318,7 @@ for config in configs:
         ),
         max_steps=int(mparams["total_samples"] / mparams["base_batch_size"]) - 100,
         max_samples=None,
-        checkpoint_config=CheckpointConfig(
+        checkpoint_config=RecsysCheckpointConfig(
             from_checkpoint=True,
             checkpoint_every_n=500,
             checkpoint_keep_every_nth=100,

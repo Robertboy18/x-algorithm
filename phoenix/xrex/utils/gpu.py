@@ -161,6 +161,25 @@ def _read_sysfs(path: str) -> str:
         return f.read()
 
 
+def _parse_cpulist(text: str) -> set[int]:
+    cpus: set[int] = set()
+    for part in filter(None, text.strip().split(",")):
+        lo, _, hi = part.partition("-")
+        cpus.update(range(int(lo), int(hi or lo) + 1))
+    return cpus
+
+
+def schedulable_cpus(*nodes: int) -> set[int]:
+    cpus: set[int] = set()
+    for node in nodes:
+        cpus |= _parse_cpulist(_read_sysfs(f"/sys/devices/system/node/node{node}/cpulist"))
+    try:
+        isolated = _parse_cpulist(_read_sysfs("/sys/devices/system/cpu/isolated"))
+    except FileNotFoundError:
+        isolated = set()
+    return cpus - isolated
+
+
 @cache
 def _gpu_index_to_local_numa_node() -> dict[int, int]:
     mapping: dict[int, int] = {}
@@ -259,8 +278,18 @@ def pin_process_to_local_numa(gpu_index: int | str) -> None:
     try:
         import numa
 
-        numa.schedule.run_on_nodes(node)
         numa.memory.set_membind_nodes(node)
-        rank_logger.info(f"NUMA pin: gpu {gpu_index} -> node {node} (cpu affinity + membind)")
     except Exception as e:
-        rank_logger.warning(f"NUMA pin: failed to bind gpu {gpu_index} to node {node} ({e})")
+        rank_logger.warning(f"NUMA pin: failed to membind gpu {gpu_index} to node {node} ({e})")
+        return
+    try:
+        cpus = schedulable_cpus(node)
+        if not cpus:
+            rank_logger.warning(f"NUMA pin: node {node} has no non-isolated CPUs; membind only")
+            return
+        os.sched_setaffinity(0, cpus)
+        rank_logger.info(f"NUMA pin: gpu {gpu_index} -> node {node} ({len(cpus)} cpus + membind)")
+    except Exception as e:
+        rank_logger.warning(
+            f"NUMA pin: gpu {gpu_index} membind to node {node} ok, CPU affinity failed ({e})"
+        )

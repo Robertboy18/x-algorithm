@@ -3,7 +3,6 @@
 import logging
 import traceback
 from collections.abc import Iterator
-from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -39,7 +38,7 @@ class EvalModule(Config):
             raise ValueError("All fields must be specified")
 
 
-@dataclass
+@configclass
 class EvaluationTaskNew(Config):
     max_steps: int = -1
     eval_step_timeout: int = 300

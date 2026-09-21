@@ -17,24 +17,15 @@ const HYDRATOR_TWEET_IDS: &str = "vf_hydrator_tweet_ids";
 const HYDRATOR_BATCH_SIZE: &str = "vf_hydrator_batch_size";
 const FALLBACK_CACHE_KEYS: &str = "vf_fallback_cache_keys";
 const FALLBACK_CACHE_ENTRIES: &str = "vf_fallback_cache_entries";
+const AUTHOR_LABELS: &str = "vf_author_labels";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum HydratorOutcome {
     Success,
     Partial,
     Timeout,
     Error,
-}
-
-impl HydratorOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            HydratorOutcome::Success => "success",
-            HydratorOutcome::Partial => "partial",
-            HydratorOutcome::Timeout => "timeout",
-            HydratorOutcome::Error => "error",
-        }
-    }
 }
 
 pub(crate) fn batch_outcome<K, V, E>(map: &HashMap<K, Result<V, E>>) -> HydratorOutcome {
@@ -56,26 +47,6 @@ struct KeyedResultCounts {
 }
 
 impl KeyedResultCounts {
-    fn from_results<K, V, E>(
-        candidate_count_by_key: &HashMap<K, usize>,
-        results: &HashMap<K, Result<V, E>>,
-    ) -> Self
-    where
-        K: Eq + Hash,
-    {
-        let mut counts = Self::default();
-        for (key, candidate_count) in candidate_count_by_key {
-            if matches!(results.get(key), Some(Ok(_))) {
-                counts.success_keys += 1;
-                counts.success_candidates += candidate_count;
-            } else {
-                counts.error_keys += 1;
-                counts.error_candidates += candidate_count;
-            }
-        }
-        counts
-    }
-
     fn from_batch<K, V>(
         candidate_count_by_key: &HashMap<K, usize>,
         batch: &HydrationBatch<K, V>,
@@ -103,14 +74,6 @@ impl KeyedResultCounts {
         counts
     }
 
-    fn outer_timeout<K>(candidate_count_by_key: &HashMap<K, usize>) -> Self {
-        Self {
-            timeout_keys: candidate_count_by_key.len(),
-            timeout_candidates: candidate_count_by_key.values().sum(),
-            ..Self::default()
-        }
-    }
-
     fn outcome(self) -> HydratorOutcome {
         let failures = self.timeout_keys + self.error_keys;
         match (self.success_keys, failures) {
@@ -134,7 +97,7 @@ pub(crate) fn record_hydrator_request(
         debug!(
             client,
             method,
-            outcome = outcome.as_str(),
+            outcome = <&str>::from(outcome),
             candidate_count,
             "Hydrator fail-open"
         );
@@ -144,8 +107,8 @@ pub(crate) fn record_hydrator_request(
         &[
             ("client", client),
             ("method", method),
-            ("outcome", outcome.as_str()),
-            ("safety_level", safety_level.as_str()),
+            ("outcome", outcome.into()),
+            ("safety_level", safety_level.into()),
         ],
         1,
     );
@@ -154,8 +117,8 @@ pub(crate) fn record_hydrator_request(
         &[
             ("client", client),
             ("method", method),
-            ("result", outcome.as_str()),
-            ("safety_level", safety_level.as_str()),
+            ("result", outcome.into()),
+            ("safety_level", safety_level.into()),
         ],
         candidate_count as u64,
     );
@@ -164,7 +127,7 @@ pub(crate) fn record_hydrator_request(
         &[
             ("client", client),
             ("method", method),
-            ("safety_level", safety_level.as_str()),
+            ("safety_level", safety_level.into()),
         ],
         latency_ms,
         HistogramBuckets::Bucket50To500,
@@ -183,7 +146,7 @@ fn record_keyed_hydrator_request(
         debug!(
             client,
             method,
-            outcome = outcome.as_str(),
+            outcome = <&str>::from(outcome),
             success_keys = counts.success_keys,
             timeout_keys = counts.timeout_keys,
             error_keys = counts.error_keys,
@@ -195,8 +158,8 @@ fn record_keyed_hydrator_request(
         &[
             ("client", client),
             ("method", method),
-            ("outcome", outcome.as_str()),
-            ("safety_level", safety_level.as_str()),
+            ("outcome", outcome.into()),
+            ("safety_level", safety_level.into()),
         ],
         1,
     );
@@ -209,7 +172,7 @@ fn record_keyed_hydrator_request(
             ("client", client),
             ("method", method),
             ("result", result),
-            ("safety_level", safety_level.as_str()),
+            ("safety_level", safety_level.into()),
         ];
         incr_nonzero(HYDRATOR_KEYS, &labels, keys as u64);
         incr_nonzero(HYDRATOR_TWEET_IDS, &labels, candidates as u64);
@@ -219,11 +182,31 @@ fn record_keyed_hydrator_request(
         &[
             ("client", client),
             ("method", method),
-            ("safety_level", safety_level.as_str()),
+            ("safety_level", safety_level.into()),
         ],
         latency_ms,
         HistogramBuckets::Bucket50To500,
     );
+}
+
+pub(crate) fn record_tes_join_latency(safety_level: SafetyLevel, elapsed: Duration) {
+    observe(
+        HYDRATOR_LATENCY_MS,
+        &[
+            ("client", "tes"),
+            ("method", "join"),
+            ("hydrator", "tes"),
+            ("safety_level", safety_level.into()),
+        ],
+        elapsed.as_secs_f64() * 1000.0,
+        HistogramBuckets::Bucket50To500,
+    );
+}
+
+pub(crate) fn record_author_labels(mapped: usize, unmapped: usize) {
+    for (result, count) in [("mapped", mapped), ("unmapped", unmapped)] {
+        incr_nonzero(AUTHOR_LABELS, &[("result", result)], count as u64);
+    }
 }
 
 pub(crate) fn record_batch_size(client: &'static str, candidate_count: usize) {
@@ -241,7 +224,6 @@ pub(crate) fn record_fallback_cache_keys(
     fresh: usize,
     stale: usize,
     stale_not_found: usize,
-    shadow_hit: usize,
     not_found: usize,
     unavailable: usize,
 ) {
@@ -249,7 +231,6 @@ pub(crate) fn record_fallback_cache_keys(
         ("fresh", fresh),
         ("stale", stale),
         ("stale_not_found", stale_not_found),
-        ("shadow_hit", shadow_hit),
         ("not_found", not_found),
         ("unavailable", unavailable),
     ] {
@@ -284,38 +265,6 @@ pub(crate) async fn timed_rpc<T: Default>(
         safety_level,
         outcome,
         candidate_count,
-        start.elapsed().as_secs_f64() * 1000.0,
-    );
-    body
-}
-
-pub(crate) async fn timed_keyed_rpc<K, V, E>(
-    client: &'static str,
-    method: &'static str,
-    safety_level: SafetyLevel,
-    candidate_count_by_key: &HashMap<K, usize>,
-    timeout: Duration,
-    fut: impl Future<Output = HashMap<K, Result<V, E>>>,
-) -> HashMap<K, Result<V, E>>
-where
-    K: Eq + Hash,
-{
-    let start = Instant::now();
-    let (counts, body) = match tokio::time::timeout(timeout, fut).await {
-        Ok(body) => (
-            KeyedResultCounts::from_results(candidate_count_by_key, &body),
-            body,
-        ),
-        Err(_) => (
-            KeyedResultCounts::outer_timeout(candidate_count_by_key),
-            HashMap::new(),
-        ),
-    };
-    record_keyed_hydrator_request(
-        client,
-        method,
-        safety_level,
-        counts,
         start.elapsed().as_secs_f64() * 1000.0,
     );
     body
@@ -427,6 +376,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dashboard_generator_pins_the_author_labels_metric_name() {
+        let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
+        let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
+        let path = if std::path::Path::new(cargo).exists() {
+            cargo
+        } else {
+            ws
+        };
+        let dashboard =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        assert!(dashboard.contains(&format!("AUTHOR_LABELS_METRIC = \"{AUTHOR_LABELS}\"")));
+    }
+
+    #[test]
     fn empty_batch_is_success() {
         let map: HashMap<u64, Result<u8, ()>> = HashMap::new();
         assert_eq!(batch_outcome(&map), HydratorOutcome::Success);
@@ -442,50 +405,6 @@ mod tests {
     fn any_success_preserves_legacy_batch_success() {
         let map: HashMap<u64, Result<u8, ()>> = HashMap::from([(1, Err(())), (2, Ok(7))]);
         assert_eq!(batch_outcome(&map), HydratorOutcome::Success);
-    }
-
-    #[test]
-    fn completed_keyed_batch_counts_success_error_and_missing_once() {
-        let expected = HashMap::from([(1, 2), (2, 1), (3, 3)]);
-        let results = HashMap::from([(1, Ok(Some(7))), (2, Err(()))]);
-
-        let counts = KeyedResultCounts::from_results(&expected, &results);
-
-        assert_eq!(
-            counts,
-            KeyedResultCounts {
-                success_keys: 1,
-                error_keys: 2,
-                success_candidates: 2,
-                error_candidates: 4,
-                ..Default::default()
-            }
-        );
-        assert_eq!(counts.outcome(), HydratorOutcome::Partial);
-    }
-
-    #[test]
-    fn ok_none_is_a_key_success() {
-        let expected = HashMap::from([(1, 1)]);
-        let results: HashMap<u64, Result<Option<u8>, ()>> = HashMap::from([(1, Ok(None))]);
-
-        let counts = KeyedResultCounts::from_results(&expected, &results);
-
-        assert_eq!(counts.success_keys, 1);
-        assert_eq!(counts.success_candidates, 1);
-        assert_eq!(counts.outcome(), HydratorOutcome::Success);
-    }
-
-    #[test]
-    fn all_key_errors_are_batch_error() {
-        let expected = HashMap::from([(1, 1), (2, 1)]);
-        let results: HashMap<u64, Result<Option<u8>, ()>> =
-            HashMap::from([(1, Err(())), (2, Err(()))]);
-
-        let counts = KeyedResultCounts::from_results(&expected, &results);
-
-        assert_eq!(counts.error_keys, 2);
-        assert_eq!(counts.outcome(), HydratorOutcome::Error);
     }
 
     #[test]
@@ -532,7 +451,6 @@ mod tests {
         )
         .await;
 
-        assert_eq!(returned.failed_count(), 2);
         assert!(matches!(
             returned.hydrated(&1),
             Some(Hydrated::Failed(HydrationError::Timeout))
@@ -558,55 +476,5 @@ mod tests {
             returned.hydrated(&2),
             Some(Hydrated::Failed(HydrationError::MissingResponse))
         ));
-    }
-
-    #[test]
-    fn outer_timeout_accounts_for_every_key_and_candidate() {
-        let expected = HashMap::from([(1, 2), (2, 3)]);
-
-        let counts = KeyedResultCounts::outer_timeout(&expected);
-
-        assert_eq!(counts.timeout_keys, 2);
-        assert_eq!(counts.timeout_candidates, 5);
-        assert_eq!(counts.outcome(), HydratorOutcome::Timeout);
-    }
-
-    #[tokio::test]
-    async fn timed_keyed_rpc_returns_completed_backend_map_unchanged() {
-        let expected = HashMap::from([(1, 1), (2, 1)]);
-        let backend_map = HashMap::from([(1, Ok(Some(7))), (2, Err("failed"))]);
-
-        let returned = timed_keyed_rpc(
-            "test",
-            "completed",
-            SafetyLevel::TimelineHome,
-            &expected,
-            Duration::from_secs(1),
-            std::future::ready(backend_map),
-        )
-        .await;
-
-        assert_eq!(
-            returned,
-            HashMap::from([(1, Ok(Some(7))), (2, Err("failed"))])
-        );
-    }
-
-    #[tokio::test]
-    async fn timed_keyed_rpc_outer_timeout_returns_empty_map() {
-        let expected = HashMap::from([(1, 2), (2, 3)]);
-        let never = std::future::pending::<HashMap<u64, Result<Option<u8>, ()>>>();
-
-        let returned = timed_keyed_rpc(
-            "test",
-            "timeout",
-            SafetyLevel::TimelineHome,
-            &expected,
-            Duration::ZERO,
-            never,
-        )
-        .await;
-
-        assert!(returned.is_empty());
     }
 }

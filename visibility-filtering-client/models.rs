@@ -88,6 +88,7 @@ pub enum FilteredReason {
     ViewerMutesAuthor,
     TweetIsNullcast,
     ExclusiveTweet,
+    ViewerBlocksAuthor,
 }
 
 impl MValCodec for KeywordMatch {
@@ -498,6 +499,9 @@ impl From<vf_pb::FilteredReason> for FilteredReason {
             Some(vf_pb::filtered_reason::Reason::ExclusiveTweet(_)) => {
                 FilteredReason::ExclusiveTweet
             }
+            Some(vf_pb::filtered_reason::Reason::ViewerBlocksAuthor(_)) => {
+                FilteredReason::ViewerBlocksAuthor
+            }
             None => FilteredReason::UnspecifiedReason,
         }
     }
@@ -555,6 +559,9 @@ impl From<FilteredReason> for vf_pb::FilteredReason {
             }
             FilteredReason::ExclusiveTweet => {
                 Some(vf_pb::filtered_reason::Reason::ExclusiveTweet(true))
+            }
+            FilteredReason::ViewerBlocksAuthor => {
+                Some(vf_pb::filtered_reason::Reason::ViewerBlocksAuthor(true))
             }
         };
         vf_pb::FilteredReason { reason }

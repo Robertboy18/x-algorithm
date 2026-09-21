@@ -8,7 +8,51 @@ use xai_candidate_pipeline::hydrator::{CacheStore, CachedHydrator};
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
 
-type MediaInfoCacheValue = (Option<bool>, Option<i32>);
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MediaInfoCacheValue {
+    has_media: Option<bool>,
+    has_photo: Option<bool>,
+    has_video: Option<bool>,
+    media_count: Option<i32>,
+    min_video_duration_ms: Option<i32>,
+    max_video_duration_ms: Option<i32>,
+}
+
+impl MediaInfoCacheValue {
+    fn from_candidate(candidate: &PostCandidate) -> Self {
+        Self {
+            has_media: candidate.has_media,
+            has_photo: candidate.has_photo,
+            has_video: candidate.has_video,
+            media_count: candidate.media_count,
+            min_video_duration_ms: candidate.min_video_duration_ms,
+            max_video_duration_ms: candidate.max_video_duration_ms,
+        }
+    }
+
+    fn no_media() -> Self {
+        Self {
+            has_media: Some(false),
+            has_photo: Some(false),
+            has_video: Some(false),
+            media_count: Some(0),
+            min_video_duration_ms: None,
+            max_video_duration_ms: None,
+        }
+    }
+
+    fn into_candidate(self) -> PostCandidate {
+        PostCandidate {
+            has_media: self.has_media,
+            has_photo: self.has_photo,
+            has_video: self.has_video,
+            media_count: self.media_count,
+            min_video_duration_ms: self.min_video_duration_ms,
+            max_video_duration_ms: self.max_video_duration_ms,
+            ..Default::default()
+        }
+    }
+}
 
 pub struct MediaInfoHydrator {
     pub media_info_cache_client: Arc<dyn MediaInfoCacheClient + Send + Sync>,
@@ -27,6 +71,10 @@ impl MediaInfoHydrator {
 
 fn min_video_duration_ms(durations: &[i64]) -> Option<i32> {
     durations.iter().copied().min().map(|v| v as i32)
+}
+
+fn max_video_duration_ms(durations: &[i64]) -> Option<i32> {
+    durations.iter().copied().max().map(|v| v as i32)
 }
 
 #[async_trait]
@@ -48,15 +96,11 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for MediaInfoHydrator {
     }
 
     fn cache_value(&self, hydrated: &PostCandidate) -> Self::CacheValue {
-        (hydrated.has_media, hydrated.min_video_duration_ms)
+        MediaInfoCacheValue::from_candidate(hydrated)
     }
 
     fn hydrate_from_cache(&self, value: Self::CacheValue) -> PostCandidate {
-        PostCandidate {
-            has_media: value.0,
-            min_video_duration_ms: value.1,
-            ..Default::default()
-        }
+        value.into_candidate()
     }
 
     async fn hydrate_from_client(
@@ -77,16 +121,16 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for MediaInfoHydrator {
         let mut hydrated_candidates = Vec::with_capacity(candidates.len());
         for tweet_id in tweet_ids {
             let hydrated = match media_info.get(&tweet_id) {
-                Some(Ok(Some(info))) => Ok(PostCandidate {
+                Some(Ok(Some(info))) => Ok(MediaInfoCacheValue {
                     has_media: Some(info.has_media),
+                    has_photo: Some(info.has_photo),
+                    has_video: Some(info.has_video),
+                    media_count: Some(info.media_count.clamp(0, i32::MAX as i64) as i32),
                     min_video_duration_ms: min_video_duration_ms(&info.video_durations_ms),
-                    ..Default::default()
-                }),
-                Some(Ok(None)) | None => Ok(PostCandidate {
-                    has_media: Some(false),
-                    min_video_duration_ms: None,
-                    ..Default::default()
-                }),
+                    max_video_duration_ms: max_video_duration_ms(&info.video_durations_ms),
+                }
+                .into_candidate()),
+                Some(Ok(None)) | None => Ok(MediaInfoCacheValue::no_media().into_candidate()),
                 Some(Err(err)) => Err(err.clone()),
             };
             hydrated_candidates.push(hydrated);
@@ -97,7 +141,11 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for MediaInfoHydrator {
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.has_media = hydrated.has_media;
+        candidate.has_photo = hydrated.has_photo;
+        candidate.has_video = hydrated.has_video;
+        candidate.media_count = hydrated.media_count;
         candidate.min_video_duration_ms = hydrated.min_video_duration_ms;
+        candidate.max_video_duration_ms = hydrated.max_video_duration_ms;
     }
 }
 
@@ -145,7 +193,11 @@ mod tests {
         assert!(result[0].is_ok());
         let c = result[0].as_ref().unwrap();
         assert_eq!(c.has_media, Some(true));
+        assert_eq!(c.has_photo, Some(true));
+        assert_eq!(c.has_video, Some(true));
+        assert_eq!(c.media_count, Some(1));
         assert_eq!(c.min_video_duration_ms, Some(3000));
+        assert_eq!(c.max_video_duration_ms, Some(5000));
     }
 
     #[tokio::test]
@@ -168,7 +220,10 @@ mod tests {
         assert!(result[0].is_ok());
         let c = result[0].as_ref().unwrap();
         assert_eq!(c.has_media, Some(false));
+        assert_eq!(c.has_video, Some(false));
+        assert_eq!(c.media_count, Some(0));
         assert_eq!(c.min_video_duration_ms, None);
+        assert_eq!(c.max_video_duration_ms, None);
     }
 
     #[tokio::test]

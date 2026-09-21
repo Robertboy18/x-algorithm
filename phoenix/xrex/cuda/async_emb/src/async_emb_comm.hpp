@@ -131,7 +131,11 @@ class AsyncEmbContext : public common::CommContext {
 
   void armLookup(LookupJob job, cudaStream_t main_stream);
   void armUpdate(
-      UpdateJob job, const int32_t* pending, ApplyUpdateRule apply, cudaStream_t main_stream
+      UpdateJob job,
+      const int32_t* pending,
+      ApplyUpdateRule apply,
+      cudaStream_t main_stream,
+      const int32_t* logical_step = nullptr
   );
   void warmupUpdateRule(const ApplyUpdateRule& apply);
   void resetTableBinding();

@@ -162,7 +162,7 @@ pub(crate) async fn build_vf_channel(
 }
 
 async fn build_vf_wily_channel(params: &VfChannelParams<'_>) -> Result<Channel, VfChannelError> {
-    let channel = build_wily_channel(params.name, params.dc, params.aperture_size).await?;
+    let channel = build_wily_channel(params).await?;
     incr_build_metric(params.name, "wily", "built");
     Ok(channel)
 }
@@ -182,11 +182,9 @@ impl LookupService for NamedWilyLookup {
     }
 }
 
-async fn build_wily_channel(
-    name: &str,
-    dc: &str,
-    num_endpoints: usize,
-) -> Result<Channel, VfChannelError> {
+async fn build_wily_channel(params: &VfChannelParams<'_>) -> Result<Channel, VfChannelError> {
+    let name = params.name;
+    let dc = params.dc;
     let wilyns = WilyNs::new(xai_wily::WilyConfig::local_zone(dc))
         .with_context(|| format!("{name}: failed to create WilyNs"))
         .map_err(VfChannelError::Config)?;
@@ -195,7 +193,7 @@ async fn build_wily_channel(
         inner: WilyNsLookup {
             wilyns,
             wily_path: VF_WILY_PATH.to_string(),
-            num_endpoints: Some(num_endpoints),
+            num_endpoints: None,
             shard_coordinate: None,
             filter_to_k8s_only: false,
         },
@@ -203,9 +201,14 @@ async fn build_wily_channel(
 
     let source = PollingEndpointSource::new(lookup, VF_DNS_POLL_INTERVAL);
 
-    ChannelBuilder::new(name)
+    let mut builder = ChannelBuilder::new(name)
         .tls(vf_tls(dc)?)
         .endpoint_source(source)
+        .aperture(params.aperture_size);
+    if params.deterministic_aperture {
+        builder = builder.deterministic();
+    }
+    builder
         .build()
         .await
         .with_context(|| format!("{name}: failed to connect to vf-service via WilyNS"))

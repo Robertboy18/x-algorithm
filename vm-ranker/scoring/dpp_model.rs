@@ -8,6 +8,7 @@ use xai_vm_ranker_proto::{RankCandidate, RankRequest, RankedCandidate};
 
 use super::DppContext;
 use crate::dpp::{self, DppInput};
+use crate::metrics::DPP_SEED_CONTEXT;
 
 fn l2_norm(v: &[f16]) -> f64 {
     v.iter()
@@ -81,10 +82,36 @@ fn build_dpp_inputs(req: &RankRequest, ctx: &DppContext) -> Vec<DppInput> {
         .collect()
 }
 
+fn build_seed_input(req: &RankRequest, ctx: &DppContext) -> Option<DppInput> {
+    if req.seed_tweet_id == 0 {
+        return None;
+    }
+    match ctx.store.client.get(req.seed_tweet_id) {
+        Some(embedding) => {
+            DPP_SEED_CONTEXT.with_label_values(&["pinned"]).inc();
+            let norm = l2_norm(&embedding);
+            Some(DppInput {
+                id: req.seed_tweet_id,
+                score: 0.0,
+                embedding,
+                norm,
+                embedding_missing: false,
+            })
+        }
+        None => {
+            DPP_SEED_CONTEXT
+                .with_label_values(&["embedding_missing"])
+                .inc();
+            None
+        }
+    }
+}
+
 pub fn rank(req: &RankRequest, ctx: &DppContext) -> Vec<RankedCandidate> {
     let inputs = build_dpp_inputs(req, ctx);
+    let seed = build_seed_input(req, ctx);
 
-    let results = dpp::rescore(&inputs, &ctx.config, req.viewer_id);
+    let results = dpp::rescore(&inputs, seed.as_ref(), &ctx.config, req.viewer_id);
 
     let debug = ctx.config.debug_viewer_id != 0 && req.viewer_id == ctx.config.debug_viewer_id;
     let selected_ids: HashSet<u64> = results.iter().map(|r| r.id).collect();

@@ -31,13 +31,12 @@ from xrex.models.recsys_two_tower_model import (
 )
 from xrex.models.scaling import ScaleConfig
 from xrex.models.transformer import FeedForwardConfig, RematType, TransformerConfig
-from xrex.optimizers.optim import OptimConfig
 from xrex.optimizers.recsys.config import RecsysEmbeddingOptimConfig
+from xrex.optimizers.recsys.dense_optim import RecsysDenseOptimConfig
 from xrex.optimizers.recsys.rowwise_adagrad import RecsysRowwiseAdagradConfig
 from xrex.optimizers.schedule import ConstantSampleSchedule
 from xrex.train.parallel_config import ParallelConfig
-from xrex.train.trainer import CheckpointConfig
-from xrex.train.trainer_recsys import RecsysTrainer
+from xrex.train.trainer_recsys import RecsysCheckpointConfig, RecsysTrainer
 
 PAD_TOKEN = 0
 INPUT_VOCAB_K = 512
@@ -271,8 +270,8 @@ def _xrecsys_two_tower_combined_base() -> dict:
         "empty_history_user_dropout_rate": 0.1,
         "learning_rate": 2e-3,
         "emb_learning_rate": 0.1,
-        "qk_norm": False,
-        "attn_logit_cap": 80.0,
+        "qk_norm": True,
+        "attn_logit_cap": -1,
         "primer_norm": True,
         "feature_prep_enabled": True,
         "enable_candidate_tower_linear_proj": False,
@@ -331,16 +330,10 @@ def _xrecsys_two_tower_combined_base() -> dict:
 _H100_OVERRIDES = {
     "bs_per_device": 480,
     "ep": 128,
-    "attn_impl": "pallas_ranker_varlen_attn",
+    "attn_impl": "cutedsl_ranker_varlen_attn",
 }
 
-_GB300_OVERRIDES = {
-    "bs_per_device": 768,
-    "ep": 32,
-    "attn_impl": "cutedsl_ranker_varlen_attn",
-    "remat_policy": RematType.SAVE_GB300_RECSYS,
-    "unroll_layer_stack": True,
-}
+_GB300_OVERRIDES = {"bs_per_device": 960, "ep": 64, "attn_impl": "cutedsl_ranker_varlen_attn"}
 
 
 MODEL_CFGS = {
@@ -427,6 +420,9 @@ MODEL_CFGS = {
             "dp": 1,
             "total_samples": 1e11,
             "learning_rate": 2e-3,
+            "qk_norm": True,
+            "attn_logit_cap": -1,
+            "right_anchored_rope": True,
             "attn_impl": "pallas_ranker_attn",
             "enable_candidate_tower_linear_proj": True,
             "apply_u2u_and_i2i_loss": False,
@@ -589,6 +585,7 @@ for config in configs:
             num_global_negatives_per_example=mparams["num_global_negatives_per_example"],
             debug_mode=False,
             apply_u2u_and_i2i_loss=mparams.get("apply_u2u_and_i2i_loss", False),
+            use_history_segment_ids=mparams.get("use_history_segment_ids", False),
             positive_actions=positive_actions,
             hard_negative_actions=hard_negative_actions,
             soft_negative_actions=soft_negative_actions,
@@ -717,7 +714,7 @@ for config in configs:
             ep=mparams["ep"],
             dp=mparams["dp"],
         ),
-        optim_config=OptimConfig(
+        optim_config=RecsysDenseOptimConfig(
             optim="adam",
             weight_decay=1e-3,
             b1=0.95,
@@ -733,7 +730,7 @@ for config in configs:
         ),
         max_steps=int(mparams["total_samples"] / mparams["base_batch_size"]) - 100,
         max_samples=None,
-        checkpoint_config=CheckpointConfig(
+        checkpoint_config=RecsysCheckpointConfig(
             from_checkpoint=True,
             checkpoint_every_n=300,
             checkpoint_keep_every_nth=100,

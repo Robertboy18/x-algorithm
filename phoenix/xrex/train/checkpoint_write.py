@@ -66,6 +66,35 @@ def save_checkpoint(
 
     path = self.get_checkpoint_path(self.ctx)
 
+    encrypt_checkpoint = self.checkpoint_config.encrypt
+    if getattr(self, "_restored_encrypted", False) and not encrypt_checkpoint:
+        raise ValueError(
+            "restored from an ENCRYPTED checkpoint but checkpoint_config.encrypt is "
+            "false — refusing to downgrade to plaintext saves; set "
+            "checkpoint_config.encrypt=true with encryption_key_id/encryption_context"
+        )
+    kms_client = None
+    if encrypt_checkpoint:
+        if self.checkpoint_config.encryption_key_id is None:
+            raise ValueError(
+                "checkpoint_config.encrypt requires checkpoint_config.encryption_key_id"
+            )
+        missing_context = {"domain", "run"} - self.checkpoint_config.encryption_context.keys()
+        if missing_context:
+            raise ValueError(
+                "encrypted checkpoint context is missing " + ", ".join(sorted(missing_context))
+            )
+        import hashlib
+
+        import xai_kms
+
+        encryption_context = dict(self.checkpoint_config.encryption_context)
+        encryption_context["mint_nonce"] = hashlib.sha256(os.fsencode(path)).hexdigest()
+        kms_client = xai_kms.KmsClient.from_cluster_env(
+            key_id=self.checkpoint_config.encryption_key_id,
+            encryption_context=encryption_context,
+        )
+
     with tracer.start_as_current_span("write_checksum"):
         if self.checkpoint_config.write_checksums:
             if checksum_dict is None:
@@ -84,6 +113,7 @@ def save_checkpoint(
     def _callback(
         elapsed_samples: int = self.elapsed_samples,
         elapsed_tokens: int = self.elapsed_tokens,
+        trainer_step: int = self.step,
     ) -> None:
         if checkpoint_index is not None:
             self.current_ckpt_index = checkpoint_index
@@ -96,6 +126,7 @@ def save_checkpoint(
             elapsed_samples,
             self.current_ckpt_index,
             elapsed_tokens,
+            trainer_step,
             self.checkpoint_config.checkpoint_ttl,
         )
 
@@ -124,6 +155,9 @@ def save_checkpoint(
         compressed=self.checkpoint_config.checkpoint_compressed,
         chunk_byte_size=self.checkpoint_config.checkpoint_chunk_size_bytes,
         tracer=tracer,
+        save_concurrent_gb=self.checkpoint_config.save_concurrent_gb,
+        kms_client=kms_client,
+        encryption_chunk_size=self.checkpoint_config.encryption_chunk_size_bytes,
     )
 
 

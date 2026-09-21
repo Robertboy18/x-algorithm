@@ -21,5 +21,4 @@ cache-keys = [
   { file = "../../../crates/serving/xai-recsys-mm-server/**" },
   { file = "../../../crates/serving/xai-recsys-proto/**" },
   { file = "../../../crates/serving/xai-recsys-server/**" },
-  { file = "../../../crates/serving/xai-recsys-sid-proto/**" },
 ]

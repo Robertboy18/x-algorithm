@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import datetime
+from dataclasses import field
 from typing import Literal, NamedTuple, Protocol
 
 import haiku as hk
@@ -19,6 +20,14 @@ class CheckpointConfig(Config):
     save_final_checkpoint: bool = False
 
     copy_port: int = 0
+
+    copy_port_tls_cert: str = ""
+    copy_port_tls_key: str = ""
+    copy_port_tls_client_ca: str = ""
+    copy_port_tls_ca: str = ""
+    copy_port_tls_server_name: str = ""
+    copy_port_tls_client_cert: str = ""
+    copy_port_tls_client_key: str = ""
 
     checkpoint_disk_every_s: int = 0
 
@@ -44,6 +53,18 @@ class CheckpointConfig(Config):
     checkpoint_chunked: bool = True
     checkpoint_compressed: bool = True
     checkpoint_chunk_size_bytes: int = 1024 * 1024 * 4
+    encrypt: bool = False
+    encryption_key_id: str | None = None
+    encryption_context: dict[str, str] = field(default_factory=dict)
+    encryption_chunk_size_bytes: int = 8 * 1024 * 1024
+
+    save_concurrent_gb: int | None = None
+
+    restore_concurrent_gb: int | None = 32
+
+    restore_streamed: bool = False
+
+    restore_window_gb: float | None = None
 
     checkpoint_ttl: int = datetime.timedelta(weeks=2).total_seconds()
 

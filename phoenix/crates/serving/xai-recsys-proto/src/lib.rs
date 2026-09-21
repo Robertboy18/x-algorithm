@@ -10,6 +10,7 @@ pub use pb::*;
 
 pub mod grok_topics;
 pub mod installed_apps;
+pub mod purchase_value;
 pub mod starter_packs;
 
 pub const SAFETY_BIT_AUTHOR_NSFW: u64 = 1 << 2;

@@ -377,22 +377,7 @@ class SidRetrievalModelRunner(
         assert isinstance(self.model_config, RecsysSIDRetrievalConfig)
         hash_keys = self.dataset.hash_table.hash_keys
 
-        sid_client = None
-        if self.model_config.use_post_sid and self.model_config.sid_num_levels > 0:
-            if not self.sid_endpoint:
-                raise ValueError(
-                    "v4 SID retrieval has use_post_sid=True; "
-                    "must pass --sid_endpoint <addr> to launch_inference.py"
-                )
-            sid_client = xai_recsys_engine.PySemanticIdClient(
-                self.sid_endpoint,
-                self.model_config.sid_num_levels,
-            )
-            logger.info(
-                "SID client connected: endpoint=%s, sid_num_levels=%d",
-                self.sid_endpoint,
-                self.model_config.sid_num_levels,
-            )
+        sid_num_levels = self.model_config.sid_num_levels if self.model_config.use_post_sid else 0
 
         return xai_recsys_engine.RecsysRetrievalPredictorServer(
             self.grpc_port,
@@ -409,7 +394,6 @@ class SidRetrievalModelRunner(
             service_time_ewma_alpha=self.service_time_ewma_alpha,
             pipeline_depth=1 if self.use_pipelining else 0,
             mm_client=mm_client,
-            sid_client=sid_client,
             user_id_table_size=hash_keys.user_id_table_size,
             user_hash_scales=hash_keys.user_hash_scales,
             user_biases=hash_keys.user_biases,
@@ -442,5 +426,5 @@ class SidRetrievalModelRunner(
             num_post_float_features=recsys_batch.POST_FLOAT_FEATURE_SIZE,
             num_post_int64_features=recsys_batch.POST_INT64_FEATURE_SIZE,
             enable_async_response_compression=self.enable_async_response_compression,
-            sid_num_levels=(self.model_config.sid_num_levels if sid_client is not None else 0),
+            sid_num_levels=sid_num_levels,
         )

@@ -21,7 +21,7 @@ class SubtitleAligner:
     def __init__(self, subtitles: list[str]):
         self.subtitles = self._parse_video_subtitle(subtitles)
 
-    def align(self, times: list[float]) -> list[str]:
+    def align(self, times: list[float], max_time: float | None = None) -> list[str]:
         if not times or not self.subtitles:
             logger.warning("No times or subtitles to align")
             return []
@@ -31,6 +31,8 @@ class SubtitleAligner:
         )
         buckets: list[list[str]] = [[] for _ in range(len(times))]
         for sub in self.subtitles:
+            if max_time is not None and sub.start_time >= max_time:
+                continue
             bucket_idx = min(int(sub.start_time / bucket_duration), len(times) - 1)
             buckets[bucket_idx].append(sub.text)
         logger.info(f"Aligned subtitles to {len(times)} buckets")

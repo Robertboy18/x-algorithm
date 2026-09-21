@@ -14,10 +14,10 @@ from xrex.models.recsys_model import (
 from xrex.models.recsys_sid_retrieval_model import RecsysSIDRetrievalConfig
 from xrex.models.scaling import ScaleConfig
 from xrex.models.transformer import FeedForwardConfig, RematType, TransformerConfig
-from xrex.optimizers.optim import OptimConfig
+from xrex.optimizers.recsys.dense_optim import RecsysDenseOptimConfig
 from xrex.optimizers.schedule import ConstantSampleSchedule
 from xrex.train.parallel_config import ParallelConfig
-from xrex.train.trainer import CheckpointConfig
+from xrex.train.trainer_recsys import RecsysCheckpointConfig
 from xrex.train.trainer_sid_retrieval import SidRetrievalTrainer
 
 PAD_TOKEN = 0
@@ -226,7 +226,7 @@ def make_trainer(
             ep=128,
             dp=1,
         ),
-        optim_config=OptimConfig(
+        optim_config=RecsysDenseOptimConfig(
             optim="adam",
             weight_decay=1e-3,
             b1=0.95,
@@ -237,7 +237,7 @@ def make_trainer(
         ),
         max_steps=int(1e11 / 32) - 100,
         max_samples=None,
-        checkpoint_config=CheckpointConfig(
+        checkpoint_config=RecsysCheckpointConfig(
             from_checkpoint=True,
             checkpoint_every_n=100,
             checkpoint_keep_every_nth=1000,

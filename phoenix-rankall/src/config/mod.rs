@@ -142,6 +142,10 @@ impl PipelineKind {
                 WindowConfig::new("post_creation", 24),
                 WindowConfig::new("1fav", 24),
                 WindowConfig::new("1fav", 48),
+                WindowConfig::new("1fav_video", 48),
+                WindowConfig::bounded("1fav_video", 24 * 2, 24 * 4),
+                WindowConfig::bounded("1fav_video", 24 * 4, 24 * 14),
+                WindowConfig::bounded("1fav_video", 24 * 4, 24 * 30),
                 WindowConfig::new("32fav", 24),
                 WindowConfig::new("video", 48),
                 WindowConfig::new("video", 96),
@@ -152,7 +156,6 @@ impl PipelineKind {
                 WindowConfig::new("nsfw_video", 168),
                 WindowConfig::new("evergreen_video", 24 * 365 * 5),
                 WindowConfig::new("evergreen_nsfw_video", 24 * 365 * 5),
-                WindowConfig::new("evergreen_video_grok", 24 * 30),
             ],
             Self::Topic => vec![
                 WindowConfig::new("1fav", 24),
@@ -175,6 +178,10 @@ impl PipelineKind {
             ],
             Self::Sid => vec![
                 WindowConfig::new("1fav", 24),
+                WindowConfig::new("1fav_video", 48),
+                WindowConfig::bounded("1fav_video", 24 * 2, 24 * 4),
+                WindowConfig::bounded("1fav_video", 24 * 4, 24 * 14),
+                WindowConfig::bounded("1fav_video", 24 * 4, 24 * 30),
                 WindowConfig::new("video", 48),
                 WindowConfig::new("video", 96),
                 WindowConfig::new("video", 24 * 14),
@@ -183,7 +190,8 @@ impl PipelineKind {
                 WindowConfig::new("nsfw_video", 24 * 14),
                 WindowConfig::new("evergreen_video", 24 * 365 * 5),
                 WindowConfig::new("imagine", 96),
-                WindowConfig::new("evergreen_video_grok", 24 * 30),
+                WindowConfig::bounded("video", 24 * 4, 24 * 14),
+                WindowConfig::bounded("nsfw_video", 24 * 4, 24 * 14),
             ],
             Self::SidTail => vec![WindowConfig::new("tail", 24)],
             Self::Analysis | Self::Ads => vec![],
@@ -210,6 +218,7 @@ impl fmt::Display for PipelineKind {
 pub struct WindowConfig {
     pub name: String,
     pub retention: Duration,
+    pub min_age: Option<Duration>,
 }
 
 impl WindowConfig {
@@ -217,12 +226,25 @@ impl WindowConfig {
         Self {
             name: name.into(),
             retention: Duration::from_secs(retention_hours * 3600),
+            min_age: None,
+        }
+    }
+
+    pub fn bounded(name: impl Into<String>, min_age_hours: u64, retention_hours: u64) -> Self {
+        assert!(min_age_hours < retention_hours);
+        Self {
+            name: name.into(),
+            retention: Duration::from_secs(retention_hours * 3600),
+            min_age: Some(Duration::from_secs(min_age_hours * 3600)),
         }
     }
 
     pub fn window_name(&self) -> String {
         let days = self.retention.as_secs() / 86400;
-        format!("{}_{days}day", self.name)
+        match self.min_age {
+            Some(min) => format!("{}_{}to{days}day", self.name, min.as_secs() / 86400),
+            None => format!("{}_{days}day", self.name),
+        }
     }
 }
 
@@ -240,8 +262,12 @@ mod tests {
             "evergreen_video_1825day"
         );
         assert_eq!(
-            WindowConfig::new("evergreen_video_grok", 24 * 30).window_name(),
-            "evergreen_video_grok_30day"
+            WindowConfig::bounded("video", 24 * 4, 24 * 14).window_name(),
+            "video_4to14day"
+        );
+        assert_eq!(
+            WindowConfig::bounded("nsfw_video", 24 * 4, 24 * 14).window_name(),
+            "nsfw_video_4to14day"
         );
     }
 
@@ -254,8 +280,11 @@ mod tests {
         assert!(names.contains(&"video_2day".to_string()));
         assert!(names.contains(&"post_creation_1day".to_string()));
         assert!(names.contains(&"evergreen_video_1825day".to_string()));
-        assert!(names.contains(&"evergreen_video_grok_30day".to_string()));
-        assert_eq!(configs.len(), 14);
+        assert!(names.contains(&"1fav_video_4to14day".to_string()));
+        assert!(names.contains(&"1fav_video_4to30day".to_string()));
+        assert!(names.contains(&"1fav_video_2day".to_string()));
+        assert!(names.contains(&"1fav_video_2to4day".to_string()));
+        assert_eq!(configs.len(), 17);
     }
 
     #[test]
@@ -334,16 +363,26 @@ mod tests {
     }
 
     #[test]
-    fn sid_pipeline_includes_evergreen_video_grok_window() {
+    fn sid_pipeline_includes_bounded_4to14_windows() {
         let names: Vec<String> = PipelineKind::Sid
             .window_configs()
             .iter()
             .map(|w| w.window_name())
             .collect();
-        assert!(
-            names.contains(&"evergreen_video_grok_30day".to_string()),
-            "Sid window list missing evergreen_video_grok_30day: {names:?}",
-        );
+        for w in [
+            "video_4to14day",
+            "nsfw_video_4to14day",
+            "1fav_video_4to14day",
+            "1fav_video_4to30day",
+            "1fav_video_2day",
+            "1fav_video_2to4day",
+        ] {
+            assert!(
+                names.contains(&w.to_string()),
+                "Sid window list missing {w}: {names:?}",
+            );
+        }
+        assert!(!names.iter().any(|n| n.contains("evergreen_video_grok")));
     }
 
     #[test]

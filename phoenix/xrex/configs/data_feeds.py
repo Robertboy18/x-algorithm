@@ -56,6 +56,7 @@ _RETRIEVAL_DUMP_PATH = settings.RETRIEVAL_DUMP_PATH
 
 GROUP_IDS: dict[str, str] = {
     "xrecsys_seqpack": "user_action_sequence_xrecsys",
+    "xrecsys_search": "user_action_sequence_xrecsys",
     "home_direct_packed": "user_action_sequence_home_direct_packed",
     "home_direct_packed_gb300": "user_action_sequence_home_direct_packed",
     "home_direct_packed_nano": "user_action_sequence_home_direct_packed_nano",
@@ -112,6 +113,7 @@ def _ranking_aggregated_kafka(mparams, hash_table, use_post_sid, sid_num_levels,
         history_seq_len=mparams["history_seq_len"],
         candidate_seq_len=mparams["candidate_seq_len"],
         input_vocab_size=mparams["input_vocab_size"],
+        output_vocab_size=mparams["output_vocab_size"],
         num_continuous_actions=mparams["num_continuous_actions"],
         pad_token=PAD_TOKEN,
         num_negatives_per_example=mparams.get("num_negatives_per_example", 1),
@@ -120,6 +122,8 @@ def _ranking_aggregated_kafka(mparams, hash_table, use_post_sid, sid_num_levels,
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
+        enable_stale_post=mparams.get("enable_stale_post", False),
+        exclude_required_columns=mparams.get("exclude_required_columns", ""),
     )
 
 
@@ -144,6 +148,8 @@ def _ranking_rust_kafka(mparams, hash_table, use_post_sid, sid_num_levels, confi
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
+        enable_stale_post=mparams.get("enable_stale_post", False),
+        exclude_required_columns=mparams.get("exclude_required_columns", ""),
     )
 
 
@@ -173,6 +179,7 @@ def _ranking_kafka_dispatcher(mparams, hash_table, use_post_sid, sid_num_levels,
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
+        enable_stale_post=mparams.get("enable_stale_post", False),
     )
 
 
@@ -192,6 +199,7 @@ def _ranking_offline_kafka_dump(mparams, hash_table, use_post_sid, sid_num_level
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
+        enable_stale_post=mparams.get("enable_stale_post", False),
     )
 
 
@@ -211,11 +219,16 @@ def _ranking_rust_parquet(mparams, hash_table, use_post_sid, sid_num_levels, con
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
+        enable_stale_post=mparams.get("enable_stale_post", False),
     )
 
 
 def _ranking_grpc_recsys(mparams, hash_table, use_post_sid, sid_num_levels, config_name):
     del config_name
+    if mparams.get("enable_stale_post", False):
+        raise ValueError(
+            "enable_stale_post is unsupported on grpc_recsys, which does not transport per-post feature arrays (int64/bool/categorical/float)"
+        )
     return PhoenixGrpcDataset(
         hash_table=hash_table,
         history_seq_len=mparams["history_seq_len"],
@@ -279,6 +292,7 @@ def _retrieval_aggregated_kafka(
         output_vocab_size=mparams["output_vocab_size"],
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
+        exclude_required_columns=mparams.get("exclude_required_columns", ""),
         **extra_kwargs,
     )
 
@@ -313,6 +327,7 @@ def _retrieval_rust_kafka(
         output_vocab_size=mparams["output_vocab_size"],
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
+        exclude_required_columns=mparams.get("exclude_required_columns", ""),
         **extra_kwargs,
     )
 

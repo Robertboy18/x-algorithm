@@ -2721,6 +2721,11 @@ class FlashAttentionBackwardSm100:
             )
             mask = AttentionMaskCls(seqlen)
             n_block_for_cluster = n_block // self.cta_group_size
+            mask_block_union = const_expr(
+                blocksparse_tensors is not None
+                and blocksparse_tensors.valid_block_upper is not None
+                and blocksparse_tensors.valid_block_lower is not None
+            )
             mask_fn = partial(
                 mask.apply_mask_sm100_transposed,
                 tScS_t2r=tScS_t2r,
@@ -2730,6 +2735,13 @@ class FlashAttentionBackwardSm100:
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
                 mask_mod=self.mask_mod,
+                mask_block_union=mask_block_union,
+                valid_block_upper=(
+                    blocksparse_tensors.valid_block_upper if mask_block_union else None
+                ),
+                valid_block_lower=(
+                    blocksparse_tensors.valid_block_lower if mask_block_union else None
+                ),
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
@@ -2857,8 +2869,16 @@ class FlashAttentionBackwardSm100:
                             (softmax_scale_log2, softmax_scale_log2),
                             (-lse_pair[0], -lse_pair[1]),
                         )
-                        tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
-                        tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
+                        tSrS_cur[2 * v] = (
+                            Float32(0.0)
+                            if lse_pair[0] == -Float32.inf
+                            else cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
+                        )
+                        tSrS_cur[2 * v + 1] = (
+                            Float32(0.0)
+                            if lse_pair[1] == -Float32.inf
+                            else cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
+                        )
                     utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
                     if const_expr(stage == 0):
                         cute.arch.fence_view_async_tmem_load()

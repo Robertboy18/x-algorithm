@@ -37,21 +37,16 @@ from typing import Callable, Optional, Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Float32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.utils import LayoutEnum
 from quack import copy_utils, layout_utils, sm90_utils
-
-try:
-    from flash_attn.cute import ampere_helpers as sm80_utils
-except ImportError:
-    sm80_utils = None
-
-import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from quack.cute_dsl_utils import ParamsBase
 
+from xrex.cutedsl.ranker_fa4 import ampere_helpers as sm80_utils
 from xrex.cutedsl.ranker_fa4 import utils
 from xrex.cutedsl.ranker_fa4.cute_dsl_utils import assume_tensor_aligned
 from xrex.cutedsl.ranker_fa4.seqlen_info import SeqlenInfoQK

@@ -41,16 +41,6 @@ impl ManhattanLookup for ManhattanSource {
                                 successes += 1;
                                 results.insert(tweet_id, ManhattanOutcome::Resolved(label_map));
                             }
-                            DecodeAttempt::Failure(e) => {
-                                failures += 1;
-                                results.insert(
-                                    tweet_id,
-                                    ManhattanOutcome::Failure(LookupError::new(
-                                        FailureKind::ManhattanDecode,
-                                        e.to_string(),
-                                    )),
-                                );
-                            }
                             DecodeAttempt::Panic => {
                                 failures += 1;
                                 results.insert(

@@ -4,6 +4,7 @@ import base64
 import dataclasses
 import datetime
 import enum
+import functools
 import importlib
 import inspect
 import json
@@ -237,6 +238,8 @@ def from_dict(
                     init_values[k] = base64.b64decode(v.encode("utf-8"))
                 elif is_datetime(vtype):
                     init_values[k] = datetime.datetime.fromisoformat(v)
+                elif is_class_ref(vtype):
+                    init_values[k] = _coerce_class_ref(v, f"{cls_name}.{k}")
                 else:
                     coerced = _coerce_enums_from_hint(vtype, v)
                     if coerced is not v:
@@ -288,20 +291,21 @@ def to_dict(obj: Any, container: str = "???") -> Any:
     return obj
 
 
-def resolve_type_hints(dcls: Any) -> dict[str, Type[Any]]:
-    if isinstance(dcls, Config):
-        resolved_hints = type(dcls).get_type_hints()
-    elif isinstance(dcls, type):
-        if dataclasses.is_dataclass(dcls):
-            resolved_hints = get_type_hints(dcls)
-            field_names = [field.name for field in dataclasses.fields(dcls)]
-            return {name: resolved_hints[name] for name in field_names}
-        else:
-            return {}
+@functools.cache
+def _resolve_type_hints(cls: type) -> dict[str, Type[Any]]:
+    if issubclass(cls, Config):
+        resolved_hints = cls.get_type_hints()
+    elif dataclasses.is_dataclass(cls):
+        resolved_hints = get_type_hints(cls)
     else:
-        resolved_hints = get_type_hints(type(dcls))
-    field_names = [field.name for field in dataclasses.fields(dcls)]
-    return {name: resolved_hints[name] for name in field_names}
+        return {}
+    return {field.name: resolved_hints[field.name] for field in dataclasses.fields(cls)}
+
+
+def resolve_type_hints(dcls: Any) -> dict[str, Type[Any]]:
+    if isinstance(dcls, type):
+        return _resolve_type_hints(dcls)
+    return _resolve_type_hints(type(dcls))
 
 
 def replace_cli_subs(
@@ -508,6 +512,11 @@ def is_datetime(ty) -> bool:
     )
 
 
+def is_class_ref(ty) -> bool:
+    inner = _unwrap_optional(ty)
+    return inner is type or get_origin(inner) is type
+
+
 def _unwrap_optional(ty: Any) -> Any:
     if is_optional(ty):
         non_none = [a for a in get_args(ty) if a is not type(None)]
@@ -523,6 +532,22 @@ def _coerce_enum_value(enum_cls: enum.EnumMeta, value: Any) -> Any:
         return enum_cls(value)
     except (ValueError, TypeError):
         return enum_cls[value]
+
+
+def _coerce_class_ref(value: Any, where: str) -> Any:
+    if not isinstance(value, str):
+        return value
+    parts = value.split(".")
+    for split in range(len(parts) - 1, 0, -1):
+        try:
+            obj: Any = importlib.import_module(".".join(parts[:split]))
+        except ImportError:
+            continue
+        for attr in parts[split:]:
+            obj = getattr(obj, attr, None)
+        if isinstance(obj, type):
+            return obj
+    raise ValueError(f"{where}: cannot import class {value!r} (a local class cannot round-trip)")
 
 
 def _coerce_enums_from_hint(vtype: Any, value: Any) -> Any:

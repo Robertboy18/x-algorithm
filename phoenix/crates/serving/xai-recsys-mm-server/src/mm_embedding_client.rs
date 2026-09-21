@@ -120,82 +120,133 @@ impl MmEmbeddingsClient {
         self.shards.iter().map(|s| s.len()).sum()
     }
 
-    pub async fn preload_embeddings(&self, embeddings: Vec<EmbeddingRecord>, parallel: bool) {
-        let num_shards = self.num_shards;
+    fn shard_records(
+        embeddings: Vec<EmbeddingRecord>,
+        num_shards: usize,
+    ) -> Vec<Vec<(u64, Vec<f16>)>> {
         let mut buckets: Vec<Vec<(u64, Vec<f16>)>> = (0..num_shards).map(|_| Vec::new()).collect();
         for record in embeddings {
             let idx = (record.post_id % num_shards as u64) as usize;
             buckets[idx].push((record.post_id, record.embedding));
         }
+        buckets
+    }
 
+    fn insert_bucket(shard: &CacheShard, bucket: Vec<(u64, Vec<f16>)>) {
+        match shard {
+            CacheShard::InProcess(c) => {
+                c.bulk_insert(bucket.into_iter().map(|(id, emb)| (id, Arc::new(emb))));
+            }
+            CacheShard::Lmdb(c) => {
+                c.insert_many(bucket);
+            }
+        }
+    }
+
+    pub fn insert_sync(&self, embeddings: Vec<EmbeddingRecord>) {
+        let buckets = Self::shard_records(embeddings, self.num_shards);
+        for (shard_idx, bucket) in buckets.into_iter().enumerate() {
+            Self::insert_bucket(&self.shards[shard_idx], bucket);
+        }
+        MM_EMBEDDING_CACHE_SIZE.set(self.total_len() as f64);
+    }
+
+    pub fn ingest_parquet_bytes_sync(&self, data: bytes::Bytes, file_name: &str) -> Result<usize> {
+        let embeddings = read_embeddings_from_parquet(data, file_name)?;
+        let n = embeddings.len();
+        self.insert_sync(embeddings);
+        Ok(n)
+    }
+
+    pub async fn preload_embeddings(&self, embeddings: Vec<EmbeddingRecord>, parallel: bool) {
+        let num_shards = self.num_shards;
+        let shards = self.shards.clone();
         if parallel {
+            let buckets = match tokio::task::spawn_blocking(move || {
+                Self::shard_records(embeddings, num_shards)
+            })
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    log::error!("Shard-split task panicked: {e:#}");
+                    return;
+                }
+            };
             let mut handles = Vec::with_capacity(num_shards);
             for (shard_idx, bucket) in buckets.into_iter().enumerate() {
-                let shard = self.shards[shard_idx].clone();
-                handles.push(tokio::task::spawn_blocking(move || match shard {
-                    CacheShard::InProcess(c) => {
-                        c.bulk_insert(bucket.into_iter().map(|(id, emb)| (id, Arc::new(emb))));
-                    }
-                    CacheShard::Lmdb(c) => {
-                        c.insert_many(bucket);
-                    }
+                let shard = shards[shard_idx].clone();
+                handles.push(tokio::task::spawn_blocking(move || {
+                    Self::insert_bucket(&shard, bucket);
                 }));
             }
             for handle in handles {
                 if let Err(e) = handle.await {
-                    log::error!("Shard insertion task panicked: {:#}", e);
+                    log::error!("Shard insertion task panicked: {e:#}");
                 }
             }
+            MM_EMBEDDING_CACHE_SIZE.set(self.total_len() as f64);
         } else {
-            let shards = self.shards.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                for (shard_idx, bucket) in buckets.into_iter().enumerate() {
-                    match &shards[shard_idx] {
-                        CacheShard::InProcess(c) => {
-                            c.bulk_insert(bucket.into_iter().map(|(id, emb)| (id, Arc::new(emb))));
-                        }
-                        CacheShard::Lmdb(c) => {
-                            c.insert_many(bucket);
-                        }
-                    }
-                }
-            })
-            .await
+            let client = self.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || client.insert_sync(embeddings)).await
             {
-                log::error!("Shard insertion task panicked: {:#}", e);
+                log::error!("Cache insert task panicked: {e:#}");
             }
         }
-
-        MM_EMBEDDING_CACHE_SIZE.set(self.total_len() as f64);
     }
 
     pub fn get(&self, post_id: u64) -> Option<Arc<Vec<f16>>> {
         self.shard(post_id).get(post_id)
     }
 
-    pub async fn fetch_mm_embeddings(
-        &self,
-        post_ids: Vec<u64>,
-        emb_dim: usize,
-        candidate_seq_len: usize,
-    ) -> Result<Vec<f16>> {
-        let start_time = std::time::Instant::now();
-        assert!(emb_dim > 0);
-        let total_posts = post_ids.len();
-        let processed = candidate_seq_len.min(total_posts);
-        let mut results = vec![f16::ZERO; emb_dim * processed];
-        let mut missing = 0usize;
-
-        for (idx, &post_id) in post_ids.iter().take(processed).enumerate() {
-            let start = idx * emb_dim;
-            if !self
-                .shard(post_id)
-                .copy_to(post_id, &mut results[start..start + emb_dim])
-            {
-                missing += 1;
-            }
+    pub fn in_process() -> Self {
+        let shard_capacity = MAX_EMBEDDING_CACHE_SIZE / NUM_SHARDS;
+        let ttl = embedding_ttl();
+        log::info!(
+            "Creating in-process MM cache ({} shards, capacity={})",
+            NUM_SHARDS,
+            MAX_EMBEDDING_CACHE_SIZE
+        );
+        Self {
+            shards: (0..NUM_SHARDS)
+                .map(|_| CacheShard::InProcess(Arc::new(EmbeddingCache::new(shard_capacity, ttl))))
+                .collect(),
+            num_shards: NUM_SHARDS,
         }
+    }
 
+    pub fn fetch_mm_embeddings_into(
+        &self,
+        post_ids: &[u64],
+        emb_dim: usize,
+        dest: &mut [f16],
+    ) -> Result<()> {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        anyhow::ensure!(emb_dim > 0, "emb_dim must be > 0");
+        anyhow::ensure!(
+            dest.len().is_multiple_of(emb_dim),
+            "dest len {} is not a multiple of emb_dim {}",
+            dest.len(),
+            emb_dim
+        );
+        let start_time = std::time::Instant::now();
+        let total_posts = post_ids.len();
+        let processed = total_posts.min(dest.len() / emb_dim);
+        let missing = AtomicUsize::new(0);
+
+        dest[..processed * emb_dim]
+            .par_chunks_mut(emb_dim)
+            .zip(post_ids.par_iter().take(processed))
+            .for_each(|(dst, &post_id)| {
+                if !self.shard(post_id).copy_to(post_id, dst) {
+                    missing.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+
+        let missing = missing.load(Ordering::Relaxed);
         let found = processed - missing;
         MM_EMBEDDING_TWEET_LOOKUP
             .with_label_values(&["found"])
@@ -209,7 +260,28 @@ impl MmEmbeddingsClient {
         }
 
         FETCH_MM_EMBEDDINGS_DURATION.observe(start_time.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    pub fn fetch_mm_embeddings_sync(
+        &self,
+        post_ids: Vec<u64>,
+        emb_dim: usize,
+        candidate_seq_len: usize,
+    ) -> Result<Vec<f16>> {
+        let processed = candidate_seq_len.min(post_ids.len());
+        let mut results = vec![f16::ZERO; emb_dim.saturating_mul(processed)];
+        self.fetch_mm_embeddings_into(&post_ids, emb_dim, &mut results)?;
         Ok(results)
+    }
+
+    pub async fn fetch_mm_embeddings(
+        &self,
+        post_ids: Vec<u64>,
+        emb_dim: usize,
+        candidate_seq_len: usize,
+    ) -> Result<Vec<f16>> {
+        self.fetch_mm_embeddings_sync(post_ids, emb_dim, candidate_seq_len)
     }
 }
 
@@ -228,7 +300,7 @@ pub fn get_mm_client(
     let shard_capacity = MAX_EMBEDDING_CACHE_SIZE / NUM_SHARDS;
     let ttl = embedding_ttl();
 
-    let shards: Vec<CacheShard> = if shared {
+    let client = if shared {
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..NUM_SHARDS)
@@ -259,21 +331,12 @@ pub fn get_mm_client(
                 shards.push(handle.join().expect("shard creation thread panicked"));
             }
         });
-        shards
+        MmEmbeddingsClient {
+            shards,
+            num_shards: NUM_SHARDS,
+        }
     } else {
-        log::info!(
-            "Creating in-process MM cache ({} shards, capacity={})",
-            NUM_SHARDS,
-            MAX_EMBEDDING_CACHE_SIZE
-        );
-        (0..NUM_SHARDS)
-            .map(|_| CacheShard::InProcess(Arc::new(EmbeddingCache::new(shard_capacity, ttl))))
-            .collect()
-    };
-
-    let client = MmEmbeddingsClient {
-        shards,
-        num_shards: NUM_SHARDS,
+        MmEmbeddingsClient::in_process()
     };
 
     if !is_writer {
@@ -345,6 +408,41 @@ mod tests {
     use super::*;
     use crate::snapshot::EmbeddingRecord;
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn in_process_fetch_hits_and_misses() {
+        const TWEPOCH_MS: u64 = 1_288_834_974_657;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let hit_id = ((now_ms - TWEPOCH_MS) << 22) | 1;
+        let miss_id = ((now_ms - TWEPOCH_MS) << 22) | 2;
+        let client = MmEmbeddingsClient::in_process();
+        client
+            .preload_embeddings(
+                vec![EmbeddingRecord {
+                    post_id: hit_id,
+                    embedding: vec![f16::from_f32(0.5); 4],
+                }],
+                false,
+            )
+            .await;
+        let hit = client
+            .fetch_mm_embeddings_sync(vec![hit_id, miss_id], 4, 2)
+            .unwrap();
+        assert_eq!(hit.len(), 8);
+        assert_eq!(f32::from(hit[0]), 0.5);
+        assert_eq!(f32::from(hit[4]), 0.0);
+
+        let mut dest = vec![f16::from_f32(9.0); 12];
+        client
+            .fetch_mm_embeddings_into(&[hit_id, miss_id], 4, &mut dest)
+            .unwrap();
+        assert_eq!(f32::from(dest[0]), 0.5);
+        assert_eq!(f32::from(dest[4]), 9.0);
+        assert_eq!(f32::from(dest[8]), 9.0);
+    }
 
     #[tokio::test]
     #[ignore]

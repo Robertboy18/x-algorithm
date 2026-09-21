@@ -33,9 +33,9 @@ url = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 lazy_static = { workspace = true }
-libc = { workspace = true }
 log = { workspace = true }
 md5 = { workspace = true }
+libc = { workspace = true }
 memmap2 = { workspace = true }
 murmur3 = { workspace = true }
 nix = { workspace = true, features = ["fs", "uio"] }
@@ -62,13 +62,16 @@ tonic-reflection = { workspace = true }
 xai-recsys = { workspace = true }
 xai-recsys-proto = { workspace = true }
 xai-recsys-server = { workspace = true }
-xai-recsys-sid-proto = { workspace = true }
 xai-recsys-mm-server = { workspace = true }
+xai-o2 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ibverbs = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
 tokio-stream = { workspace = true }
 
 [lints]

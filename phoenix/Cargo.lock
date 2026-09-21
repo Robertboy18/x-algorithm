@@ -2869,6 +2869,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64 0.22.1",
+ "serde_core",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3469,6 +3479,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3942,6 +3965,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial_test"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "699f4197115b8a7e7ff19c9a315a4bd6fffec26cc4626ef45ecaea389e081c6d"
+dependencies = [
+ "futures-executor",
+ "futures-util",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "serial_test_derive",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94e153fc76e1c6a068703d6d29c508a0b15c061c4b7e43da59cc097bc342673c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4236,8 +4284,9 @@ dependencies = [
 
 [[package]]
 name = "thrift"
-version = "0.23.0"
-source = "git+https://github.com/apache/thrift.git?tag=v0.23.0#e4b684f5ff4f9c3a42cd7ec0a667c3d9bd7f6ac1"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b29bdae81cc2dbc498a720e2734e08f26e388c791fca6e95464d41001913714"
 dependencies = [
  "byteorder",
  "integer-encoding",
@@ -5049,6 +5098,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
+name = "xai-o2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+]
+
+[[package]]
 name = "xai-recsys"
 version = "0.1.0"
 dependencies = [
@@ -5056,6 +5114,7 @@ dependencies = [
  "crc32fast",
  "half",
  "lazy_static",
+ "log",
  "prometheus 0.14.0",
  "xai-recsys-proto",
 ]
@@ -5099,10 +5158,13 @@ dependencies = [
  "pyo3",
  "rand 0.9.5",
  "rayon",
+ "rcgen",
  "scopeguard",
  "serde_json",
+ "serial_test",
  "simd-adler32",
  "static_assertions",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -5111,11 +5173,11 @@ dependencies = [
  "tonic-reflection",
  "tower",
  "url",
+ "xai-o2",
  "xai-recsys",
  "xai-recsys-mm-server",
  "xai-recsys-proto",
  "xai-recsys-server",
- "xai-recsys-sid-proto",
  "zstd",
 ]
 
@@ -5138,6 +5200,7 @@ dependencies = [
  "parquet",
  "prometheus 0.14.0",
  "pyo3",
+ "rayon",
  "tempfile",
  "thrift",
  "tokio",
@@ -5185,6 +5248,15 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]

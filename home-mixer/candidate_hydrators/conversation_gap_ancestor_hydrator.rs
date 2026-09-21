@@ -40,12 +40,13 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for ConversationGapAncestorHydrat
         candidates
             .iter()
             .map(|candidate| {
-                expand_ancestors_for_gap(&candidate.ancestors, &ancestor_core).map(|ancestors| {
-                    PostCandidate {
-                        tombstone_ancestor_ids: tombstone_ancestor_ids(&ancestors, &ancestor_core),
-                        ancestors,
-                        ..Default::default()
-                    }
+                let ancestors = expand_ancestors_for_gap(&candidate.ancestors, &ancestor_core)
+                    .unwrap_or_else(|_| candidate.ancestors.to_vec());
+                Ok(PostCandidate {
+                    tombstone_ancestor_ids: tombstone_ancestor_ids(&ancestors, &ancestor_core),
+                    ancestor_texts: ancestor_texts(&candidate.ancestors, &ancestor_core),
+                    ancestors,
+                    ..Default::default()
                 })
             })
             .collect()
@@ -54,6 +55,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for ConversationGapAncestorHydrat
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.ancestors = hydrated.ancestors;
         candidate.tombstone_ancestor_ids = hydrated.tombstone_ancestor_ids;
+        candidate.ancestor_texts = hydrated.ancestor_texts;
     }
 }
 
@@ -86,6 +88,20 @@ fn tombstone_ancestor_ids(
         .iter()
         .copied()
         .filter(|id| matches!(ancestor_core.get(id), Some(Ok(None))))
+        .collect()
+}
+
+fn ancestor_texts(
+    ancestors: &[u64],
+    ancestor_core: &HashMap<u64, anyhow::Result<Option<PureCoreData>>>,
+) -> HashMap<u64, String> {
+    ancestors
+        .iter()
+        .copied()
+        .filter_map(|id| match ancestor_core.get(&id) {
+            Some(Ok(Some(data))) if !data.text.is_empty() => Some((id, data.text.clone())),
+            _ => None,
+        })
         .collect()
 }
 

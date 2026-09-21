@@ -9,6 +9,7 @@ import logging
 import os
 import pickle
 import socket
+import struct
 import time
 import uuid
 from contextlib import contextmanager
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
 
 
-AOT_CACHE_VERSION: str = "20260705"
+AOT_CACHE_VERSION: str = "20260904"
 
 
 def is_host_callbacks(obj: Any) -> bool:
@@ -314,10 +315,62 @@ def read_annotation_file(file_path: str) -> str:
         return f.read()
 
 
+_CUTLASS_CALL_TARGET = "CuteDSLRT_NvJaxCutlassCall"
+_FATBIN_MAGIC = b"\x50\xed\x55\xba"
+_ELF_MAGIC = b"\x7fELF"
+
+
+def cutlass_module_device_digest(module_bytes: bytes) -> str:
+    data = module_bytes
+    device_blobs = []
+    if data[:4] == _ELF_MAGIC and len(data) >= 0x40:
+        try:
+            shoff = struct.unpack_from("<Q", data, 0x28)[0]
+            shentsize, shnum = struct.unpack_from("<HH", data, 0x3A)
+            for i in range(shnum):
+                _, sh_type, _, _, sh_offset, sh_size = struct.unpack_from(
+                    "<IIQQQQ", data, shoff + i * shentsize
+                )
+                if sh_type == 8 or sh_size == 0:
+                    continue
+                blob = data[sh_offset : sh_offset + sh_size]
+                if _FATBIN_MAGIC in blob or _ELF_MAGIC in blob:
+                    device_blobs.append(blob)
+        except struct.error:
+            device_blobs = []
+    h = hashlib.sha256()
+    for blob in device_blobs or [data]:
+        h.update(blob)
+    return h.hexdigest()
+
+
+def _sanitize_cutlass_calls(m: ir.Module) -> ir.Module:
+    def _update(op: ir.Operation) -> ir.WalkResult:
+        if (
+            op.name == "stablehlo.custom_call"
+            and op.attributes["call_target_name"].value == _CUTLASS_CALL_TARGET
+            and "mhlo.backend_config" in op.attributes
+        ):
+            cfg = ir.DictAttr(op.attributes["mhlo.backend_config"])
+            entries = {cfg[i].name: cfg[i].attr for i in range(len(cfg))}
+            if "module" in entries and ir.StringAttr.isinstance(entries["module"]):
+                module_bytes = ir.StringAttr(entries["module"]).value_bytes
+                entries.pop("key", None)
+                entries["module"] = ir.StringAttr.get(
+                    "device_digest:" + cutlass_module_device_digest(module_bytes)
+                )
+                op.attributes["mhlo.backend_config"] = ir.DictAttr.get(entries)
+        return ir.WalkResult.ADVANCE
+
+    m.operation.walk(_update)
+    return m
+
+
 def get_sanitized_ir_text(lowered: Lowered, add_loc: bool) -> str:
     module = lowered.compiler_ir(dialect="stablehlo")
     with module.context:
         sanitized = _remove_callbacks(module.operation.clone(), IgnoreCallbacks.ALL)
+        sanitized = _sanitize_cutlass_calls(sanitized)
         return sanitized.operation.get_asm(enable_debug_info=add_loc)
 
 

@@ -1,7 +1,6 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use crate::params::ValueModelMode;
-use crate::scorers::ranking_scorer::ScoringWeights;
+use crate::scorers::ranking_scorer::{ScoringWeights, WEIGHTED_VALUE_MODEL_MODE};
 use prost::Message;
 use rand::random;
 use std::collections::HashMap;
@@ -85,7 +84,7 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for RerankingKafkaSideEffect {
             request_join_id: Some(input.query.request_id),
             product_surface: product_surface.into(),
             applied_weights: ScoringWeights::from_params(&input.query.params).applied_weights_map(),
-            value_model_mode: Some(input.query.params.get(ValueModelMode)),
+            value_model_mode: Some(WEIGHTED_VALUE_MODEL_MODE.to_string()),
         };
 
         let bytes = batch.encode_to_vec();

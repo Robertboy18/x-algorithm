@@ -13,7 +13,9 @@ from jax.sharding import PartitionSpec as P
 
 from xai_configlib import Config, configclass
 from xrex.data.recsys.feature_config import (
+    BoolFeature,
     CategoricalFeature,
+    Int64Feature,
     UserCategoricalFeature,
     UserFloatFeature,
 )
@@ -21,6 +23,15 @@ from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.models.layers import get_parameter
 from xrex.models.recsys_embedding import HashKeys, RecsysEmbeddings
 from xrex.models.scaling import ScaleConfig
+
+ENGAGEMENT_COUNT_ORDER: tuple[Int64Feature, ...] = (
+    Int64Feature.favCountSeq,
+    Int64Feature.replyCountSeq,
+    Int64Feature.repostCountSeq,
+    Int64Feature.quoteCountSeq,
+    Int64Feature.viewCountSeq,
+)
+ENGAGEMENT_COUNT_LOG2_SCALE: float = 32.0
 
 
 class FeaturePrepStreams(NamedTuple):
@@ -164,8 +175,12 @@ class FeaturePrepConfig(Config):
     enable_dwell_time: bool = True
     dwell_time_norm_scale: float = 30.0
     enable_bridge_prob: bool = False
+    enable_click_dwell_time: bool = False
+    click_dwell_time_norm_scale: float = 60.0
     product_surface_cardinality: int = 16
     timezone_cardinality: int = 32
+    enable_engagement_counts: bool = False
+    engagement_count_mlp_hidden_dim: int = 64
 
     enable_time_of_day: bool = False
     time_of_day_kernel: Literal["box", "triangle", "cosine"] = "cosine"
@@ -189,6 +204,9 @@ class FeaturePrepConfig(Config):
     enable_day_of_week: bool = False
     day_of_week_cardinality: int = 8
 
+    enable_is_author_followed_by_viewer: bool = False
+    enable_is_author_following_viewer: bool = False
+
     enable_post_sid: bool = False
     sid_embed_dim: int = 1024
     sid_num_levels: int = 6
@@ -198,6 +216,7 @@ class FeaturePrepConfig(Config):
 
     multimodal_embedding_dim: int = 0
     search_query_embedding_dim: int = 0
+    enable_stale_post: bool = False
 
     @property
     def has_user_features(self) -> bool:
@@ -589,6 +608,65 @@ def _add_context_features(
                 dow, config.day_of_week_cardinality, f"{prefix}_day_of_week_emb", config
             ).astype(fprop_dtype)
 
+    if config.enable_is_author_followed_by_viewer or config.enable_is_author_following_viewer:
+        bool_features = batch_seq.get("bool_features")
+        if bool_features is not None:
+            bool_features = _cast_jax(bool_features)
+            if config.enable_is_author_followed_by_viewer:
+                followed = bool_features[:, :, BoolFeature.isAuthorFollowedByViewerSeq].astype(
+                    jnp.int32
+                )
+                result = result + _embed_categorical(
+                    followed, 2, f"{prefix}_is_author_followed_by_viewer_emb", config
+                ).astype(fprop_dtype)
+            if config.enable_is_author_following_viewer:
+                following = bool_features[:, :, BoolFeature.isAuthorFollowingViewerSeq].astype(
+                    jnp.int32
+                )
+                result = result + _embed_categorical(
+                    following, 2, f"{prefix}_is_author_following_viewer_emb", config
+                ).astype(fprop_dtype)
+
+    if config.enable_engagement_counts:
+        i64 = batch_seq.get("int64_features")
+        if i64 is not None:
+            i64 = _cast_jax(i64)
+            x = jnp.stack(
+                [
+                    jnp.log2(jnp.maximum(i64[:, :, f.value].astype(jnp.float32), 0.0) + 1.0)
+                    for f in ENGAGEMENT_COUNT_ORDER
+                ],
+                axis=-1,
+            )
+            v = x / ENGAGEMENT_COUNT_LOG2_SCALE
+            v = jnp.concatenate([v, jnp.ones_like(v[..., :1])], axis=-1)
+            h_proj = _get_proj(
+                f"{prefix}_count_lograw_mlp_in",
+                v.shape[-1],
+                config.engagement_count_mlp_hidden_dim,
+                config,
+                role="input_proj",
+            )
+            out_proj = _get_proj(
+                f"{prefix}_count_lograw_mlp_out",
+                config.engagement_count_mlp_hidden_dim,
+                config.emb_size,
+                config,
+                role="input_proj",
+            )
+            hidden = jax.nn.gelu(jnp.dot(v.astype(h_proj.dtype), h_proj))
+            result = result + jnp.dot(hidden, out_proj).astype(fprop_dtype)
+
+    if config.enable_stale_post and prefix != "hist":
+        bools = batch_seq.get("bool_features")
+        if bools is not None and bools.shape[-1] > BoolFeature.isStalePost14d.value:
+            is_stale = _cast_jax(bools)[:, :, BoolFeature.isStalePost14d.value].astype(jnp.int32)
+            emb_table = _get_emb_table(
+                f"{prefix}_is_stale_post_14d_emb", 2, config.emb_size, config
+            )
+            one_hot = jax.nn.one_hot(jnp.clip(is_stale, 0, 1), 2)
+            result = result + jnp.dot(one_hot, emb_table).astype(fprop_dtype)
+
     return result
 
 
@@ -754,11 +832,26 @@ def _add_history_features(
             ).astype(fprop_dtype)
 
     if config.enable_bridge_prob:
+        from xai_proto import recsys_pb2
+
+        _bridge_idx = recsys_pb2.ContinuousActionName.BRIDGE_PROBABILITY
         cont_actions = batch["history_seq"].get("continuous_actions")
-        if cont_actions is not None:
-            bridge_p = jnp.clip(_cast_jax(cont_actions)[:, :, 0].astype(jnp.float32), 0.0, 1.0)
+        if cont_actions is not None and cont_actions.shape[-1] > _bridge_idx:
+            bridge_p = jnp.clip(
+                _cast_jax(cont_actions)[:, :, _bridge_idx].astype(jnp.float32), 0.0, 1.0
+            )
             result = result + _embed_scalar_times_vector(
                 bridge_p, "hist_bridge_prob_vec", config
+            ).astype(fprop_dtype)
+
+    if config.enable_click_dwell_time:
+        cont_actions = batch["history_seq"].get("continuous_actions")
+        if cont_actions is not None and cont_actions.shape[-1] > 2:
+            cd_raw = _cast_jax(cont_actions)[:, :, 2].astype(jnp.float32)
+            cd_clipped = jnp.clip(cd_raw, 0.0, config.click_dwell_time_norm_scale)
+            cd_normalized = jnp.log1p(cd_clipped) / jnp.log1p(config.click_dwell_time_norm_scale)
+            result = result + _embed_scalar_times_vector(
+                cd_normalized, "hist_click_dwell_time_vec", config
             ).astype(fprop_dtype)
 
     return result

@@ -6,26 +6,25 @@ use super::cached_value::{self, CacheLookup};
 use super::lookup::TwemcacheLookup;
 use super::metrics::{self, CacheResult, CacheTier, SourceOutcome};
 use super::types::{FallbackReason, LabelSource, TwemcacheOutcome};
-use crate::twemcache::{Key, TwemcacheClient, TwemcacheError, Value};
 use tonic::async_trait;
+use xai_cache::{CacheClient, KVCacheError, Key, Value};
 
 const KEY_PREFIX: &str = "slm_";
 
+type CacheOpResult<T> = std::result::Result<T, KVCacheError>;
+
 #[async_trait]
-pub(crate) trait CacheRead: Send + Sync {
-    async fn multi_get(
-        &self,
-        keys: &[Key],
-    ) -> HashMap<Key, crate::twemcache::Result<Option<Value>>>;
+pub(crate) trait CacheRead: Send + Sync + 'static {
+    async fn multi_get(&self, keys: &[Key]) -> HashMap<Key, CacheOpResult<Option<Value>>>;
 }
 
 #[async_trait]
-impl CacheRead for TwemcacheClient {
-    async fn multi_get(
-        &self,
-        keys: &[Key],
-    ) -> HashMap<Key, crate::twemcache::Result<Option<Value>>> {
-        TwemcacheClient::multi_get(self, keys).await
+impl CacheRead for CacheClient {
+    async fn multi_get(&self, keys: &[Key]) -> HashMap<Key, CacheOpResult<Option<Value>>> {
+        match CacheClient::multi_get(self, keys).await {
+            Ok(map) => map,
+            Err(e) => keys.iter().cloned().map(|k| (k, Err(e.clone()))).collect(),
+        }
     }
 }
 
@@ -33,11 +32,11 @@ pub(crate) struct TwemcacheSource {
     cache: Arc<dyn CacheRead>,
 }
 
-fn fallback_reason(e: &TwemcacheError) -> FallbackReason {
+fn fallback_reason(e: &KVCacheError) -> FallbackReason {
     match e {
-        TwemcacheError::Timeout => FallbackReason::Timeout,
-        TwemcacheError::Backpressure => FallbackReason::Backpressure,
-        TwemcacheError::Unavailable | TwemcacheError::Io(_) => FallbackReason::Other,
+        KVCacheError::Timeout(_) => FallbackReason::Timeout,
+        KVCacheError::Backpressure => FallbackReason::Backpressure,
+        _ => FallbackReason::Other,
     }
 }
 
@@ -62,7 +61,7 @@ impl ItemCounts {
 }
 
 impl TwemcacheSource {
-    pub(crate) fn new(cache: Arc<TwemcacheClient>) -> Self {
+    pub(crate) fn new(cache: Arc<CacheClient>) -> Self {
         Self { cache }
     }
 
@@ -107,8 +106,8 @@ impl TwemcacheLookup for TwemcacheSource {
         let mut counts = ItemCounts::default();
 
         let map = self.cache.multi_get(&keys).await;
-        for (i, &tweet_id) in ids.iter().enumerate() {
-            let outcome = match map.get(&keys[i]) {
+        for (&tweet_id, key) in ids.iter().zip(&keys) {
+            let outcome = match map.get(key) {
                 Some(Ok(Some(bytes))) => match cached_value::decode(bytes) {
                     CacheLookup::Hit(label_map) => {
                         counts.hit += 1;
@@ -161,7 +160,7 @@ mod tests {
     enum FakeTwemcacheMode {
         Empty,
         MissingResponse,
-        PerKeyError(TwemcacheError),
+        PerKeyError(KVCacheError),
         WithData(Vec<u8>),
     }
 
@@ -182,7 +181,7 @@ mod tests {
             })
         }
 
-        fn with_per_key_error(err: TwemcacheError) -> Arc<Self> {
+        fn with_per_key_error(err: KVCacheError) -> Arc<Self> {
             Arc::new(Self {
                 mode: FakeTwemcacheMode::PerKeyError(err),
             })
@@ -197,10 +196,7 @@ mod tests {
 
     #[async_trait]
     impl CacheRead for FakeTwemcache {
-        async fn multi_get(
-            &self,
-            keys: &[Key],
-        ) -> HashMap<Key, crate::twemcache::Result<Option<Value>>> {
+        async fn multi_get(&self, keys: &[Key]) -> HashMap<Key, CacheOpResult<Option<Value>>> {
             match &self.mode {
                 FakeTwemcacheMode::Empty => keys.iter().map(|k| (k.clone(), Ok(None))).collect(),
                 FakeTwemcacheMode::MissingResponse => HashMap::new(),
@@ -248,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_per_key_error_returns_other_fallback() {
-        let results = get_with_cache(FakeTwemcache::with_per_key_error(TwemcacheError::Io(
+        let results = get_with_cache(FakeTwemcache::with_per_key_error(KVCacheError::Io(
             "conn refused".into(),
         )))
         .await;
@@ -261,8 +257,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_per_key_timeout_returns_timeout_fallback() {
-        let results =
-            get_with_cache(FakeTwemcache::with_per_key_error(TwemcacheError::Timeout)).await;
+        let results = get_with_cache(FakeTwemcache::with_per_key_error(KVCacheError::Timeout(
+            "get".into(),
+        )))
+        .await;
 
         assert!(matches!(
             results.get(&42),

@@ -130,6 +130,7 @@ pub async fn ready_call_parse<'a, T: Body<Data = Bytes, Error = Infallible> + Se
     proto: Vec<(u64, Func<'a>)>,
     body: T,
     channel: &mut Channel,
+    context: &str,
 ) -> Result<(), Status> {
     let fut = async {
         channel.grpc_ready().await?;
@@ -140,8 +141,14 @@ pub async fn ready_call_parse<'a, T: Body<Data = Bytes, Error = Infallible> + Se
     match timeout(*GRPC_CALL_TIMEOUT, fut).await {
         Ok(result) => result,
         Err(_) => Err(Status::deadline_exceeded(format!(
-            "copy_port gRPC call to {} timed out after {:?}",
-            uri, *GRPC_CALL_TIMEOUT
+            "copy_port gRPC call to {} timed out after {:?}{}",
+            uri,
+            *GRPC_CALL_TIMEOUT,
+            if context.is_empty() {
+                String::new()
+            } else {
+                format!(" ({context})")
+            }
         ))),
     }
 }

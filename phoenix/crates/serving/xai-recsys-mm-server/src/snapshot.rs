@@ -505,10 +505,7 @@ pub async fn fetch_recent_embeddings_from_o2(
 
     tokio::spawn(async move {
         let poll_interval = Duration::from_secs(30);
-        log::info!(
-            "O2 watcher task started: polling every {:?} for new embedding files",
-            poll_interval
-        );
+        log::info!("O2 watcher task started: polling every {:?}", poll_interval);
 
         loop {
             tokio::time::sleep(poll_interval).await;
@@ -532,17 +529,42 @@ pub async fn fetch_recent_embeddings_from_o2(
                             snap_time
                         );
 
-                        match read_embeddings_from_o2(&mm_fetcher, &obj.location).await {
-                            Ok(embeddings) => {
-                                let count = embeddings.len();
-                                log::info!("Loaded {} new embeddings from {}", count, path_str);
-                                SNAPSHOT_READ_SUCCESS.inc();
-                                SNAPSHOT_READ_EMBEDDINGS_TOTAL.inc_by(count as u64);
-
-                                mm_client.preload_embeddings(embeddings, false).await;
+                        match mm_fetcher.get_raw(&obj.location).await {
+                            Ok(data) => {
+                                let client = mm_client.clone();
+                                let parse_path = path_str.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    client.ingest_parquet_bytes_sync(data, &parse_path)
+                                })
+                                .await
+                                {
+                                    Ok(Ok(count)) => {
+                                        log::info!(
+                                            "Loaded {} new embeddings from {}",
+                                            count,
+                                            path_str
+                                        );
+                                        SNAPSHOT_READ_SUCCESS.inc();
+                                        SNAPSHOT_READ_EMBEDDINGS_TOTAL.inc_by(count as u64);
+                                    }
+                                    Ok(Err(e)) => {
+                                        log::error!(
+                                            "Failed to parse/insert embeddings from {}: {e:#}",
+                                            path_str
+                                        );
+                                        SNAPSHOT_READ_FAILURE.inc();
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "Blocking ingest panicked for {}: {e:#}",
+                                            path_str
+                                        );
+                                        SNAPSHOT_READ_FAILURE.inc();
+                                    }
+                                }
                             }
                             Err(e) => {
-                                log::error!("Failed to read embeddings from {}: {:#}", path_str, e);
+                                log::error!("Failed to read embeddings from {}: {e:#}", path_str);
                                 SNAPSHOT_READ_FAILURE.inc();
                             }
                         }
@@ -551,7 +573,7 @@ pub async fn fetch_recent_embeddings_from_o2(
                     }
                 }
                 Err(e) => {
-                    log::error!("Failed to list O2 objects: {:#}", e);
+                    log::error!("Failed to list O2 objects: {e:#}");
                 }
             }
 

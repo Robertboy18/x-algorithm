@@ -15,13 +15,12 @@ from grox.flows.ptos.state import (
 from grox.flows.ptos.classifier import (
     SafetyPtosChildSafetyPolicyClassifier,
     SafetyPtosPolicyClassifier,
+    SafetyPtosPolicyCrossValidator,
 )
 from grox.config.config import ModelName
 from grox.flows.ptos.mode import SafetyPtosMode
 from grox.flows.ptos.constants import GEMMA, HIGH_FAV_THRESHOLD
-from strato_http.queries.safety_post_annotations_result import (
-    StratoSafetyPostAnnotationsResultDirectMh,
-)
+from grox.flows.ptos.prior_nsfw import post_is_already_flagged_nsfw
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +29,7 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
     child_safety_classifier = SafetyPtosChildSafetyPolicyClassifier(
         gemma_model_name=GEMMA
     )
+    cross_validator = SafetyPtosPolicyCrossValidator()
 
     classifiers = {
         SafetyPtosMode.STANDARD: SafetyPtosPolicyClassifier(
@@ -64,24 +64,6 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
         ),
     }
 
-    _result_direct_mh = StratoSafetyPostAnnotationsResultDirectMh()
-
-    @classmethod
-    async def _post_is_already_flagged_nsfw(cls, post: Post) -> bool:
-        try:
-            result = await cls._result_direct_mh.fetch(int(post.id))
-        except Exception as e:
-            Metrics.counter(
-                "task.safety_ptos_deluxe_policy.nsfw_lookup_error.count"
-            ).add(1)
-            logger.warning(
-                f"Post {post.id}: NSFW MH lookup failed, treating as not flagged: {e}"
-            )
-            return False
-        return bool(
-            result and result.safetyBoolMetadata and result.safetyBoolMetadata.isNsfw
-        )
-
     @classmethod
     async def _exec_with_post(cls, ctx: TaskContext, post: Post) -> None:
         annotations = ctx.state(SafetyPtosState).annotations
@@ -98,26 +80,10 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
 
         violations = list(annotations.violatedPolicies or [])
 
-        injected_recheck = None
-        if mode.is_deluxe and post.get_fav_count() >= HIGH_FAV_THRESHOLD:
-            if (
-                not any(
-                    v.category == SafetyPolicyCategory.AdultContent for v in violations
-                )
-                and PostRenderer.has_media(post)
-                and not await cls._post_is_already_flagged_nsfw(post)
-            ):
-                injected_recheck = SafetyPtosViolatedPolicy(
-                    category=SafetyPolicyCategory.AdultContent,
-                    reason="high-fav adult content recheck",
-                    score=50,
-                )
-                violations.append(injected_recheck)
-
         for violation in violations:
             if (
                 violation.category == SafetyPolicyCategory.AdultContent
-                and await cls._post_is_already_flagged_nsfw(post)
+                and await post_is_already_flagged_nsfw(ctx, post)
             ):
                 Metrics.counter(
                     f"{metric_prefix}.skipped_adult_content_already_nsfw.count"
@@ -127,8 +93,19 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
                     reason="post was previously flagged nsfw by ptos",
                 )
             elif violation.category == SafetyPolicyCategory.ChildSafety:
-                violation.safetyPolicy = (
-                    await cls.child_safety_classifier.classify_policy(post)
+                policy = await cls.child_safety_classifier.classify_policy(post)
+                violation.safetyPolicy = await cls.cross_validator.validate(
+                    violation.category, post, policy
+                )
+            elif violation.category in (
+                SafetyPolicyCategory.ViolentMedia,
+                SafetyPolicyCategory.IllegalAndRegulatedBehaviors,
+            ):
+                policy = await active_classifier.classify_policy_for_violation(
+                    post, violation
+                )
+                violation.safetyPolicy = await cls.cross_validator.validate(
+                    violation.category, post, policy
                 )
             else:
                 violation.safetyPolicy = (
@@ -139,12 +116,49 @@ class TaskSafetyPtosPolicyDetection(TaskWithPost):
             if violation.safetyPolicy:
                 cls._record_policy_metrics(metric_prefix, violation)
 
-        if injected_recheck is not None:
-            policy = injected_recheck.safetyPolicy
-            if not policy or policy.policyType == SafetyPolicyType.NoViolation:
-                violations.remove(injected_recheck)
+        recheck = await cls._high_fav_adult_recheck(
+            ctx, post, mode, active_classifier, violations, metric_prefix
+        )
+        if recheck is not None:
+            violations.append(recheck)
 
         annotations.violatedPolicies = violations
+
+    @classmethod
+    async def _high_fav_adult_recheck(
+        cls,
+        ctx: TaskContext,
+        post: Post,
+        mode: SafetyPtosMode,
+        active_classifier: SafetyPtosPolicyClassifier,
+        violations: list[SafetyPtosViolatedPolicy],
+        metric_prefix: str,
+    ) -> SafetyPtosViolatedPolicy | None:
+        if not mode.is_deluxe or post.get_fav_count() < HIGH_FAV_THRESHOLD:
+            return None
+        if any(v.category == SafetyPolicyCategory.AdultContent for v in violations):
+            return None
+        if not PostRenderer.has_media(post) or await post_is_already_flagged_nsfw(
+            ctx, post
+        ):
+            return None
+
+        recheck = SafetyPtosViolatedPolicy(
+            category=SafetyPolicyCategory.AdultContent,
+            reason="high-fav adult content recheck",
+            score=50,
+        )
+        policy = await active_classifier.classify_policy_for_violation(post, recheck)
+        if policy is None:
+            return None
+        recheck.safetyPolicy = policy
+        Metrics.counter(f"{metric_prefix}.high_fav_adult_recheck.count").add(
+            1, attributes={"policy_type": policy.policyType.name}
+        )
+        if policy.policyType == SafetyPolicyType.NoViolation:
+            return None
+        cls._record_policy_metrics(metric_prefix, recheck)
+        return recheck
 
     @classmethod
     def _record_policy_metrics(

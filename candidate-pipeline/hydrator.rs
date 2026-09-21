@@ -1,4 +1,4 @@
-use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery};
+use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery, PipelineStage};
 use crate::util;
 use crate::SPAN_LEVEL;
 use std::any::{type_name_of_val, Any};
@@ -19,18 +19,26 @@ where
 
     async fn hydrate(&self, query: &Q, candidates: &[C]) -> Vec<Result<C, String>>;
 
+    async fn hydrate_for_stage(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        _stage: PipelineStage,
+    ) -> Vec<Result<C, String>> {
+        self.hydrate(query, candidates).await
+    }
+
     #[xai_stats_macro::receive_stats(latency=Bucket50To500, size=Bucket500To2500)]
     #[tracing::instrument(level = SPAN_LEVEL, skip_all, name = "hydrator", fields(name = self.name()))]
-    async fn run(&self, query: &Q, candidates: &[C]) -> Vec<Result<C, String>> {
-        let hydrated = self.hydrate(query, candidates).await;
+    async fn run(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        stage: PipelineStage,
+    ) -> Vec<Result<C, String>> {
+        let hydrated = self.hydrate_for_stage(query, candidates, stage).await;
         let expected_len = candidates.len();
         if hydrated.len() == expected_len {
-            #[cfg(feature = "quiet-spans")]
-            tracing::info!(
-                component = self.name(),
-                candidate_count = expected_len,
-                "hydrator"
-            );
             hydrated
         } else {
             let message = format!(
@@ -61,9 +69,6 @@ where
         util::short_type_name(type_name_of_val(self))
     }
 }
-
-const CACHE_HIT_SCOPE: [(&str, &str); 1] = [("requests", "cache_hit")];
-const CACHE_MISS_SCOPE: [(&str, &str); 1] = [("requests", "cache_miss")];
 
 #[async_trait]
 pub trait CacheStore<K, V>: Send + Sync {
@@ -104,14 +109,22 @@ where
         util::short_type_name(type_name_of_val(self))
     }
 
-    fn stat_cache(&self, cache_hits: usize, cache_misses: usize) {
+    fn stat_cache(&self, cache_hits: usize, cache_misses: usize, stage: PipelineStage) {
         if let Some(receiver) = global_stats_receiver() {
             let metric_name = format!("{}.cache", self.name());
             if cache_hits > 0 {
-                receiver.incr(metric_name.as_str(), &CACHE_HIT_SCOPE, cache_hits as u64);
+                receiver.incr(
+                    metric_name.as_str(),
+                    &stage.stat_labels(self.name(), "cache_hit"),
+                    cache_hits as u64,
+                );
             }
             if cache_misses > 0 {
-                receiver.incr(metric_name.as_str(), &CACHE_MISS_SCOPE, cache_misses as u64);
+                receiver.incr(
+                    metric_name.as_str(),
+                    &stage.stat_labels(self.name(), "cache_miss"),
+                    cache_misses as u64,
+                );
             }
         }
     }
@@ -129,6 +142,16 @@ where
     }
 
     async fn hydrate(&self, query: &Q, candidates: &[C]) -> Vec<Result<C, String>> {
+        self.hydrate_for_stage(query, candidates, PipelineStage::Hydrator)
+            .await
+    }
+
+    async fn hydrate_for_stage(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        stage: PipelineStage,
+    ) -> Vec<Result<C, String>> {
         let mut results = vec![None; candidates.len()];
         let mut missing_candidates = Vec::new();
         let mut missing_keys = Vec::new();
@@ -156,7 +179,7 @@ where
             }
         }
 
-        self.stat_cache(cache_hits, cache_misses);
+        self.stat_cache(cache_hits, cache_misses, stage);
 
         if !missing_candidates.is_empty() {
             let hydrated_missing = self.hydrate_from_client(query, &missing_candidates).await;

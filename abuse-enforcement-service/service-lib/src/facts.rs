@@ -139,6 +139,29 @@ impl Facts {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestedActionFacts {
+    pub kind: String,
+    pub perm: bool,
+    pub policy: String,
+    pub labels: Vec<String>,
+    pub ttl_msec: i64,
+    pub head: String,
+}
+
+impl RequestedActionFacts {
+    fn from_proto(a: &xai_abuse_proto::enforcement::RequestedAction) -> Self {
+        Self {
+            kind: a.kind.clone(),
+            perm: a.perm,
+            policy: a.policy.clone(),
+            labels: a.labels.clone(),
+            ttl_msec: a.ttl_msec,
+            head: a.head.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScoreFacts {
     pub model_version: String,
@@ -147,6 +170,10 @@ pub struct ScoreFacts {
     pub labels: Vec<String>,
     #[serde(default)]
     pub skip_author_credibility_prechecks: bool,
+    #[serde(default)]
+    pub requested_actions: Vec<RequestedActionFacts>,
+    #[serde(default)]
+    pub policy_version: String,
 }
 
 impl ScoreFacts {
@@ -170,6 +197,12 @@ impl ScoreFacts {
             decoded_actions: take_string("decoded_actions"),
             labels,
             skip_author_credibility_prechecks: score.skip_author_credibility_prechecks,
+            requested_actions: score
+                .requested_actions
+                .iter()
+                .map(RequestedActionFacts::from_proto)
+                .collect(),
+            policy_version: score.policy_version.clone(),
         }
     }
 }
@@ -495,6 +528,73 @@ mod tests {
         assert_eq!(f.labels, vec!["RTBot".to_owned(), "content_spammer".into()]);
         assert_eq!(f.model_version, "v_test");
         assert_eq!(f.enforcement_note, "test note");
+    }
+
+    #[test]
+    fn score_facts_projects_requested_actions_and_policy_version() {
+        use xai_abuse_proto::enforcement::RequestedAction;
+        let s = ScoreResult {
+            requested_actions: vec![
+                RequestedAction {
+                    kind: "suspend".into(),
+                    perm: true,
+                    policy: "PlatformManipulation".into(),
+                    labels: vec![],
+                    ttl_msec: 0,
+                    head: "IsSpammer".into(),
+                },
+                RequestedAction {
+                    kind: "label".into(),
+                    perm: false,
+                    policy: String::new(),
+                    labels: vec!["SpamHighRecall".into()],
+                    ttl_msec: 86_400_000,
+                    head: "IsLabelHead".into(),
+                },
+            ],
+            policy_version: "7".into(),
+            ..Default::default()
+        };
+        let f = ScoreFacts::from_score(&s);
+        assert_eq!(f.policy_version, "7");
+        assert_eq!(f.requested_actions.len(), 2);
+        assert_eq!(
+            f.requested_actions[0],
+            RequestedActionFacts {
+                kind: "suspend".into(),
+                perm: true,
+                policy: "PlatformManipulation".into(),
+                labels: vec![],
+                ttl_msec: 0,
+                head: "IsSpammer".into(),
+            }
+        );
+        assert_eq!(f.requested_actions[1].kind, "label");
+        assert_eq!(
+            f.requested_actions[1].labels,
+            vec!["SpamHighRecall".to_owned()]
+        );
+        assert_eq!(f.requested_actions[1].ttl_msec, 86_400_000);
+    }
+
+    #[test]
+    fn score_facts_without_requested_actions_projects_empty() {
+        let f = ScoreFacts::from_score(&ScoreResult::default());
+        assert!(f.requested_actions.is_empty());
+        assert_eq!(f.policy_version, "");
+    }
+
+    #[test]
+    fn score_facts_pre_requested_actions_json_still_deserializes() {
+        let legacy = r#"{
+            "model_version": "v1",
+            "enforcement_note": "",
+            "decoded_actions": "[]",
+            "labels": []
+        }"#;
+        let f: ScoreFacts = serde_json::from_str(legacy).expect("legacy ScoreFacts must parse");
+        assert!(f.requested_actions.is_empty());
+        assert_eq!(f.policy_version, "");
     }
 
     #[test]

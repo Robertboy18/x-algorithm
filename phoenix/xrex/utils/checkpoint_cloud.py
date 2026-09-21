@@ -7,7 +7,7 @@ import os
 
 logger = logging.getLogger(__name__)
 
-_ORBAX_TMP_PREFIX = ".orbax-checkpoint-tmp-"
+ORBAX_TMP_DIR_SUFFIX = ".orbax-checkpoint-tmp-"
 
 
 def ensure_orbax_dir_finalized(local_ckpt_dir: str, tag: str) -> None:
@@ -15,7 +15,7 @@ def ensure_orbax_dir_finalized(local_ckpt_dir: str, tag: str) -> None:
     if os.path.isdir(orbax_dir):
         return
     for entry in os.listdir(local_ckpt_dir):
-        if entry.startswith(f"{tag}{_ORBAX_TMP_PREFIX}"):
+        if entry.startswith(f"{tag}{ORBAX_TMP_DIR_SUFFIX}"):
             tmp_dir = os.path.join(local_ckpt_dir, entry)
             try:
                 os.rename(tmp_dir, orbax_dir)

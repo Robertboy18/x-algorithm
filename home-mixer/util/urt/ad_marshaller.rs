@@ -1,36 +1,62 @@
 use super::client_event::ad_client_event_info;
+use crate::models::query::RequestType;
 
 const ENTRY_NAMESPACE_PROMOTED_TWEET: &str = "promoted-tweet";
 use super::post_marshaller::{make_tweet, make_tweet_item};
-use std::collections::BTreeMap;
-use xai_recsys_proto::AdIndexInfo;
+use std::collections::{BTreeMap, BTreeSet};
+use xai_recsys_proto::{AdIndexInfo, HeaderImagePromptAdInfo};
 use xai_urt_thrift::ad::RtbImageAd;
 use xai_urt_thrift::api_media::{ApiMediaKey, TweetImageKey};
 use xai_urt_thrift::contextual_refs::{ContextualTweetRef, SafetyLevel, TweetHydrationContext};
 use xai_urt_thrift::entry::{TimelineEntry, TimelineEntryContent};
 use xai_urt_thrift::item::{TimelineItem, TimelineItemContent};
-use xai_urt_thrift::metadata::{ImageVariant, Url, UrlType};
+use xai_urt_thrift::message::{
+    HeaderImagePrompt, MessageAction, MessageContent, MessageImage, MessagePrompt,
+    MessageTextAction,
+};
+use xai_urt_thrift::metadata::{Callback, ClientEventInfo, ImageVariant, Url, UrlType};
 use xai_urt_thrift::promoted::{
     AdMetadataContainer, BoostCta, BoostCtaActionText, CallToAction, ClickTrackingInfo, DspId,
     DynamicPrerollType, MediaInfo, Preroll, PrerollMetadata, PromotedMetadata, RTBAdMetadata,
     SkAdNetworkData, UrlOverrideType, VideoVariant,
 };
+use xai_urt_thrift::richtext::RichText;
 
 const CLIENT_TWEET_OPEN_LINK: usize = 39;
 const LIKELY_TO_OPEN_LINK_THRESHOLD: f64 = 0.1;
 
 const ENTRY_NAMESPACE_RTB_IMAGE_AD: &str = "rtb-image-ad";
+const ENTRY_NAMESPACE_HEADER_IMAGE_PROMPT_AD: &str = "header-image-prompt-ad";
 const GOOGLE_SDK_NATIVE_AD: &str = "GoogleSDKNativeAd";
 const EMPTY_LANDING_URL: &str = "emptyLandingUrl";
 const DSP_IMPRESSION_PREAMBLE: &str = "IS1:";
 const DEFAULT_DSP_CREATIVE_ID: &str = "default-dsp-creative-id";
 
-pub(super) fn marshal_ad(ad: &AdIndexInfo, sort_index: i64) -> TimelineEntry {
+pub(super) fn marshal_ad(
+    ad: &AdIndexInfo,
+    sort_index: i64,
+    request_type: RequestType,
+) -> TimelineEntry {
     let impression_string = format!("{:x}", ad.impression_id);
+
+    if let Some(info) = &ad.header_image_prompt_ad_info {
+        return marshal_header_image_prompt_ad(
+            ad,
+            info,
+            sort_index,
+            request_type,
+            &impression_string,
+        );
+    }
 
     if ad.post_id == 0 && ad.rtb_ad_metadata.is_some() {
         return marshal_ssp_ad(ad, sort_index, &impression_string);
     }
+
+    let entry_id = format!(
+        "{}-{}-{}",
+        ENTRY_NAMESPACE_PROMOTED_TWEET, ad.post_id, impression_string
+    );
 
     let url_params: BTreeMap<String, String> = ad
         .url_params
@@ -183,15 +209,120 @@ pub(super) fn marshal_ad(ad: &AdIndexInfo, sort_index: i64) -> TimelineEntry {
     tweet.contextual_tweet_ref = Some(contextual_ref(ad.post_id));
 
     TimelineEntry {
-        entry_id: format!("{}-{}", ENTRY_NAMESPACE_PROMOTED_TWEET, ad.post_id),
+        entry_id,
         sort_index,
         content: TimelineEntryContent::Item(make_tweet_item(
             tweet,
-            Some(ad_client_event_info(ad)),
+            Some(ad_client_event_info(ad, request_type)),
             None,
         )),
         expiry_time: None,
     }
+}
+
+fn marshal_header_image_prompt_ad(
+    ad: &AdIndexInfo,
+    info: &HeaderImagePromptAdInfo,
+    sort_index: i64,
+    request_type: RequestType,
+    impression_string: &str,
+) -> TimelineEntry {
+    let header_image = MessageImage {
+        image_variants: BTreeSet::from([ImageVariant {
+            url: info.image_url.clone(),
+            width: info.image_width,
+            height: info.image_height,
+            palette: None,
+        }]),
+        background_color: None,
+    };
+
+    let plain_rich_text = |text: &str| RichText {
+        text: text.to_string(),
+        entities: vec![],
+        rtl: None,
+        alignment: None,
+    };
+
+    let button_action =
+        |text: &str, url: &str, cta_action: &str, callbacks: &[String]| MessageTextAction {
+            text: text.to_string(),
+            action: MessageAction {
+                dismiss_on_click: info.dismiss_on_click,
+                url: Some(url.to_string()),
+                client_event_info: Some(ClientEventInfo {
+                    component: None,
+                    element: None,
+                    details: None,
+                    action: Some(cta_action.to_string()),
+                    entity_token: None,
+                }),
+                on_click_callbacks: to_callbacks(callbacks),
+                on_click_reactive_trigger: None,
+            },
+        };
+
+    let primary_button_action = button_action(
+        &info.button_text,
+        &info.landing_url,
+        "primary_cta",
+        &info.click_callback_endpoints,
+    );
+    let secondary_button_action = (!info.secondary_button_text.is_empty()).then(|| {
+        button_action(
+            &info.secondary_button_text,
+            &info.secondary_landing_url,
+            "secondary_cta",
+            &[],
+        )
+    });
+
+    let body_text = (!info.body_text.is_empty()).then(|| info.body_text.clone());
+    let content = MessageContent::HeaderImagePrompt(HeaderImagePrompt {
+        header_image,
+        header_text: Some(info.header_text.clone()),
+        body_text: body_text.clone(),
+        primary_button_action: Some(primary_button_action),
+        secondary_button_action,
+        action: None,
+        header_rich_text: Some(plain_rich_text(&info.header_text)),
+        body_rich_text: body_text.as_deref().map(plain_rich_text),
+    });
+
+    let message_prompt = MessagePrompt {
+        content,
+        impression_callbacks: to_callbacks(&info.impression_callback_endpoints),
+    };
+
+    let mut client_event_info = ad_client_event_info(ad, request_type);
+    client_event_info.element = None;
+
+    TimelineEntry {
+        entry_id: format!("{ENTRY_NAMESPACE_HEADER_IMAGE_PROMPT_AD}-{impression_string}"),
+        sort_index,
+        content: TimelineEntryContent::Item(TimelineItem {
+            content: TimelineItemContent::Message(message_prompt),
+            client_event_info: Some(client_event_info),
+            feedback_info: None,
+            prompt: None,
+            reactive_triggers: None,
+        }),
+        expiry_time: None,
+    }
+}
+
+fn to_callbacks(endpoints: &[String]) -> Option<Vec<Callback>> {
+    if endpoints.is_empty() {
+        return None;
+    }
+    Some(
+        endpoints
+            .iter()
+            .map(|e| Callback {
+                endpoint: e.clone(),
+            })
+            .collect(),
+    )
 }
 
 fn rtb_ad_metadata(ad: &AdIndexInfo) -> Option<Box<RTBAdMetadata>> {
@@ -305,7 +436,7 @@ mod tests {
     use xai_urt_thrift::item::TimelineItemContent;
 
     fn promoted_metadata_for(ad: AdIndexInfo) -> PromotedMetadata {
-        let entry = marshal_ad(&ad, 0);
+        let entry = marshal_ad(&ad, 0, RequestType::ForYou);
         let item = match entry.content {
             TimelineEntryContent::Item(item) => item,
             _ => panic!("expected an item entry"),
@@ -315,6 +446,140 @@ mod tests {
             _ => panic!("expected a tweet item"),
         };
         tweet.promoted_metadata.expect("promoted_metadata present")
+    }
+
+    #[test]
+    fn header_image_prompt_ad_marshals_to_message_prompt_entry() {
+        let ad = AdIndexInfo {
+            impression_id: 0xfa4ead01,
+            header_image_prompt_ad_info: Some(HeaderImagePromptAdInfo {
+                image_url: "https://example.com/ad.jpg".to_string(),
+                image_width: 1199,
+                image_height: 571,
+                header_text: "Header".to_string(),
+                body_text: "Body".to_string(),
+                button_text: "Shop now".to_string(),
+                landing_url: "https://example.com/land".to_string(),
+                dismiss_on_click: true,
+                impression_callback_endpoints: vec!["https://example.com/imp".to_string()],
+                click_callback_endpoints: vec!["https://example.com/click".to_string()],
+                secondary_button_text: String::new(),
+                secondary_landing_url: String::new(),
+            }),
+            rtb_ad_metadata: Some(PbRtbAdMetadata {
+                dsp_id: 0,
+                response_content: "x".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let entry = marshal_ad(&ad, 5, RequestType::ForYou);
+        assert_eq!(entry.entry_id, "header-image-prompt-ad-fa4ead01");
+        assert_eq!(entry.sort_index, 5);
+
+        let item = match entry.content {
+            TimelineEntryContent::Item(item) => item,
+            _ => panic!("expected an item entry"),
+        };
+        assert!(item.client_event_info.is_some());
+        assert!(item.client_event_info.as_ref().unwrap().element.is_none());
+
+        let prompt = match item.content {
+            TimelineItemContent::Message(m) => m,
+            other => panic!("expected a message prompt item, got {other:?}"),
+        };
+        assert_eq!(
+            prompt.impression_callbacks.as_ref().unwrap()[0].endpoint,
+            "https://example.com/imp"
+        );
+
+        let header = match prompt.content {
+            MessageContent::HeaderImagePrompt(h) => h,
+            other => panic!("expected header image prompt content, got {other:?}"),
+        };
+        let variant = header.header_image.image_variants.first().unwrap();
+        assert_eq!(variant.url, "https://example.com/ad.jpg");
+        assert_eq!((variant.width, variant.height), (1199, 571));
+        assert_eq!(header.header_text.as_deref(), Some("Header"));
+        assert_eq!(header.body_text.as_deref(), Some("Body"));
+
+        let cta = header.primary_button_action.unwrap();
+        assert_eq!(cta.text, "Shop now");
+        assert_eq!(cta.action.url.as_deref(), Some("https://example.com/land"));
+        assert_eq!(
+            cta.action
+                .client_event_info
+                .as_ref()
+                .and_then(|c| c.action.as_deref()),
+            Some("primary_cta")
+        );
+        assert!(header.secondary_button_action.is_none());
+        assert!(cta.action.dismiss_on_click);
+        assert_eq!(
+            cta.action.on_click_callbacks.unwrap()[0].endpoint,
+            "https://example.com/click"
+        );
+    }
+
+    #[test]
+    fn header_image_prompt_ad_emits_secondary_button_when_set() {
+        let ad = AdIndexInfo {
+            impression_id: 0xfa4ead01,
+            header_image_prompt_ad_info: Some(HeaderImagePromptAdInfo {
+                image_url: "https://example.com/ad.jpg".to_string(),
+                image_width: 1199,
+                image_height: 571,
+                header_text: "Header".to_string(),
+                body_text: "Body".to_string(),
+                button_text: "Shop now".to_string(),
+                landing_url: "https://example.com/land".to_string(),
+                dismiss_on_click: true,
+                impression_callback_endpoints: vec![],
+                click_callback_endpoints: vec![],
+                secondary_button_text: "Learn more".to_string(),
+                secondary_landing_url: "https://example.com".to_string(),
+            }),
+            ..Default::default()
+        };
+
+        let entry = marshal_ad(&ad, 0, RequestType::ForYou);
+        let TimelineEntryContent::Item(item) = entry.content else {
+            panic!("expected an item entry");
+        };
+        let TimelineItemContent::Message(prompt) = item.content else {
+            panic!("expected a message prompt item");
+        };
+        let MessageContent::HeaderImagePrompt(header) = prompt.content else {
+            panic!("expected header image prompt content");
+        };
+
+        let secondary = header.secondary_button_action.unwrap();
+        assert_eq!(secondary.text, "Learn more");
+        assert_eq!(secondary.action.url.as_deref(), Some("https://example.com"));
+        assert_eq!(
+            secondary
+                .action
+                .client_event_info
+                .as_ref()
+                .and_then(|c| c.action.as_deref()),
+            Some("secondary_cta")
+        );
+    }
+
+    #[test]
+    fn header_image_prompt_ad_info_absent_stays_a_tweet_item() {
+        let ad = AdIndexInfo {
+            post_id: 42,
+            impression_id: 0xabc,
+            ..Default::default()
+        };
+        let entry = marshal_ad(&ad, 0, RequestType::ForYou);
+        assert_eq!(entry.entry_id, "promoted-tweet-42-abc");
+        let item = match entry.content {
+            TimelineEntryContent::Item(item) => item,
+            _ => panic!("expected an item entry"),
+        };
+        assert!(matches!(item.content, TimelineItemContent::Tweet(_)));
     }
 
     #[test]
@@ -391,7 +656,7 @@ mod tests {
 
     #[test]
     fn ssp_ad_emits_rtb_image_ad_item() {
-        let entry = marshal_ad(&ssp_ad(), 7);
+        let entry = marshal_ad(&ssp_ad(), 7, RequestType::ForYou);
 
         assert_eq!(entry.entry_id, "rtb-image-ad-abc123");
         assert_eq!(entry.sort_index, 7);
@@ -440,8 +705,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let entry = marshal_ad(&ad, 0);
-        assert_eq!(entry.entry_id, "promoted-tweet-42");
+        let entry = marshal_ad(&ad, 0, RequestType::ForYou);
+        assert_eq!(entry.entry_id, "promoted-tweet-42-0");
         let item = match entry.content {
             TimelineEntryContent::Item(item) => item,
             _ => panic!("expected an item entry"),
@@ -455,7 +720,7 @@ mod tests {
             post_id: 0,
             ..Default::default()
         };
-        let entry = marshal_ad(&ad, 0);
+        let entry = marshal_ad(&ad, 0, RequestType::ForYou);
         let item = match entry.content {
             TimelineEntryContent::Item(item) => item,
             _ => panic!("expected an item entry"),

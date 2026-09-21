@@ -278,3 +278,95 @@ async fn pipeline_shutdown_flushes_data() {
     let batches = read_parquet_file(&symlink).unwrap();
     assert_eq!(batches[0].num_rows(), 1);
 }
+
+#[tokio::test]
+async fn bounded_window_young_records_survive_restart() {
+    let dir = TempDir::new().unwrap();
+    let now = chrono::Utc::now().timestamp() as f64;
+    let young_id = timestamp_secs_to_snowflake(now - 3600.0);
+    let recent_id = timestamp_secs_to_snowflake(now - 2.0 * 86400.0 - 1800.0);
+    let mature_id = timestamp_secs_to_snowflake(now - 3.0 * 86400.0);
+    let expired_id = timestamp_secs_to_snowflake(now - 5.0 * 86400.0);
+
+    let windows = vec![xai_recsys_rankall::config::WindowConfig::bounded(
+        "1fav_video",
+        24 * 2,
+        24 * 4,
+    )];
+    let store_config = || StoreConfig {
+        output_dir: dir.path().to_path_buf(),
+        windows: windows.clone(),
+        compaction_interval_secs: 999,
+        versions_to_keep: 3,
+        pipeline: "main".to_string(),
+        sid_num_levels: 6,
+    };
+    let run = |msgs: Vec<Vec<Vec<u8>>>| {
+        let store = BaseSnapshotStore::new(
+            store_config(),
+            prefix_window_router(),
+            Arc::new(PipelineMetrics::new(prometheus::Registry::new()).unwrap()),
+        );
+        Pipeline::new(
+            Box::new(MockConsumer::new(msgs)),
+            Box::new(MainProcessor::new()),
+            Box::new(store),
+            PipelineMetrics::new(prometheus::Registry::new()).unwrap(),
+        )
+        .run(CancellationToken::new())
+    };
+    let read_ids = |path: &std::path::Path| -> Vec<i64> {
+        read_parquet_file(path)
+            .unwrap()
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    };
+
+    run(vec![vec![
+        make_core_thrift(young_id, 10, "1fav_video"),
+        make_core_thrift(recent_id, 15, "1fav_video"),
+        make_core_thrift(mature_id, 20, "1fav_video"),
+        make_core_thrift(expired_id, 30, "1fav_video"),
+    ]])
+    .await
+    .unwrap();
+
+    let public = dir.path().join("1fav_video_2to4day.parquet");
+    let sidecar = dir.path().join("prefloor_1fav_video_2to4day.parquet");
+    assert_eq!(
+        read_ids(&public),
+        vec![mature_id, recent_id],
+        "public: matured records only, expired dropped"
+    );
+    assert_eq!(
+        read_ids(&sidecar),
+        vec![recent_id, young_id],
+        "sidecar: young plus slack-band overlap of recently matured"
+    );
+
+    run(vec![]).await.unwrap();
+    assert_eq!(read_ids(&sidecar), vec![recent_id, young_id]);
+
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.starts_with("1fav_video_2to4day") {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+    run(vec![]).await.unwrap();
+    assert_eq!(
+        read_ids(&public),
+        vec![recent_id],
+        "public regenerated from sidecar-recovered memory"
+    );
+    assert_eq!(read_ids(&sidecar), vec![recent_id, young_id]);
+}

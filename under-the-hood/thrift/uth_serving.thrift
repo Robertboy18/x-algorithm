@@ -53,11 +53,13 @@ enum UthFollowerClass {
 struct UthPostLabelAggregate {
   1: optional string label (personalDataType = 'TweetSafetyLabels')
   2: optional list<UthDayCarriedRemoved> days
+  3: optional list<string> countryCodes
 }(persisted = 'true', hasPersonalData = 'true')
 
 struct UthAccountLabelAggregate {
   1: optional string label (personalDataType = 'UserSafetyLabels')
   2: optional list<i32> activeDays
+  3: optional list<string> countryCodes
 }(persisted = 'true', hasPersonalData = 'true')
 
 // Brand safety is experimental-only / unused now

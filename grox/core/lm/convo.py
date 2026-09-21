@@ -20,6 +20,16 @@ STORYBOARD_COLUMNS = 3
 STORYBOARD_TILE_SIZE = 448
 NO_THINKING_PROMPT = grox_config.prompt_tokens.no_thinking_prompt
 
+PREVIEW_IMAGE_LABEL = "[Video Preview Thumbnail]"
+
+MOTION_REVEAL_DESCRIPTION = (
+    "Motion-reveal stills for this video follow. They expose content that may be hidden under the visible video "
+    "as a faint overlay, by subtracting the static layer and amplifying the moving one, so colors and textures are "
+    "distorted. Judge what they show as part of the video's actual content, as if it were shown openly, even when "
+    "it is low-resolution, blurred, or partially obscured. The visible video may be a decoy: when the revealed "
+    "content is more severe than the visible video, classify the post by the revealed content."
+)
+
 
 class Role(str, Enum):
     USER = "User"
@@ -50,12 +60,23 @@ class Video(BaseModel):
     duration: float
     total_duration: float
     is_deluxe_target: bool = False
+    motion_reveal_frames: list[bytes] = Field(default_factory=lambda: [])
+    preview_image: bytes | None = None
 
-    @field_serializer("frames", when_used="json")
+    @field_serializer("frames", "motion_reveal_frames", when_used="json")
     def serialize_frames(self, value: list[bytes]) -> list[str]:
         return [b64encode(frame).decode("utf-8") for frame in value]
 
-    @field_validator("frames", mode="before")
+    @field_serializer("preview_image", when_used="json")
+    def serialize_preview_image(self, value: bytes | None) -> str | None:
+        return b64encode(value).decode("utf-8") if value is not None else None
+
+    @field_validator("preview_image", mode="before")
+    @classmethod
+    def decode_preview_image(cls, value: str | bytes | None) -> bytes | None:
+        return b64decode(value) if isinstance(value, str) else value
+
+    @field_validator("frames", "motion_reveal_frames", mode="before")
     @classmethod
     def decode_frames(cls, value: list[str] | list[bytes]) -> list[bytes]:
         is_list_str = len(value) > 0 and isinstance(value[0], str)
@@ -109,6 +130,9 @@ class Video(BaseModel):
     ) -> list[str | bytes]:
         res: list[str | bytes] = []
 
+        if self.preview_image:
+            res.extend([f"{PREVIEW_IMAGE_LABEL} ", self.preview_image, "\n"])
+
         res.append(
             f"The video has a duration of {self.total_duration:.2f} seconds. "
             "Below is a storyboard with composite panels of frames (which are sorted left to right, top to bottom) "
@@ -154,6 +178,11 @@ class Video(BaseModel):
                     res.append(f" Subtitles: {'; '.join(subtitle_texts)}")
 
             res.append("\n")
+
+        if self.motion_reveal_frames:
+            res.append(f"{MOTION_REVEAL_DESCRIPTION}\n")
+            for idx, reveal_bytes in enumerate(self.motion_reveal_frames):
+                res.extend([" ", reveal_bytes, f" Motion-reveal still {idx + 1}\n"])
 
         return res
 
@@ -352,6 +381,9 @@ class Conversation(BaseModel):
                 elif isinstance(c, Image):
                     parts.append(_image_part(c.content))
                 elif isinstance(c, Video):
+                    if c.preview_image:
+                        parts.append({"type": "text", "text": PREVIEW_IMAGE_LABEL})
+                        parts.append(_image_part(c.preview_image))
                     desc = f"The video lasts for {c.total_duration:.2f} seconds. The following {len(c.frames)} frames are sampled at equal intervals."
                     parts.append({"type": "text", "text": desc})
                     bucket_times = [i * c.duration for i in range(len(c.frames))]
@@ -371,6 +403,18 @@ class Conversation(BaseModel):
                             }
                         )
                         parts.append(_image_part(frame))
+                    if c.motion_reveal_frames:
+                        parts.append(
+                            {"type": "text", "text": MOTION_REVEAL_DESCRIPTION}
+                        )
+                        for idx, reveal in enumerate(c.motion_reveal_frames):
+                            parts.append(
+                                {
+                                    "type": "text",
+                                    "text": f"Motion-reveal still {idx + 1}",
+                                }
+                            )
+                            parts.append(_image_part(reveal))
 
             if not parts:
                 continue

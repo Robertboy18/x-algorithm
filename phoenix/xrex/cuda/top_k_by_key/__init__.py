@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
+import logging
+
 import jax
 import jax.numpy as jnp
 
-
-def gather_selected_validity(eligibility: jax.Array, selected_indices: jax.Array) -> jax.Array:
-    return jnp.take_along_axis(eligibility, selected_indices, axis=1)
-
+_log = logging.getLogger(__name__)
 
 try:
-    from xrex.cuda.top_k_by_key.src import top_k_by_key_api
-except ImportError:
+    import xrex_cuda_kernels.top_k_by_key_api as top_k_by_key_api
+except ModuleNotFoundError:
     top_k_by_key_api = None
 else:
     jax.ffi.register_ffi_target(
@@ -18,8 +17,8 @@ else:
     )
 
 try:
-    from xrex.cuda.top_k_by_key.src import top_k_by_key_async_api
-except ImportError:
+    import xrex_cuda_kernels.top_k_by_key_async_api as top_k_by_key_async_api
+except ModuleNotFoundError:
     top_k_by_key_async_api = None
 else:
     jax.ffi.register_ffi_target(
@@ -29,8 +28,8 @@ else:
     )
 
 try:
-    from xrex.cuda.top_k_by_key.src import top_k_by_key_radix_select_api
-except ImportError:
+    import xrex_cuda_kernels.top_k_by_key_radix_select_api as top_k_by_key_radix_select_api
+except ModuleNotFoundError:
     top_k_by_key_radix_select_api = None
 else:
     jax.ffi.register_ffi_target(
@@ -38,6 +37,26 @@ else:
         fn=top_k_by_key_radix_select_api.top_k_by_key_radix_select(),
         platform="CUDA",
     )
+
+_MISSING = [
+    name
+    for name, api in (
+        ("top_k_by_key_api", top_k_by_key_api),
+        ("top_k_by_key_async_api", top_k_by_key_async_api),
+        ("top_k_by_key_radix_select_api", top_k_by_key_radix_select_api),
+    )
+    if api is None
+]
+if _MISSING:
+    _log.warning(
+        "xrex.cuda.top_k_by_key: xrex_cuda_kernels.%s not installed; the jax.lax.top_k "
+        "reference path runs instead of the compiled kernel(s)",
+        ", ".join(_MISSING),
+    )
+
+
+def gather_selected_validity(eligibility: jax.Array, selected_indices: jax.Array) -> jax.Array:
+    return jnp.take_along_axis(eligibility, selected_indices, axis=1)
 
 
 def top_k_by_key(

@@ -49,6 +49,14 @@ lazy_static! {
         &["value_model_id"]
     )
     .unwrap();
+    pub static ref DPP_SEED_CONTEXT: CounterVec = register_counter_vec!(
+        Opts::new(
+            "vm_ranker_dpp_seed_context_total",
+            "Rank requests with a seed_tweet_id, by whether the seed embedding was found"
+        ),
+        &["result"]
+    )
+    .unwrap();
     pub static ref DPP_RESCALING: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_rescaling",

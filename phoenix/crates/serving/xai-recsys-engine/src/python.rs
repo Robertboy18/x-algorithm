@@ -448,15 +448,18 @@ impl PredictRequestBatch {
                                 dist_entry.candidate = Some(candidate.clone());
                             }
 
-                            if item.return_log_map {
+                            if item.return_logits_list {
+                                dist_entry.requested_action_logits = item
+                                    .requested_action_indices
+                                    .iter()
+                                    .map(|&idx| {
+                                        dist.get(idx as usize).copied().unwrap_or(f32::NEG_INFINITY)
+                                    })
+                                    .collect();
+                            } else if item.return_log_map {
                                 for idx in item.requested_action_indices.iter() {
                                     if let Some(v) = dist.get(*idx as usize) {
                                         dist_entry.index_to_logits.insert(*idx, *v);
-                                    }
-                                }
-                                for idx in item.requested_continuous_action_indices.iter() {
-                                    if let Some(v) = cont_pred.get(*idx as usize) {
-                                        dist_entry.index_to_continuous_values.insert(*idx, *v);
                                     }
                                 }
                             } else if item.return_logprob {
@@ -465,6 +468,13 @@ impl PredictRequestBatch {
                             } else {
                                 dist_entry.logits = dist.to_vec();
                                 dist_entry.continuous_actions_values = cont_pred.to_vec();
+                            }
+                            if item.return_logits_list || item.return_log_map {
+                                for idx in item.requested_continuous_action_indices.iter() {
+                                    if let Some(v) = cont_pred.get(*idx as usize) {
+                                        dist_entry.index_to_continuous_values.insert(*idx, *v);
+                                    }
+                                }
                             }
 
                             dist_entry
@@ -954,8 +964,6 @@ struct RecsysPredictorImpl {
     reload_directive: Arc<StdMutex<Option<ReloadDirective>>>,
     enqueue_timeout_ms: u64,
     mm_embeddings_client: Option<MmEmbeddingsClient>,
-    #[allow(dead_code)]
-    sid_client: Option<Arc<crate::sid_client::SemanticIdClient>>,
     admission: Arc<AdmissionController>,
     #[allow(dead_code)]
     prefetch_mm_query_config: Option<Arc<PrefetchMmQueryConfig>>,
@@ -1110,6 +1118,7 @@ impl RecsysPredictorImpl {
             request.return_logprob,
             request.top_logprobs_num,
             request.return_log_map,
+            request.return_logits_list,
             request.requested_action_indices,
             request.requested_continuous_action_indices,
             request.return_candidate_tweet_id_only,
@@ -1230,36 +1239,6 @@ impl pb::recsys_predictor_server::RecsysPredictor for RecsysPredictorImpl {
     }
 }
 
-fn fill_semantic_ids(
-    sids: &std::collections::HashMap<i64, Vec<i32>>,
-    post_ids: &[i64],
-    dst: &mut [u16],
-    sid_dim: usize,
-) {
-    for (j, &post_id) in post_ids.iter().enumerate() {
-        if post_id == 0 {
-            continue;
-        }
-        if let Some(codes) = sids.get(&post_id) {
-            assert_eq!(
-                codes.len(),
-                sid_dim,
-                "SID codes length ({}) != sid_num_levels ({}) for post_id {}",
-                codes.len(),
-                sid_dim,
-                post_id,
-            );
-            let dst_start = j * sid_dim;
-            for (d, &c) in dst[dst_start..dst_start + sid_dim]
-                .iter_mut()
-                .zip(codes.iter())
-            {
-                *d = (c + 1) as u16;
-            }
-        }
-    }
-}
-
 async fn handle_request(
     candidate_set: CandidateSet,
     sequence: Option<UserActionSequence>,
@@ -1267,6 +1246,7 @@ async fn handle_request(
     return_logprob: bool,
     top_logprobs_num: u32,
     return_log_map: bool,
+    return_logits_list: bool,
     requested_action_indices: Vec<u32>,
     requested_continuous_action_indices: Vec<u32>,
     return_candidate_tweet_id_only: bool,
@@ -1393,6 +1373,7 @@ async fn handle_request(
         return_logprob,
         top_logprobs_num,
         return_log_map,
+        return_logits_list,
         requested_action_indices,
         requested_continuous_action_indices,
         return_candidate_tweet_id_only,
@@ -1966,7 +1947,7 @@ impl PrepareBatch<PredictRequestBatch> for RankingBatchPrep {
         let output_vocab_size = model_config.hash_table.output_vocab_size;
         let num_continuous_actions = model_config.hash_table.num_continuous_actions;
         let embedding_dim = model_config.multimodal_embedding_dim;
-        let search_query_embedding_dim = model_config.hash_table.search_query_embedding_dim;
+        let search_query_embedding_dim = model_config.search_query_embedding_dim;
         let sid_num_levels = model_config.sid_num_levels;
 
         py.detach(|| {
@@ -2113,6 +2094,7 @@ impl PrepareBatch<PredictRequestBatch> for RankingBatchPrep {
                     .par_chunks(chunk_size)
                     .zip(candidate_embeddings_slices.par_iter_mut())
                     .for_each(|(items_chunk, shard_slice)| {
+                        shard_slice.fill(f16::ZERO);
                         shard_slice
                             .par_chunks_exact_mut(row_size)
                             .zip(items_chunk.par_iter())
@@ -2120,7 +2102,10 @@ impl PrepareBatch<PredictRequestBatch> for RankingBatchPrep {
                                 if let Some(ref input_buffer) = item.input_buffer {
                                     let src = &input_buffer.candidate_embeddings;
                                     let copy_len = embedding_row.len().min(src.len());
-                                    embedding_row[..copy_len].copy_from_slice(&src[..copy_len]);
+                                    if copy_len > 0 {
+                                        embedding_row[..copy_len]
+                                            .copy_from_slice(&src[..copy_len]);
+                                    }
                                 }
                             });
                     });
@@ -2129,14 +2114,23 @@ impl PrepareBatch<PredictRequestBatch> for RankingBatchPrep {
             if search_query_embedding_dim > 0
                 && let Some(sq_slice) = candidate_search_query_embeddings_slice
             {
+                sq_slice.fill(0.0);
                 sq_slice
                     .par_chunks_exact_mut(candidate_seq_len * search_query_embedding_dim)
                     .take(length_of_input)
                     .zip(request.items.par_iter())
                     .for_each(|(search_query_emb_row, item)| {
                         if let Some(ref input_buffer) = item.input_buffer {
-                            search_query_emb_row
-                                .copy_from_slice(&input_buffer.candidate_search_query_embeddings);
+                            let src = &input_buffer.candidate_search_query_embeddings;
+                            if src.len() == search_query_embedding_dim {
+                                let n_rep = input_buffer
+                                    .num_real_candidates(num_item_hashes, candidate_seq_len);
+                                xai_recsys::util::repeat_query_into(
+                                    search_query_emb_row,
+                                    src,
+                                    n_rep,
+                                );
+                            }
                         }
                     });
             }
@@ -2810,7 +2804,6 @@ struct RecsysRetrievalPredictorImpl {
     reload_directive: Arc<StdMutex<Option<ReloadDirective>>>,
     enqueue_timeout_ms: u64,
     mm_embeddings_client: Option<MmEmbeddingsClient>,
-    sid_client: Option<Arc<crate::sid_client::SemanticIdClient>>,
     admission: Arc<AdmissionController>,
     prefetch_mm_query_config: Option<Arc<PrefetchMmQueryConfig>>,
 }
@@ -2929,7 +2922,6 @@ impl RecsysRetrievalPredictorImpl {
             &self.model_config,
             &cancel_token,
             self.enqueue_timeout_ms,
-            &self.sid_client,
             request.client_context,
             request.user_context,
             deadline,
@@ -3034,7 +3026,6 @@ async fn handle_retrieval_request(
     model_config: &ModelConfig,
     cancellation_token: &CancellationToken,
     enqueue_timeout_ms: u64,
-    sid_client: &Option<Arc<crate::sid_client::SemanticIdClient>>,
     client_context: Option<pb::ClientContext>,
     user_context: Option<pb::UserContext>,
     deadline: Option<Instant>,
@@ -3049,7 +3040,7 @@ async fn handle_retrieval_request(
         .unwrap_or("");
 
     let start = std::time::Instant::now();
-    let mut input_buffer = if let Some(ref columnar_bytes) = columnar_sequence_bytes {
+    let input_buffer = if let Some(ref columnar_bytes) = columnar_sequence_bytes {
         log::debug!(
             "Computing retrieval input buffer from columnar bytes ({} bytes)",
             columnar_bytes.len()
@@ -3087,25 +3078,6 @@ async fn handle_retrieval_request(
             user_context.as_ref(),
         )
     };
-
-    let sid_num_levels = model_config.sid_num_levels;
-    if sid_num_levels > 0
-        && let Some(client) = sid_client.as_ref()
-    {
-        let history_ids: Vec<i64> = input_buffer
-            .history_post_ids
-            .iter()
-            .copied()
-            .filter(|&id| id != 0)
-            .collect();
-        let sids = client.lookup(&history_ids).await;
-        fill_semantic_ids(
-            &sids,
-            &input_buffer.history_post_ids,
-            &mut input_buffer.history_semantic_ids,
-            sid_num_levels,
-        );
-    }
 
     let duration = start.elapsed();
     INPUT_BUFFER_COMPUTATION_TIME.observe(duration.as_secs_f64());
@@ -3193,7 +3165,6 @@ macro_rules! server_impl {
                         enqueue_timeout_ms = ENQUEUE_TIMEOUT_MS,
                         queue_max_staleness_ms = QUEUE_MAX_STALENESS_MS,
                         mm_client = None,
-                        sid_client = None,
                         user_id_table_size = 100_000,
                         user_hash_scales = vec![196742702, 1852108266],
                         user_biases = vec![1935840681, 167407236],
@@ -3258,7 +3229,6 @@ macro_rules! server_impl {
                         enqueue_timeout_ms: u64,
                         queue_max_staleness_ms: u64,
                         mm_client: Option<&PyMmEmbeddingsClient>,
-                        sid_client: Option<&crate::sid_client::PySemanticIdClient>,
                         user_id_table_size: usize,
                         user_hash_scales: Vec<i64>,
                         user_biases: Vec<i64>,
@@ -3407,7 +3377,6 @@ macro_rules! server_impl {
                         let _guard = runtime.enter();
 
                         let mm_embeddings_client = mm_client.map(|c| c.client().clone());
-                        let sid_client_arc = sid_client.map(|c| c.build());
 
                         let prefetch_mm_query_config: Option<Arc<PrefetchMmQueryConfig>> =
                             if prefetch_mm_query_for_retrieval && mm_embeddings_client.is_some() {
@@ -3446,7 +3415,6 @@ macro_rules! server_impl {
                             reload_directive: reload_directive.clone(),
                             enqueue_timeout_ms,
                             mm_embeddings_client,
-                            sid_client: sid_client_arc,
                             admission: admission.clone(),
                             prefetch_mm_query_config,
                         };
@@ -3785,7 +3753,6 @@ pub fn xai_recsys_engine(_py: Python<'_>, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<RankingBatchPrep>()?;
     m.add_class::<RetrievalBatchPrep>()?;
     m.add_class::<PyMmEmbeddingsClient>()?;
-    m.add_class::<crate::sid_client::PySemanticIdClient>()?;
     m.add_class::<RecsysPredictorServer>()?;
     m.add_class::<RecsysRetrievalPredictorServer>()?;
     m.add_class::<PredictRequestBatch>()?;

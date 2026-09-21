@@ -1,56 +1,64 @@
+import asyncio
 import logging
-import os
-from functools import cache
-
 from thrifts.gen.twitter.strato.columns.content_understanding.content_understanding.ttypes import (
     SimpleTweetEmbedding,
 )
 from thrifts.serdes import Serializer
 from grox.core.data_loaders.data_types import Post
 from grox.config.config import grox_config
-from kafka_cli.producer import ScramKafkaProducer
+from kafka_cli.multi_region_producer import MultiRegionKafkaProducer
 from grox.flows.mm_emb.constants import (
     TOPIC_EMBEDDING_V5,
     TOPIC_EMBEDDING_V5_ALL,
     TOPIC_EMBEDDING_V8_2,
+    TOPIC_EMBEDDING_V8_SEARCH,
 )
 
 logger = logging.getLogger(__name__)
 
 
-class TaskPublishEmbeddingKafka:
+def _serialize(post: Post, embedding: list[float]) -> bytes:
+    return Serializer.serialize(
+        SimpleTweetEmbedding(tweetId=int(post.id), embedding1=embedding)
+    )
+
+
+class TaskPublishEmbeddingMultiRegionKafka:
     KAFKA_TOPIC_NAME: str
+
+    _producer: MultiRegionKafkaProducer | None = None
+    _producer_lock = asyncio.Lock()
 
     @classmethod
     async def _publish_to_kafka(cls, post: Post, embedding: list[float]) -> None:
-        tweet_embedding = SimpleTweetEmbedding(
-            tweetId=int(post.id),
-            embedding1=embedding,
-        )
-        serialized_bytes = Serializer.serialize(tweet_embedding)
-        await cls._get_kafka_producer().send(id=post.id, value=serialized_bytes)
+        producer = await cls._get_kafka_producer()
+        await producer.send(id=post.id, value=_serialize(post, embedding))
         logger.info(f"Published embedding for post {post.id} to {cls.KAFKA_TOPIC_NAME}")
 
     @classmethod
-    @cache
-    def _get_kafka_producer(cls) -> ScramKafkaProducer:
-        producer_config = grox_config.get_kafka_producer_topic(cls.KAFKA_TOPIC_NAME)
-        password = os.environ.get("KAFKA_RECSYS_PASSWORD")
-        if not password:
-            raise RuntimeError(
-                "KAFKA_RECSYS_PASSWORD env var is required for SCRAM auth but is not set."
-            )
-        producer_config.ssl.sasl_plain_password = password
-        return ScramKafkaProducer(producer_config)
+    async def _get_kafka_producer(cls) -> MultiRegionKafkaProducer:
+        if cls._producer is None:
+            async with cls._producer_lock:
+                if cls._producer is None:
+                    producer = MultiRegionKafkaProducer(
+                        grox_config.get_kafka_producer(cls.KAFKA_TOPIC_NAME)
+                    )
+                    await producer.start()
+                    cls._producer = producer
+        return cls._producer
 
 
-class TaskPublishEmbeddingV5Kafka(TaskPublishEmbeddingKafka):
+class TaskPublishEmbeddingV5Kafka(TaskPublishEmbeddingMultiRegionKafka):
     KAFKA_TOPIC_NAME = TOPIC_EMBEDDING_V5
 
 
-class TaskPublishEmbeddingV5AllKafka(TaskPublishEmbeddingKafka):
+class TaskPublishEmbeddingV5AllKafka(TaskPublishEmbeddingMultiRegionKafka):
     KAFKA_TOPIC_NAME = TOPIC_EMBEDDING_V5_ALL
 
 
-class TaskPublishEmbeddingV82Kafka(TaskPublishEmbeddingKafka):
+class TaskPublishEmbeddingV82Kafka(TaskPublishEmbeddingMultiRegionKafka):
     KAFKA_TOPIC_NAME = TOPIC_EMBEDDING_V8_2
+
+
+class TaskPublishEmbeddingV8SearchKafka(TaskPublishEmbeddingMultiRegionKafka):
+    KAFKA_TOPIC_NAME = TOPIC_EMBEDDING_V8_SEARCH

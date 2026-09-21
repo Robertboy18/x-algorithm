@@ -1,3 +1,4 @@
+use crate::hydration::batch::Completeness;
 use crate::hydration::metrics::{record_hydrator_request, HydratorOutcome};
 use crate::models::{Viewer, ViewerAge, ViewerFeatures};
 use crate::rules::SafetyLevel;
@@ -6,7 +7,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 use xai_core_entities::gizmoduck_client::{GizmoduckClient, QueryFields};
 
-const CLIENT_TIMEOUT: Duration = Duration::from_millis(150);
+const CLIENT_TIMEOUT: Duration = crate::hydration::HYDRATION_TIMEOUT;
 
 const VIEWER_QUERY_FIELDS: [QueryFields; 2] = [QueryFields::ACCOUNT, QueryFields::EXTENDED_PROFILE];
 
@@ -20,12 +21,12 @@ impl ViewerHydrator {
         viewer_id: Option<u64>,
         country_code: Option<String>,
         safety_level: SafetyLevel,
-    ) -> ViewerFeatures {
+    ) -> Completeness<ViewerFeatures> {
         let viewer = match viewer_id {
             Some(id) => Viewer::LoggedIn(id),
             None => Viewer::LoggedOut,
         };
-        let (allows_sensitive_media, viewer_age, account_country_code) = match viewer_id {
+        let lookup = match viewer_id {
             Some(vid) => {
                 let start = Instant::now();
                 let result = tokio::time::timeout(
@@ -54,32 +55,34 @@ impl ViewerHydrator {
                             None if data.user_exists => ViewerAge::NotStated,
                             None => ViewerAge::Unknown,
                         };
-                        (
+                        Completeness::Complete((
                             data.nsfw_view.unwrap_or(false),
                             age,
                             data.account_country_code,
-                        )
+                        ))
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "Gizmoduck viewer lookup failed; failing open");
-                        (false, ViewerAge::Unknown, None)
+                        Completeness::Incomplete((false, ViewerAge::Unknown, None))
                     }
                     Err(_) => {
                         warn!("Gizmoduck viewer lookup timed out; failing open");
-                        (false, ViewerAge::Unknown, None)
+                        Completeness::Incomplete((false, ViewerAge::Unknown, None))
                     }
                 }
             }
-            None => (false, ViewerAge::Unknown, None),
+            None => Completeness::Complete((false, ViewerAge::Unknown, None)),
         };
 
-        ViewerFeatures {
-            viewer,
-            allows_sensitive_media,
-            country_code: country_code.map(|c| c.to_ascii_lowercase()),
-            account_country_code: account_country_code.map(|c| c.to_ascii_lowercase()),
-            viewer_age,
-        }
+        lookup.map(
+            |(allows_sensitive_media, viewer_age, account_country_code)| ViewerFeatures {
+                viewer,
+                allows_sensitive_media,
+                country_code: country_code.map(|c| c.to_ascii_lowercase()),
+                account_country_code: account_country_code.map(|c| c.to_ascii_lowercase()),
+                viewer_age,
+            },
+        )
     }
 }
 
@@ -169,9 +172,13 @@ mod tests {
         let hydrator = ViewerHydrator {
             gizmoduck_client: Arc::new(BrokenViewerClient(lookup)),
         };
-        hydrator
+        let Completeness::Incomplete(viewer) = hydrator
             .hydrate(Some(123), Some("US".to_string()), SafetyLevel::FilterAll)
             .await
+        else {
+            panic!("broken viewer lookups are incomplete")
+        };
+        viewer
     }
 
     #[tokio::test]
@@ -204,7 +211,8 @@ mod tests {
 
         let viewer = hydrator
             .hydrate(None, Some("US".to_string()), SafetyLevel::FilterAll)
-            .await;
+            .await
+            .into_value();
 
         assert_eq!(viewer.viewer, Viewer::LoggedOut);
         assert!(!viewer.allows_sensitive_media);
@@ -224,7 +232,8 @@ mod tests {
 
         let viewer = hydrator
             .hydrate(Some(123), Some("US".to_string()), SafetyLevel::FilterAll)
-            .await;
+            .await
+            .into_value();
 
         assert_eq!(viewer.account_country_code.as_deref(), Some("kr"));
         assert_eq!(viewer.country_code.as_deref(), Some("us"));
@@ -244,7 +253,8 @@ mod tests {
 
         let viewer = hydrator
             .hydrate(Some(123), None, SafetyLevel::FilterAll)
-            .await;
+            .await
+            .into_value();
 
         assert_eq!(viewer.viewer_age, ViewerAge::NotStated);
     }
@@ -257,7 +267,8 @@ mod tests {
 
         let viewer = hydrator
             .hydrate(Some(123), Some("FR".to_string()), SafetyLevel::FilterAll)
-            .await;
+            .await
+            .into_value();
 
         assert_eq!(viewer.viewer, Viewer::LoggedIn(123));
         assert!(!viewer.allows_sensitive_media);

@@ -28,3 +28,8 @@ def reply_scoring_system_simple_prompt(large_account_follower_threshold: int) ->
 @cache
 def coordinated_spam_system_prompt() -> str:
     return _env.get_template("coordinated_spam_system.j2").render()
+
+
+@cache
+def multi_step_reply_spam_system_prompt() -> str:
+    return _env.get_template("multi_step_reply_spam_system.j2").render()

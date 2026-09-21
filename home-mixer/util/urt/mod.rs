@@ -51,6 +51,7 @@ pub(crate) fn make_urt_timeline(
         cursor,
         language_code,
         country_code,
+        true,
     ));
 
     let mut entries: Vec<TimelineEntry> = items
@@ -87,12 +88,17 @@ pub(crate) fn make_urt_timeline(
             Some(FeedItemKind::PushToHome(post)) => Some(
                 push_to_home_marshaller::marshal_push_to_home(post, feed_item.position as i64),
             ),
-            Some(FeedItemKind::Ad(ad)) => {
-                Some(ad_marshaller::marshal_ad(ad, feed_item.position as i64))
-            }
-            Some(FeedItemKind::WhoToFollow(wtf)) => {
-                wtf_marshaller::marshal_wtf(wtf, feed_item.position as i64, client_app_id)
-            }
+            Some(FeedItemKind::Ad(ad)) => Some(ad_marshaller::marshal_ad(
+                ad,
+                feed_item.position as i64,
+                request_type,
+            )),
+            Some(FeedItemKind::WhoToFollow(wtf)) => wtf_marshaller::marshal_wtf(
+                wtf,
+                feed_item.position as i64,
+                client_app_id,
+                initial_sort_index,
+            ),
             Some(FeedItemKind::Prompt(module)) => {
                 match prompt_marshaller::marshal_prompt(module, feed_item.position as i64) {
                     Some(prompt_marshaller::PromptUrtResult::Entry(entry)) => Some(entry),
@@ -258,7 +264,7 @@ mod tests {
     fn without_nonce_entry_ids_are_unchanged() {
         let ids = rendered_entry_ids(&[post_item(100), ad_item(200)], None);
         assert!(ids.contains(&"tweet-100".to_string()), "{ids:?}");
-        assert!(ids.contains(&"promoted-tweet-200".to_string()), "{ids:?}");
+        assert!(ids.contains(&"promoted-tweet-200-0".to_string()), "{ids:?}");
     }
 
     #[test]
@@ -266,7 +272,7 @@ mod tests {
         let ids = rendered_entry_ids(&[post_item(100), ad_item(200)], Some(42));
         assert!(ids.contains(&"tweet-100-42".to_string()), "{ids:?}");
         assert!(!ids.contains(&"tweet-100".to_string()), "{ids:?}");
-        assert!(ids.contains(&"promoted-tweet-200".to_string()), "{ids:?}");
+        assert!(ids.contains(&"promoted-tweet-200-0".to_string()), "{ids:?}");
         assert!(
             ids.iter().any(|id| id.starts_with("cursor-top-")),
             "{ids:?}"

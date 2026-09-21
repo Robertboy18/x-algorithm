@@ -4,7 +4,7 @@ use xai_urt_thrift::entry::{TimelineEntry, TimelineEntryContent};
 use xai_urt_thrift::item::{TimelineItem, TimelineItemContent};
 use xai_urt_thrift::metadata::{
     ClientEventInfo, ContextType, FeedbackInfo, TopicFeedbackContext, TweetContext,
-    TweetContextDetails,
+    TweetContextDetails, Url, UrlType,
 };
 use xai_urt_thrift::tweet::{Tweet, TweetDisplayType, TweetFacepile};
 
@@ -72,17 +72,39 @@ pub(super) fn tweet_context_from_post(post: &ScoredPost) -> Option<TweetContext>
     if !is_standalone_original_post(post) {
         return None;
     }
-    let topic = post.topic_feedback_topic.as_ref()?;
+    if let Some(topic) = post.topic_feedback_topic.as_ref().filter(|t| !t.is_empty()) {
+        return Some(TweetContext {
+            context_type: ContextType::TOPIC,
+            text: topic.clone(),
+            context_image_urls: None,
+            landing_url: None,
+            context: Some(TweetContextDetails::TopicFeedbackContext(
+                TopicFeedbackContext {
+                    topic: Some(topic.clone()),
+                    url: None,
+                    topic_id: post.topic_feedback_topic_id.clone(),
+                },
+            )),
+            icon: None,
+        });
+    }
+    let trend = post.ai_trend_name.as_ref().filter(|t| !t.is_empty())?;
+    let trend_id = post.ai_trend_id.as_ref().filter(|id| !id.is_empty())?;
+    let landing_url = Url {
+        url_type: UrlType::EXTERNAL_URL,
+        url: format!("https://x.com/i/trending/{trend_id}"),
+        urt_endpoint_options: None,
+    };
     Some(TweetContext {
         context_type: ContextType::TOPIC,
-        text: topic.clone(),
+        text: trend.clone(),
         context_image_urls: None,
-        landing_url: None,
+        landing_url: Some(landing_url.clone()),
         context: Some(TweetContextDetails::TopicFeedbackContext(
             TopicFeedbackContext {
-                topic: Some(topic.clone()),
-                url: None,
-                topic_id: post.topic_feedback_topic_id.clone(),
+                topic: Some(trend.clone()),
+                url: Some(landing_url),
+                topic_id: None,
             },
         )),
         icon: None,

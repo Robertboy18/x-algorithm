@@ -2,7 +2,7 @@
 // Copyright 2026 X.AI Corp.
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::{error, info};
+use log::{error, info, warn};
 use object_store::aws::AmazonS3Builder;
 use object_store::chunked::ChunkedStore;
 use object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder};
@@ -18,13 +18,33 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
+use xai_o2::{O2ClientBuilder, base_client::BaseO2Client};
+
 const MAX_CONCURRENT: usize = 16;
 
 const MAX_RETRIES: usize = 6;
 
 const MULTIPART_THRESHOLD: usize = 100 * 1024 * 1024;
 
-const MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
+const MULTIPART_PART_SIZE: usize = 32 * 1024 * 1024;
+
+const MAX_CONCURRENT_WRITE_REQUESTS: usize = 1;
+
+fn env_usize(name: &str, default: usize) -> usize {
+    match env::var(name) {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(
+                    "[checkpoint-store] invalid {}={:?}, using default {}",
+                    name, raw, default
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
 
 pub struct CheckpointStore {
     client: Arc<dyn ObjectStore>,
@@ -153,6 +173,34 @@ impl CheckpointStore {
     }
 }
 
+pub struct XaiO2Store {
+    client: Arc<dyn BaseO2Client>,
+}
+
+impl XaiO2Store {
+    pub async fn put(&self, path: &ObjectPath, data: Bytes, label: &str) -> Result<(), String> {
+        self.client
+            .put(path.as_ref(), data)
+            .await
+            .map_err(|e| format!("PUT {} failed: {}", label, e))
+    }
+}
+
+#[derive(Clone)]
+pub enum Store {
+    ObjectStore(Arc<CheckpointStore>),
+    XaiO2(Arc<XaiO2Store>),
+}
+
+impl Store {
+    pub async fn put(&self, path: &ObjectPath, data: Bytes, label: &str) -> Result<(), String> {
+        match self {
+            Store::ObjectStore(s) => s.put(path, data, label).await,
+            Store::XaiO2(s) => s.put(path, data, label).await,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct WorkloadIdentityCredentialProvider {
     inner: google_cloud_auth::credentials::AccessTokenCredentials,
@@ -221,6 +269,8 @@ fn is_external_account_credential(path: &str) -> bool {
 }
 
 static STORES: OnceLock<Mutex<HashMap<String, Arc<CheckpointStore>>>> = OnceLock::new();
+
+static XAI_O2_STORES: OnceLock<Mutex<HashMap<String, Arc<XaiO2Store>>>> = OnceLock::new();
 
 pub fn get_checkpoint_store(
     url: &str,
@@ -292,8 +342,9 @@ pub fn get_checkpoint_store(
             ..Default::default()
         };
 
-        let endpoint =
-            env::var("O2_ENDPOINT_URL").unwrap_or_else(|_| "http://o2.example.invalid".into());
+        let endpoint = env::var("O2_ENDPOINT_URL").map_err(|_| {
+            "O2 endpoint not set: set XAI_O2_ENDPOINT_URL or O2_ENDPOINT_URL".to_string()
+        })?;
         let access_key = env::var("O2_ACCESS_KEY_ID").unwrap_or_else(|_| "anonymous".to_string());
         let secret_key =
             env::var("O2_SECRET_ACCESS_KEY").unwrap_or_else(|_| "anonymous".to_string());
@@ -328,4 +379,124 @@ pub fn get_checkpoint_store(
     map.insert(cache_key, store.clone());
 
     Ok((store, ObjectPath::from(path)))
+}
+
+fn is_o2_scheme(url: &str) -> bool {
+    url.starts_with("s3://") || url.starts_with("s3-o2://")
+}
+
+fn use_xai_o2_for(url: &str) -> bool {
+    if !is_o2_scheme(url) {
+        return false;
+    }
+    match env::var("XAI_RECSYS_S3_BACKEND") {
+        Ok(raw) => {
+            let v = raw.trim();
+            if v.eq_ignore_ascii_case("xai-o2") {
+                true
+            } else {
+                if !v.is_empty() {
+                    warn!(
+                        "[checkpoint-store] unknown XAI_RECSYS_S3_BACKEND={:?}, \
+                         using object_store (set to \"xai-o2\" for the xai-o2 backend)",
+                        raw
+                    );
+                }
+                false
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+pub fn get_store(
+    url: &str,
+    runtime: Option<&tokio::runtime::Runtime>,
+) -> Result<(Store, ObjectPath), Box<dyn std::error::Error + Send + Sync>> {
+    if use_xai_o2_for(url) {
+        let (store, path) = get_xai_o2_store(url)?;
+        return Ok((Store::XaiO2(store), path));
+    }
+    let (store, path) = get_checkpoint_store(url, runtime)?;
+    Ok((Store::ObjectStore(store), path))
+}
+
+fn get_xai_o2_store(
+    url: &str,
+) -> Result<(Arc<XaiO2Store>, ObjectPath), Box<dyn std::error::Error + Send + Sync>> {
+    let parsed = url::Url::parse(url)?;
+    let bucket = parsed
+        .host_str()
+        .ok_or_else(|| format!("No bucket in URL: {}", url))?
+        .to_string();
+    let path = parsed.path().trim_start_matches('/');
+
+    let cache_key = format!("s3://{}", bucket);
+    let stores = XAI_O2_STORES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = stores.lock().map_err(|e| format!("lock poisoned: {}", e))?;
+    if let Some(store) = map.get(&cache_key) {
+        return Ok((store.clone(), ObjectPath::from(path)));
+    }
+
+    let store = Arc::new(XaiO2Store {
+        client: build_xai_o2_client(&bucket)?,
+    });
+    map.insert(cache_key, store.clone());
+    Ok((store, ObjectPath::from(path)))
+}
+
+fn build_xai_o2_client(
+    bucket: &str,
+) -> Result<Arc<dyn BaseO2Client>, Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = env::var("O2_ENDPOINT_URL").map_err(|_| {
+        "O2 endpoint not set: set XAI_O2_ENDPOINT_URL or O2_ENDPOINT_URL".to_string()
+    })?;
+    let access_key = env::var("O2_ACCESS_KEY_ID").unwrap_or_else(|_| "anonymous".to_string());
+    let secret_key = env::var("O2_SECRET_ACCESS_KEY").unwrap_or_else(|_| "anonymous".to_string());
+    let skip_signature = access_key == "anonymous" && secret_key == "anonymous";
+
+    let max_write_reqs = env_usize(
+        "XAI_RECSYS_O2_MAX_CONCURRENT_WRITE_REQUESTS",
+        MAX_CONCURRENT_WRITE_REQUESTS,
+    )
+    .max(1);
+    let write_chunk_concurrency =
+        env_usize("XAI_RECSYS_O2_WRITE_CHUNK_CONCURRENCY", MAX_CONCURRENT).max(1);
+    let write_chunk_size_mib = env_usize(
+        "XAI_RECSYS_O2_WRITE_CHUNK_SIZE_MIB",
+        MULTIPART_PART_SIZE / (1024 * 1024),
+    )
+    .max(1);
+
+    info!(
+        "[checkpoint-store] Creating xai-o2 client bucket={} \
+         max_concurrent_write_requests={} write_chunk_concurrency={} \
+         write_chunk_size_mib={}",
+        bucket, max_write_reqs, write_chunk_concurrency, write_chunk_size_mib
+    );
+
+    let mut builder = O2ClientBuilder::default();
+    builder
+        .endpoint(endpoint)
+        .bucket(bucket)
+        .prefix("")
+        .write_chunk_size_mib(write_chunk_size_mib)
+        .write_chunk_concurrency(write_chunk_concurrency)
+        .max_concurrent_write_requests(max_write_reqs)
+        .retry_max_times(MAX_RETRIES)
+        .retry_min_delay(Duration::from_secs(1))
+        .retry_max_delay(Duration::from_secs(32))
+        .timeout(Duration::from_secs(300))
+        .io_timeout(Duration::from_secs(300))
+        .trace_always(false);
+    if skip_signature {
+        builder.allow_anonymous(true);
+    } else {
+        builder
+            .access_key_id(access_key)
+            .secret_access_key(secret_key);
+    }
+    builder
+        .build()
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
 }

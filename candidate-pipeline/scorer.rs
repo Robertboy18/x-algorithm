@@ -1,4 +1,4 @@
-use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery};
+use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery, PipelineStage};
 use crate::util;
 use crate::SPAN_LEVEL;
 use std::any::type_name_of_val;
@@ -17,16 +17,15 @@ where
 
     #[xai_stats_macro::receive_stats(latency = Vm)]
     #[tracing::instrument(level = SPAN_LEVEL, skip_all, name = "scorer", fields(name = self.name()))]
-    async fn run(&self, query: &Q, candidates: &[C]) -> Vec<Result<C, String>> {
+    async fn run(
+        &self,
+        query: &Q,
+        candidates: &[C],
+        _stage: PipelineStage,
+    ) -> Vec<Result<C, String>> {
         let scored = self.score(query, candidates).await;
         let expected_len = candidates.len();
         if scored.len() == expected_len {
-            #[cfg(feature = "quiet-spans")]
-            tracing::info!(
-                component = self.name(),
-                candidate_count = expected_len,
-                "scorer"
-            );
             scored
         } else {
             let message = format!(

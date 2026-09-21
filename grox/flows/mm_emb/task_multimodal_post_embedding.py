@@ -7,6 +7,11 @@ from grox.flows.mm_emb.state import MultimodalPostEmbeddingState
 from grox.core.data_loaders.data_types import Post, Video
 from grox.flows.mm_emb.embedder import MultimodalPostEmbedderV5
 from grox.flows.mm_emb.embedder_v82 import MultimodalPostEmbedderV82
+from grox.flows.mm_emb.embedder_v8_search import (
+    MultimodalPostEmbedderV8Search,
+    MultimodalPostEmbedderV8SearchBackfill,
+)
+from grox.flows.mm_emb.constants import V8_SEARCH_STATE_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -75,3 +80,50 @@ class TaskMultimodalPostEmbeddingV82(TaskWithPost):
             f"TaskMultimodalPostEmbeddingV82 Embedding Added, length: {len(embedding)}"
         )
         Metrics.counter("task.multimodal_post_embedding_v82.count").add(1)
+
+
+class TaskMultimodalPostEmbeddingV8Search(TaskWithPost):
+    embedder = MultimodalPostEmbedderV8Search()
+
+    @classmethod
+    async def _exec_with_post(cls, ctx: TaskContext, post: Post) -> None:
+        try:
+            _, embedding = await cls.embedder.embed(post)
+        except Exception as e:
+            Metrics.counter("task.multimodal_post_embedding_v8_search.error").add(1)
+            logger.warning(
+                f"TaskMultimodalPostEmbeddingV8Search failed for post {post.id}: {e}"
+            )
+            raise
+        if not embedding:
+            Metrics.counter("task.multimodal_post_embedding_v8_search.empty").add(1)
+            logger.info(
+                f"TaskMultimodalPostEmbeddingV8Search produced empty embedding for post {post.id}"
+            )
+            raise TaskStopExecution(f"Empty v8-search embedding for post {post.id}")
+        ctx.state(MultimodalPostEmbeddingState).embeddings[V8_SEARCH_STATE_KEY] = (
+            embedding
+        )
+        logger.info(
+            f"TaskMultimodalPostEmbeddingV8Search Embedding Added, length: {len(embedding)}"
+        )
+        Metrics.counter("task.multimodal_post_embedding_v8_search.count").add(1)
+
+
+class TaskMultimodalPostEmbeddingV8SearchBackfill(TaskWithPost):
+    embedder = MultimodalPostEmbedderV8SearchBackfill()
+
+    @classmethod
+    async def _exec_with_post(cls, ctx: TaskContext, post: Post) -> None:
+        try:
+            _, embedding = await cls.embedder.embed(post)
+        except Exception:
+            Metrics.counter("task.multimodal_post_embedding_v8_search.error").add(1)
+            raise
+        if not embedding:
+            Metrics.counter("task.multimodal_post_embedding_v8_search.empty").add(1)
+            raise TaskStopExecution(f"Empty v8-search embedding for post {post.id}")
+        ctx.state(MultimodalPostEmbeddingState).embeddings[V8_SEARCH_STATE_KEY] = (
+            embedding
+        )
+        Metrics.counter("task.multimodal_post_embedding_v8_search.count").add(1)

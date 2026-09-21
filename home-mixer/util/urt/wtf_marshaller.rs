@@ -20,6 +20,7 @@ pub(super) fn marshal_wtf(
     wtf: &WhoToFollowModule,
     sort_index: i64,
     client_app_id: i32,
+    module_id: i64,
 ) -> Option<TimelineEntry> {
     let is_android = ClientPlatform::is_android(client_app_id);
     let user_display_type = if is_android {
@@ -33,6 +34,8 @@ pub(super) fn marshal_wtf(
         ModuleDisplayType::VERTICAL
     };
     let resp = wtf.who_to_follow_response.as_ref()?;
+
+    let module_entry_id = format!("{}-{}", ENTRY_NAMESPACE_WTF, module_id);
 
     let header = resp.header.as_ref().and_then(|h| {
         h.title.as_ref().map(|title| ModuleHeader {
@@ -110,7 +113,10 @@ pub(super) fn marshal_wtf(
                 awards_given: None,
             };
             ModuleItem {
-                entry_id: format!("{}-{}", ENTRY_NAMESPACE_USER, rec.user_id),
+                entry_id: format!(
+                    "{}-{}-{}",
+                    module_entry_id, ENTRY_NAMESPACE_USER, rec.user_id
+                ),
                 item: TimelineItem {
                     content: TimelineItemContent::User(user),
                     client_event_info: Some(wtf_item_client_event_info(
@@ -127,15 +133,20 @@ pub(super) fn marshal_wtf(
         })
         .collect();
 
+    let first_tracking_token = resp
+        .user_recommendations
+        .first()
+        .and_then(|rec| rec.tracking_token.as_deref());
+
     Some(TimelineEntry {
-        entry_id: format!("{}-0", ENTRY_NAMESPACE_WTF),
+        entry_id: module_entry_id,
         sort_index,
         content: TimelineEntryContent::TimelineModule(TimelineModule {
             items: module_items,
             display_type: module_display_type,
             header,
             footer,
-            client_event_info: Some(wtf_module_client_event_info()),
+            client_event_info: Some(wtf_module_client_event_info(first_tracking_token)),
             feedback_info: None,
             metadata: None,
             show_more_behavior: None,

@@ -18,12 +18,18 @@ class ThreadRenderer:
         role: Role = Role.USER,
         separator=SEPARATOR,
         include_signals: bool = False,
+        include_follower_count: bool = False,
     ) -> Message:
         message = Message(role=role, content=[], separator=separator)
+        message.content.append(
+            "\n# Reply Author Info\n\nThe user profile and any signals below describe the author of the reply being evaluated (the final post of the thread).\n"
+        )
         message.content.extend(UserRenderer.render(post.user))
         if include_signals:
             message.content.extend(cls._render_signals(post))
-        message.content.extend(cls._render_thread(post))
+        message.content.extend(
+            cls._render_thread(post, include_follower_count=include_follower_count)
+        )
         return message
 
     @classmethod
@@ -60,7 +66,9 @@ class ThreadRenderer:
         return ["\n# Additional Signals\n" + "\n".join(lines) + "\n"]
 
     @classmethod
-    def _render_thread(cls, post: Post) -> list[Content]:
+    def _render_thread(
+        cls, post: Post, include_follower_count: bool = False
+    ) -> list[Content]:
         res = []
         res.append(
             "\n\n# Thread \n\nListed below is the X post thread before the reply. Post 0 is the original post. \n\n"
@@ -76,11 +84,24 @@ class ThreadRenderer:
             if p is None:
                 res.append("\n<- A post has been deleted ->\n")
             else:
-                res.extend(PostRenderer.render(p, max_media=MAX_MEDIA_PER_POST))
+                res.extend(
+                    PostRenderer.render(
+                        p,
+                        max_media=MAX_MEDIA_PER_POST,
+                        include_follower_count=include_follower_count,
+                        include_bio=include_follower_count and post_idx == 0,
+                    )
+                )
             res.append("\n\n------\n\n")
 
         res.append("\n\n# Reply \n\nBelow is the reply that you need to evaluate. \n\n")
-        res.extend(PostRenderer.render(post, max_media=MAX_MEDIA_PER_POST))
+        res.extend(
+            PostRenderer.render(
+                post,
+                max_media=MAX_MEDIA_PER_POST,
+                include_follower_count=include_follower_count,
+            )
+        )
         res.append("\n\n------\n\n")
 
         return res

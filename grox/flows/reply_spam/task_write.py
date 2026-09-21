@@ -22,7 +22,6 @@ from grox.core.data_loaders.data_types import (
 from grox.core.data_loaders.strato_loader import UserStratoLoader
 from strato_http.queries.data_types import (
     ReplyRankingScore,
-    ReplyRankingScoreKafka,
 )
 from grox.flows.reply_spam.strato_loader import ReplyRankingScoreStratoLoader
 
@@ -86,9 +85,6 @@ class TaskWriteReplyRankingManhattan(Task):
         Metrics.counter("task.write_reply_ranking_manhattan.intaken.count").add(1)
         try:
             await cls._publish_to_reply_ranking_manhattan(post, result)
-            logger.info(
-                f"Published reply ranking post to manhattan: {post.id=} user_id={post.user.id if post.user else None}"
-            )
         except Exception:
             Metrics.counter("task.write_reply_ranking_manhattan.failed.count").add(1)
             logger.error(
@@ -113,25 +109,37 @@ class TaskWriteReplyRankingManhattan(Task):
                 f"Missing user id [_publish_to_reply_ranking_manhattan] {reasoning=} {post.id=} {score=}"
             )
 
+        existing = await ReplyRankingScoreStratoLoader.fetch_reply_ranking_score(
+            post.id
+        )
+        if (
+            existing is not None
+            and existing.score is not None
+            and score >= existing.score
+        ):
+            Metrics.counter("task.write_reply_ranking_manhattan.skipped.count").add(
+                1, attributes={"reason": "not_lower_than_existing"}
+            )
+            logger.info(
+                f"[_publish_to_reply_ranking_manhattan] skipping write: new {score=} >= existing={existing.score} {post.id=}"
+            )
+            return
+
         if score == 0.0:
             await _apply_reply_spam_label(post.id, post.user.id if post.user else None)
 
-        await ReplyRankingScoreStratoLoader.save_reply_ranking_score(
+        await ReplyRankingScoreStratoLoader.publish_reply_ranking_score(
             post_id=post.id,
             reply_ranking_score=ReplyRankingScore(
                 score=score, reasoning=reasoning[-500:]
             ),
         )
 
-        await ReplyRankingScoreStratoLoader.save_reply_ranking_kafka_v2(
-            post_id=post.id,
-            reply_ranking_score_kafka=ReplyRankingScoreKafka(
-                postId=int(post.id), score=score, reasoning=reasoning[-500:]
-            ),
-        )
-
         Metrics.counter("task.write_reply_ranking_manhattan.success.count").add(
             1, attributes={"column": "reply_ranking"}
+        )
+        logger.info(
+            f"Published reply ranking post to manhattan: {post.id=} user_id={post.user.id if post.user else None} {score=}"
         )
 
 
@@ -175,17 +183,10 @@ class TaskWriteCoordinatedSpamReplyRanking(Task):
     async def _mark_spam(cls, post_id: str, author_id: int, reasoning: str) -> None:
         await _apply_reply_spam_label(post_id, author_id)
 
-        await ReplyRankingScoreStratoLoader.save_reply_ranking_score(
+        await ReplyRankingScoreStratoLoader.publish_reply_ranking_score(
             post_id=post_id,
             reply_ranking_score=ReplyRankingScore(
                 score=0.0, reasoning=reasoning[-500:]
-            ),
-        )
-
-        await ReplyRankingScoreStratoLoader.save_reply_ranking_kafka_v2(
-            post_id=post_id,
-            reply_ranking_score_kafka=ReplyRankingScoreKafka(
-                postId=int(post_id), score=0.0, reasoning=reasoning
             ),
         )
         logger.info(

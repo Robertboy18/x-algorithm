@@ -5,17 +5,16 @@ pub mod safety_labels;
 pub mod tweet;
 pub mod viewer;
 
-pub use author::{AuthorFeatures, UserLabelSet};
+pub use author::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
 pub use exclusive_content::ExclusiveContentFeatures;
 pub use relationship::ViewerAuthorRelationship;
-pub use safety_labels::{SafetyLabel, SafetyLabelMap, SafetyLabelType};
-pub use tweet::{CoreFeature, MediaFeature, NsfwFeature, TakedownFeature, TweetFeatures};
-pub use viewer::{Viewer, ViewerAge, ViewerFeatures, ADULT_AGE_YEARS};
+pub use safety_labels::{SafetyLabelMap, SafetyLabelType};
+pub use tweet::{CoreFeature, MediaFeature, NsfwFeature, TweetFeatures};
+pub use viewer::{Viewer, ViewerAge, ViewerFeatures};
 
 use std::collections::HashMap;
 use xai_core_entities::entities::PureCoreData;
 use xai_visibility_filtering::models::FilteredReason;
-use xai_x_thrift::user_labels::LabelValue;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TweetId(pub u64);
@@ -44,10 +43,12 @@ pub struct TweetCandidateInput {
 pub fn resolve_candidate(
     raw: &RawCandidate,
     core: &HashMap<TweetId, PureCoreData>,
+    recovered_authors: &HashMap<TweetId, u64>,
 ) -> Option<TweetCandidateInput> {
     let author = raw
         .request_author_id
-        .or_else(|| core.get(&raw.tweet_id).map(|c| c.author_id))?;
+        .or_else(|| core.get(&raw.tweet_id).map(|c| c.author_id))
+        .or_else(|| recovered_authors.get(&raw.tweet_id).copied())?;
     Some(TweetCandidateInput {
         tweet_id: raw.tweet_id,
         author_id: AuthorId(author),
@@ -57,9 +58,10 @@ pub fn resolve_candidate(
 pub fn resolve_candidates(
     raw: &[RawCandidate],
     core: &HashMap<TweetId, PureCoreData>,
+    recovered_authors: &HashMap<TweetId, u64>,
 ) -> Vec<TweetCandidateInput> {
     raw.iter()
-        .filter_map(|c| resolve_candidate(c, core))
+        .filter_map(|c| resolve_candidate(c, core, recovered_authors))
         .collect()
 }
 
@@ -114,7 +116,7 @@ impl HydratedTweetCandidate {
         self.tweet_features.is_community_tweet
     }
 
-    pub fn author_has_user_label(&self, label: LabelValue) -> bool {
+    pub fn author_has_user_label(&self, label: AuthorLabel) -> bool {
         self.author_features.user_labels.has_label(label)
     }
 
@@ -174,7 +176,7 @@ mod tests {
             tweet_id: TweetId(10),
             request_author_id: Some(100),
         };
-        let resolved = resolve_candidate(&raw, &core).unwrap();
+        let resolved = resolve_candidate(&raw, &core, &HashMap::new()).unwrap();
         assert_eq!(resolved.author_id.get(), 100);
     }
 
@@ -191,7 +193,7 @@ mod tests {
             tweet_id: TweetId(10),
             request_author_id: None,
         };
-        let resolved = resolve_candidate(&raw, &core).unwrap();
+        let resolved = resolve_candidate(&raw, &core, &HashMap::new()).unwrap();
         assert_eq!(resolved.author_id.get(), 200);
     }
 
@@ -202,7 +204,7 @@ mod tests {
             tweet_id: TweetId(10),
             request_author_id: None,
         };
-        assert!(resolve_candidate(&raw, &core).is_none());
+        assert!(resolve_candidate(&raw, &core, &HashMap::new()).is_none());
     }
 
     #[test]
@@ -224,10 +226,48 @@ mod tests {
                 request_author_id: None,
             },
         ];
-        let resolved = resolve_candidates(&raw, &core);
+        let resolved = resolve_candidates(&raw, &core, &HashMap::new());
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].tweet_id, TweetId(2));
         assert_eq!(resolved[0].author_id.get(), 20);
+    }
+
+    #[test]
+    fn resolve_candidates_uses_recovered_author_only_when_request_and_core_miss() {
+        let core = HashMap::from([(
+            TweetId(2),
+            PureCoreData {
+                author_id: 20,
+                ..Default::default()
+            },
+        )]);
+        let recovered = HashMap::from([(TweetId(1), 11), (TweetId(2), 22), (TweetId(3), 33)]);
+        let raw = vec![
+            RawCandidate {
+                tweet_id: TweetId(1),
+                request_author_id: Some(10),
+            },
+            RawCandidate {
+                tweet_id: TweetId(2),
+                request_author_id: None,
+            },
+            RawCandidate {
+                tweet_id: TweetId(3),
+                request_author_id: None,
+            },
+            RawCandidate {
+                tweet_id: TweetId(4),
+                request_author_id: None,
+            },
+        ];
+        let resolved: Vec<(TweetId, u64)> = resolve_candidates(&raw, &core, &recovered)
+            .into_iter()
+            .map(|c| (c.tweet_id, c.author_id.get()))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![(TweetId(1), 10), (TweetId(2), 20), (TweetId(3), 33)]
+        );
     }
 
     fn candidate() -> HydratedTweetCandidate {

@@ -1,7 +1,9 @@
 import logging
+import time
 
 from grox.core.tasks.task import Task, TaskWithPost, TaskResultCategory
 from grox.flows.mm_emb.disable_rules import DisableTaskForNonMmEmbProd
+from grox.flows.mm_emb.constants import V8_SEARCH_MODEL_VERSION, V8_SEARCH_STATE_KEY
 from monitor.metrics import Metrics
 from grox.core.schedules.types import TaskContext
 from grox.flows.mm_emb.state import MultimodalPostEmbeddingState
@@ -15,6 +17,7 @@ from grox.flows.mm_emb.task_embedding_pub import (
     TaskPublishEmbeddingV5Kafka,
     TaskPublishEmbeddingV5AllKafka,
     TaskPublishEmbeddingV82Kafka,
+    TaskPublishEmbeddingV8SearchKafka,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,3 +161,90 @@ class TaskWriteMMEmbeddingV5ToAllTopic(TaskWriteMMEmbeddingSinkBase):
         await TaskPublishEmbeddingV5AllKafka._publish_to_kafka(post, embedding)
 
         Metrics.counter("task.write_post_embedding_v5_all_kafka.count").add(1)
+
+
+class _TaskWriteV8SearchSinkBase(TaskWriteMMEmbeddingSinkBase):
+    model_version = V8_SEARCH_MODEL_VERSION
+
+
+class TaskWriteV8SearchSinkSkipKafkaForReplies(_TaskWriteV8SearchSinkBase):
+    @classmethod
+    async def _exec_with_post(cls, ctx: TaskContext, post: Post) -> None:
+        start_time = time.perf_counter_ns()
+
+        embedding = ctx.state(MultimodalPostEmbeddingState).embeddings[
+            V8_SEARCH_STATE_KEY
+        ]
+        assert embedding is not None
+        query = StratoPostMultimodalEmbeddingMhSearchAiNoCache()
+        await query.put(
+            int(post.id),
+            cls.model_version,
+            TweetEmbedding(tweetId=int(post.id), embedding1=embedding),
+        )
+
+        is_reply = bool(post.ancestors)
+        if not is_reply:
+            await TaskPublishEmbeddingV8SearchKafka._publish_to_kafka(post, embedding)
+        else:
+            Metrics.counter(
+                "task.write_post_embedding_sink_v8_search.kafka_skipped.count"
+            ).add(1)
+
+        logger.info(
+            f"wrote v8-search embedding to Manhattan for post {post.id} "
+            f"(model_version={cls.model_version}, kafka={'yes' if not is_reply else 'no'})"
+        )
+        duration_ms = (time.perf_counter_ns() - start_time) / 1_000_000
+        Metrics.histogram(
+            "task.write_post_embedding_sink_v8_search.duration_ms"
+        ).record(duration_ms)
+        Metrics.counter("task.write_post_embedding_sink_v8_search.count").add(1)
+
+
+class TaskWriteV8SearchSink(_TaskWriteV8SearchSinkBase):
+    @classmethod
+    async def _exec_with_post(cls, ctx: TaskContext, post: Post) -> None:
+        start_time = time.perf_counter_ns()
+
+        embedding = ctx.state(MultimodalPostEmbeddingState).embeddings[
+            V8_SEARCH_STATE_KEY
+        ]
+        assert embedding is not None
+        query = StratoPostMultimodalEmbeddingMhSearchAiNoCache()
+        await query.put(
+            int(post.id),
+            cls.model_version,
+            TweetEmbedding(tweetId=int(post.id), embedding1=embedding),
+        )
+
+        await TaskPublishEmbeddingV8SearchKafka._publish_to_kafka(post, embedding)
+
+        logger.info(
+            f"wrote v8-search embedding to Manhattan for reply post {post.id} (model_version={cls.model_version}, kafka=yes)"
+        )
+        duration_ms = (time.perf_counter_ns() - start_time) / 1_000_000
+        Metrics.histogram(
+            "task.write_post_embedding_sink_v8_search.duration_ms"
+        ).record(duration_ms)
+        Metrics.counter("task.write_post_embedding_sink_v8_search.count").add(1)
+
+
+class TaskWriteV8SearchBackfillSink(TaskWriteMMEmbeddingSinkBase):
+    model_version = V8_SEARCH_MODEL_VERSION
+
+    @classmethod
+    async def _exec_with_post(cls, ctx: TaskContext, post: Post) -> None:
+        embedding = ctx.state(MultimodalPostEmbeddingState).embeddings[
+            V8_SEARCH_STATE_KEY
+        ]
+        assert embedding is not None
+        query = StratoPostMultimodalEmbeddingMhSearchAiNoCache()
+        await query.put(
+            int(post.id),
+            cls.model_version,
+            TweetEmbedding(tweetId=int(post.id), embedding1=embedding),
+        )
+        Metrics.counter("task.write_post_embedding_sink_v8_search_backfill.count").add(
+            1
+        )

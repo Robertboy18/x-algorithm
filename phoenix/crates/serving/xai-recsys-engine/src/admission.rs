@@ -98,6 +98,11 @@ impl AdmissionController {
         }
     }
 
+    pub fn reset_estimates(&self) {
+        self.service_time_us.store(0, Ordering::Relaxed);
+        self.pipeline_time_us.store(0, Ordering::Relaxed);
+    }
+
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
     }
@@ -370,6 +375,20 @@ mod tests {
         assert_eq!(c.predicted_eta_us(0), Some(100_000));
         assert_eq!(c.predicted_eta_loop_us(0), Some(100_000));
         assert_eq!(c.predicted_eta_pipeline_us(0), None);
+    }
+
+    #[test]
+    fn reset_estimates_clears_s_and_p() {
+        let c = AdmissionController::new(cfg_pipeline(true));
+        c.record_service_time_us(100_000);
+        c.record_sojourn_us(80_000, 0);
+        assert!(c.service_time_us() > 0);
+        assert!(c.pipeline_time_us() > 0);
+        assert!(c.should_reject(Some(1), 32));
+        c.reset_estimates();
+        assert_eq!(c.service_time_us(), 0);
+        assert_eq!(c.pipeline_time_us(), 0);
+        assert!(!c.should_reject(Some(1), 32));
     }
 
     #[test]

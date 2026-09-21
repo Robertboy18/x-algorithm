@@ -9,10 +9,10 @@ use tonic::async_trait;
 use tracing::warn;
 use xai_candidate_pipeline::component_library::clients::StratoClient;
 use xai_candidate_pipeline::hydrator::Hydrator;
-use xai_strato::{decode, StratoResult, StratoValue};
+use xai_strato::{decode, Bytes, StratoResult, StratoValue};
 
 fn decode_topics_pair(
-    result: &Result<Vec<u8>, Box<dyn std::error::Error>>,
+    result: &Result<Bytes, Box<dyn std::error::Error>>,
     experiment: TopicFilteringExperiment,
     need_unfiltered: bool,
 ) -> (Option<Vec<i64>>, Option<Vec<i64>>) {

@@ -233,6 +233,28 @@ def sparse_tensor_m_block(
 
 
 @cute.jit
+def _bridge_block_lists(
+    prev_block_idx: cute.Tensor,
+    next_block_idx: cute.Tensor,
+    next_block_cnt,
+    kv_producer_state,
+    load_K,
+    load_V,
+    pipeline_k,
+    pipeline_v,
+):
+    n_block_prev_last = prev_block_idx[0]
+    n_block_next_first = next_block_idx[next_block_cnt - 1]
+    kv_producer_state_prev = kv_producer_state.clone()
+    kv_producer_state.advance()
+    pipeline_k.producer_acquire(kv_producer_state)
+    load_K(src_idx=n_block_next_first, producer_state=kv_producer_state)
+    pipeline_v.producer_acquire(kv_producer_state_prev)
+    load_V(src_idx=n_block_prev_last, producer_state=kv_producer_state_prev)
+    return kv_producer_state
+
+
+@cute.jit
 def produce_block_sparse_loads(
     blocksparse_tensors: BlockSparseTensors,
     batch_idx,
@@ -255,8 +277,8 @@ def produce_block_sparse_loads(
         curr_mask_block_idx,
         curr_full_block_cnt,
         curr_full_block_idx,
-        _curr_diag_block_cnt,
-        _curr_diag_block_idx,
+        curr_diag_block_cnt,
+        curr_diag_block_idx,
     ) = get_curr_blocksparse_tensors(
         batch_idx,
         head_idx,
@@ -264,97 +286,189 @@ def produce_block_sparse_loads(
         blocksparse_tensors,
         seqlen_info,
     )
+    has_diag = const_expr(curr_diag_block_idx is not None)
 
-    mask_empty = curr_mask_block_cnt == 0
-    full_empty = curr_full_block_cnt == 0
+    load_kwargs = dict(
+        load_K=load_K,
+        load_V=load_V,
+        pipeline_k=pipeline_k,
+        pipeline_v=pipeline_v,
+        intra_wg_overlap=intra_wg_overlap,
+    )
+    bridge_kwargs = dict(load_K=load_K, load_V=load_V, pipeline_k=pipeline_k, pipeline_v=pipeline_v)
 
-    if mask_empty:
+    if const_expr(not intra_wg_overlap):
         kv_producer_state = load_block_list(
-            curr_full_block_idx,
-            curr_full_block_cnt,
-            first_block_preloaded=False,
-            kv_producer_state=kv_producer_state,
-            load_K=load_K,
-            load_V=load_V,
-            pipeline_k=pipeline_k,
-            pipeline_v=pipeline_v,
-            intra_wg_overlap=intra_wg_overlap,
+            curr_mask_block_idx, curr_mask_block_cnt, False, kv_producer_state, **load_kwargs
         )
-
-        if const_expr(intra_wg_overlap) and curr_full_block_cnt > 0:
-            kv_producer_state = finish_overlap_v_load(
-                curr_full_block_idx,
-                curr_full_block_cnt,
-                load_V,
-                pipeline_v,
-                kv_producer_state,
+        kv_producer_state = load_block_list(
+            curr_full_block_idx, curr_full_block_cnt, False, kv_producer_state, **load_kwargs
+        )
+        if const_expr(has_diag):
+            kv_producer_state = load_block_list(
+                curr_diag_block_idx, curr_diag_block_cnt, False, kv_producer_state, **load_kwargs
             )
     else:
+        mask_empty = curr_mask_block_cnt == 0
+        full_empty = curr_full_block_cnt == 0
+
         kv_producer_state = load_block_list(
-            curr_mask_block_idx,
-            curr_mask_block_cnt,
-            first_block_preloaded=False,
-            kv_producer_state=kv_producer_state,
-            load_K=load_K,
-            load_V=load_V,
-            pipeline_k=pipeline_k,
-            pipeline_v=pipeline_v,
-            intra_wg_overlap=intra_wg_overlap,
+            curr_mask_block_idx, curr_mask_block_cnt, False, kv_producer_state, **load_kwargs
         )
-
-        if full_empty:
-            if const_expr(intra_wg_overlap):
-                kv_producer_state = finish_overlap_v_load(
+        if not full_empty:
+            if not mask_empty:
+                kv_producer_state = _bridge_block_lists(
                     curr_mask_block_idx,
-                    curr_mask_block_cnt,
-                    load_V,
-                    pipeline_v,
+                    curr_full_block_idx,
+                    curr_full_block_cnt,
                     kv_producer_state,
+                    **bridge_kwargs,
                 )
-        else:
-            if const_expr(intra_wg_overlap):
-                n_block_mask_last = curr_mask_block_idx[0]
-                n_block_full_first = curr_full_block_idx[curr_full_block_cnt - 1]
-                kv_producer_state_prev = kv_producer_state.clone()
-                kv_producer_state.advance()
-                pipeline_k.producer_acquire(kv_producer_state)
-                load_K(src_idx=n_block_full_first, producer_state=kv_producer_state)
-                pipeline_v.producer_acquire(kv_producer_state_prev)
-                load_V(src_idx=n_block_mask_last, producer_state=kv_producer_state_prev)
-
                 kv_producer_state = load_block_list(
-                    curr_full_block_idx,
-                    curr_full_block_cnt,
-                    first_block_preloaded=True,
-                    kv_producer_state=kv_producer_state,
-                    load_K=load_K,
-                    load_V=load_V,
-                    pipeline_k=pipeline_k,
-                    pipeline_v=pipeline_v,
-                    intra_wg_overlap=intra_wg_overlap,
-                )
-
-                kv_producer_state = finish_overlap_v_load(
-                    curr_full_block_idx,
-                    curr_full_block_cnt,
-                    load_V,
-                    pipeline_v,
-                    kv_producer_state,
+                    curr_full_block_idx, curr_full_block_cnt, True, kv_producer_state, **load_kwargs
                 )
             else:
                 kv_producer_state = load_block_list(
                     curr_full_block_idx,
                     curr_full_block_cnt,
-                    first_block_preloaded=False,
-                    kv_producer_state=kv_producer_state,
-                    load_K=load_K,
-                    load_V=load_V,
-                    pipeline_k=pipeline_k,
-                    pipeline_v=pipeline_v,
-                    intra_wg_overlap=intra_wg_overlap,
+                    False,
+                    kv_producer_state,
+                    **load_kwargs,
+                )
+        if const_expr(has_diag):
+            diag_empty = curr_diag_block_cnt == 0
+            if not diag_empty:
+                if not full_empty:
+                    kv_producer_state = _bridge_block_lists(
+                        curr_full_block_idx,
+                        curr_diag_block_idx,
+                        curr_diag_block_cnt,
+                        kv_producer_state,
+                        **bridge_kwargs,
+                    )
+                    kv_producer_state = load_block_list(
+                        curr_diag_block_idx,
+                        curr_diag_block_cnt,
+                        True,
+                        kv_producer_state,
+                        **load_kwargs,
+                    )
+                elif not mask_empty:
+                    kv_producer_state = _bridge_block_lists(
+                        curr_mask_block_idx,
+                        curr_diag_block_idx,
+                        curr_diag_block_cnt,
+                        kv_producer_state,
+                        **bridge_kwargs,
+                    )
+                    kv_producer_state = load_block_list(
+                        curr_diag_block_idx,
+                        curr_diag_block_cnt,
+                        True,
+                        kv_producer_state,
+                        **load_kwargs,
+                    )
+                else:
+                    kv_producer_state = load_block_list(
+                        curr_diag_block_idx,
+                        curr_diag_block_cnt,
+                        False,
+                        kv_producer_state,
+                        **load_kwargs,
+                    )
+                kv_producer_state = finish_overlap_v_load(
+                    curr_diag_block_idx, curr_diag_block_cnt, load_V, pipeline_v, kv_producer_state
+                )
+            elif not full_empty:
+                kv_producer_state = finish_overlap_v_load(
+                    curr_full_block_idx, curr_full_block_cnt, load_V, pipeline_v, kv_producer_state
+                )
+            else:
+                kv_producer_state = finish_overlap_v_load(
+                    curr_mask_block_idx, curr_mask_block_cnt, load_V, pipeline_v, kv_producer_state
+                )
+        else:
+            if not full_empty:
+                kv_producer_state = finish_overlap_v_load(
+                    curr_full_block_idx, curr_full_block_cnt, load_V, pipeline_v, kv_producer_state
+                )
+            else:
+                kv_producer_state = finish_overlap_v_load(
+                    curr_mask_block_idx, curr_mask_block_cnt, load_V, pipeline_v, kv_producer_state
                 )
 
     return kv_producer_state
+
+
+@cute.jit
+def _consume_block_list(
+    block_idx: cute.Tensor,
+    block_cnt,
+    mask_fn_first,
+    mask_fn_rest,
+    seqlen_info,
+    kv_consumer_state,
+    mma_pv_fn,
+    mma_one_n_block,
+    process_first_half_block,
+    score_mod_fn,
+    O_should_accumulate,
+    intra_wg_overlap: cutlass.Constexpr,
+    first_list: cutlass.Constexpr[bool],
+    warp_scheduler_barrier_sync: Callable,
+):
+    n_block = block_idx[block_cnt - 1]
+    if const_expr(not intra_wg_overlap):
+        if const_expr(first_list):
+            warp_scheduler_barrier_sync()
+        kv_consumer_state = mma_one_n_block(
+            kv_consumer_state,
+            n_block=n_block,
+            mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+            mask_fn=mask_fn_first,
+            is_first_n_block=first_list,
+        )
+        O_should_accumulate = True
+        for i in cutlass.range(1, block_cnt):
+            n_block = block_idx[block_cnt - 1 - i]
+            kv_consumer_state = mma_one_n_block(
+                kv_consumer_state,
+                n_block=n_block,
+                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                mask_fn=mask_fn_rest,
+                is_first_n_block=False,
+            )
+            O_should_accumulate = True
+    else:
+        if const_expr(first_list):
+            kv_consumer_state = process_first_half_block(
+                n_block=n_block,
+                seqlen=seqlen_info,
+                kv_consumer_state=kv_consumer_state,
+                mask_fn=mask_fn_first,
+                score_mod_fn=score_mod_fn,
+                is_first_block=True,
+            )
+        else:
+            kv_consumer_state = mma_one_n_block(
+                kv_consumer_state,
+                n_block=n_block,
+                seqlen=seqlen_info,
+                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                mask_fn=mask_fn_first,
+            )
+            O_should_accumulate = True
+        for i in cutlass.range(1, block_cnt):
+            n_block = block_idx[block_cnt - 1 - i]
+            kv_consumer_state = mma_one_n_block(
+                kv_consumer_state,
+                n_block=n_block,
+                seqlen=seqlen_info,
+                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                mask_fn=mask_fn_rest,
+            )
+            O_should_accumulate = True
+    return kv_consumer_state, O_should_accumulate
 
 
 @cute.jit
@@ -379,6 +493,7 @@ def consume_block_sparse_loads(
     warp_scheduler_barrier_arrive: Callable,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    mask_block_union: cutlass.Constexpr[bool] = False,
 ):
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
@@ -387,8 +502,8 @@ def consume_block_sparse_loads(
         curr_mask_block_idx,
         curr_full_block_cnt,
         curr_full_block_idx,
-        _curr_diag_block_cnt,
-        _curr_diag_block_idx,
+        curr_diag_block_cnt,
+        curr_diag_block_idx,
     ) = get_curr_blocksparse_tensors(
         batch_idx,
         head_idx,
@@ -396,140 +511,102 @@ def consume_block_sparse_loads(
         blocksparse_tensors,
         seqlen_info,
     )
+    has_diag = const_expr(curr_diag_block_idx is not None)
+    total_cnt = curr_mask_block_cnt + curr_full_block_cnt
+    if const_expr(has_diag):
+        total_cnt = total_cnt + curr_diag_block_cnt
+    processed_any = total_cnt > 0
 
-    processed_any = curr_mask_block_cnt + curr_full_block_cnt > 0
+    if const_expr(mask_block_union):
+        mask_first = partial(mask_fn, mask_block_union=True, mask_seqlen=True)
+        mask_rest = partial(mask_fn, mask_block_union=True, mask_seqlen=False)
+    else:
+        mask_first = partial(
+            mask_fn,
+            mask_mod=mask_mod,
+            mask_seqlen=True,
+            fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
+        )
+        mask_rest = partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False)
+    full_first = partial(mask_fn, mask_mod=None, mask_seqlen=True)
+    full_rest = partial(mask_fn, mask_mod=None, mask_seqlen=False)
+    diag_first = partial(mask_fn, mask_mod=None, mask_diagonal=True, mask_seqlen=True)
+    diag_rest = partial(mask_fn, mask_mod=None, mask_diagonal=True, mask_seqlen=False)
+
+    common = dict(
+        seqlen_info=seqlen_info,
+        mma_pv_fn=mma_pv_fn,
+        mma_one_n_block=mma_one_n_block,
+        process_first_half_block=process_first_half_block,
+        score_mod_fn=score_mod_fn,
+        intra_wg_overlap=intra_wg_overlap,
+        warp_scheduler_barrier_sync=warp_scheduler_barrier_sync,
+    )
+
+    if curr_mask_block_cnt > 0:
+        kv_consumer_state, O_should_accumulate = _consume_block_list(
+            curr_mask_block_idx,
+            curr_mask_block_cnt,
+            mask_first,
+            mask_rest,
+            kv_consumer_state=kv_consumer_state,
+            O_should_accumulate=O_should_accumulate,
+            first_list=True,
+            **common,
+        )
+    if curr_full_block_cnt > 0:
+        if curr_mask_block_cnt == 0:
+            kv_consumer_state, O_should_accumulate = _consume_block_list(
+                curr_full_block_idx,
+                curr_full_block_cnt,
+                full_first,
+                full_rest,
+                kv_consumer_state=kv_consumer_state,
+                O_should_accumulate=O_should_accumulate,
+                first_list=True,
+                **common,
+            )
+        else:
+            kv_consumer_state, O_should_accumulate = _consume_block_list(
+                curr_full_block_idx,
+                curr_full_block_cnt,
+                full_first,
+                full_rest,
+                kv_consumer_state=kv_consumer_state,
+                O_should_accumulate=O_should_accumulate,
+                first_list=False,
+                **common,
+            )
+    if const_expr(has_diag):
+        if curr_diag_block_cnt > 0:
+            if curr_mask_block_cnt + curr_full_block_cnt == 0:
+                kv_consumer_state, O_should_accumulate = _consume_block_list(
+                    curr_diag_block_idx,
+                    curr_diag_block_cnt,
+                    diag_first,
+                    diag_rest,
+                    kv_consumer_state=kv_consumer_state,
+                    O_should_accumulate=O_should_accumulate,
+                    first_list=True,
+                    **common,
+                )
+            else:
+                kv_consumer_state, O_should_accumulate = _consume_block_list(
+                    curr_diag_block_idx,
+                    curr_diag_block_cnt,
+                    diag_first,
+                    diag_rest,
+                    kv_consumer_state=kv_consumer_state,
+                    O_should_accumulate=O_should_accumulate,
+                    first_list=False,
+                    **common,
+                )
 
     if const_expr(not intra_wg_overlap):
-        if curr_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
-            warp_scheduler_barrier_sync()
-            kv_consumer_state = mma_one_n_block(
-                kv_consumer_state,
-                n_block=mask_n_block,
-                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                mask_fn=partial(
-                    mask_fn,
-                    mask_mod=mask_mod,
-                    mask_seqlen=True,
-                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
-                ),
-                is_first_n_block=True,
-            )
-            O_should_accumulate = True
-            for i in cutlass.range(1, curr_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=mask_n_block,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
-                    is_first_n_block=False,
-                )
-                O_should_accumulate = True
-            if curr_full_block_cnt == 0:
-                warp_scheduler_barrier_arrive()
-
-        if curr_full_block_cnt > 0:
-            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
-            if curr_mask_block_cnt == 0:
-                warp_scheduler_barrier_sync()
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=full_n_block,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_seqlen=True),
-                    is_first_n_block=True,
-                )
-                O_should_accumulate = True
-                for i in cutlass.range(1, curr_full_block_cnt):
-                    full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
-                    kv_consumer_state = mma_one_n_block(
-                        kv_consumer_state,
-                        n_block=full_n_block,
-                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                        mask_fn=partial(mask_fn, mask_seqlen=False),
-                        is_first_n_block=False,
-                    )
-                    O_should_accumulate = True
-            else:
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=full_n_block,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
-                    is_first_n_block=False,
-                )
-                O_should_accumulate = True
-                for i in cutlass.range(1, curr_full_block_cnt):
-                    full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
-                    kv_consumer_state = mma_one_n_block(
-                        kv_consumer_state,
-                        n_block=full_n_block,
-                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                        mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
-                        is_first_n_block=False,
-                    )
-                    O_should_accumulate = True
+        if processed_any:
             warp_scheduler_barrier_arrive()
     else:
-        if curr_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
-            kv_consumer_state = process_first_half_block(
-                n_block=mask_n_block,
-                seqlen=seqlen_info,
-                kv_consumer_state=kv_consumer_state,
-                mask_fn=partial(
-                    mask_fn,
-                    mask_mod=mask_mod,
-                    mask_seqlen=True,
-                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
-                ),
-                score_mod_fn=score_mod_fn,
-                is_first_block=True,
-            )
-            for i in cutlass.range(1, curr_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=mask_n_block,
-                    seqlen=seqlen_info,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
-                )
-                O_should_accumulate = True
-
-        if curr_full_block_cnt > 0:
-            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
-            if curr_mask_block_cnt == 0:
-                kv_consumer_state = process_first_half_block(
-                    n_block=full_n_block,
-                    seqlen=seqlen_info,
-                    kv_consumer_state=kv_consumer_state,
-                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
-                    score_mod_fn=score_mod_fn,
-                    is_first_block=True,
-                )
-            else:
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=full_n_block,
-                    seqlen=seqlen_info,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
-                )
-                O_should_accumulate = True
-            for i in cutlass.range(1, curr_full_block_cnt):
-                full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=full_n_block,
-                    seqlen=seqlen_info,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
-                )
-                O_should_accumulate = True
-
-        if curr_mask_block_cnt + curr_full_block_cnt > 0:
+        if processed_any:
             kv_consumer_state = process_last_half_block(
                 kv_consumer_state=kv_consumer_state,
                 zero_init=not O_should_accumulate,
@@ -1312,67 +1389,64 @@ def produce_block_sparse_q_loads_bwd_sm90(
     subtile_factor: cutlass.Constexpr,
     m_block_max: int,
 ):
-    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
-
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
-    else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+    (
+        curr_q_cnt,
+        curr_q_idx,
+        curr_full_cnt,
+        curr_full_idx,
+        curr_diag_cnt,
+        curr_diag_idx,
+        _total,
+    ) = get_block_sparse_iteration_info_bwd(
+        blocksparse_tensors, batch_idx, head_idx, n_block, subtile_factor, m_block_max
+    )
 
     kv_loaded = False
+    load_args = (
+        pipeline_Q,
+        pipeline_dO,
+        load_K,
+        load_V,
+        load_Q,
+        load_dO,
+        load_LSE,
+        load_dPsum,
+        tma_copy_bytes_K,
+        tma_copy_bytes_V,
+        Q_stage_eq_dO_stage,
+    )
 
     for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
-        sparse_idx = iter_idx // subtile_factor
-        subtile_offset = iter_idx % subtile_factor
-        m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
-
+        m_block = (
+            curr_q_idx[iter_idx // subtile_factor] * subtile_factor + iter_idx % subtile_factor
+        )
         if m_block < m_block_max:
             producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
-                m_block,
-                producer_state_Q,
-                producer_state_dO,
-                pipeline_Q,
-                pipeline_dO,
-                load_K,
-                load_V,
-                load_Q,
-                load_dO,
-                load_LSE,
-                load_dPsum,
-                tma_copy_bytes_K,
-                tma_copy_bytes_V,
-                Q_stage_eq_dO_stage,
-                load_kv=not kv_loaded,
+                m_block, producer_state_Q, producer_state_dO, *load_args, load_kv=not kv_loaded
             )
             kv_loaded = True
 
-    if const_expr(full_cnt is not None):
+    if const_expr(curr_full_idx is not None):
         for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
-            sparse_idx = iter_idx // subtile_factor
-            subtile_offset = iter_idx % subtile_factor
-            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
-
+            m_block = (
+                curr_full_idx[iter_idx // subtile_factor] * subtile_factor
+                + iter_idx % subtile_factor
+            )
             if m_block < m_block_max:
                 producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
-                    m_block,
-                    producer_state_Q,
-                    producer_state_dO,
-                    pipeline_Q,
-                    pipeline_dO,
-                    load_K,
-                    load_V,
-                    load_Q,
-                    load_dO,
-                    load_LSE,
-                    load_dPsum,
-                    tma_copy_bytes_K,
-                    tma_copy_bytes_V,
-                    Q_stage_eq_dO_stage,
-                    load_kv=not kv_loaded,
+                    m_block, producer_state_Q, producer_state_dO, *load_args, load_kv=not kv_loaded
+                )
+                kv_loaded = True
+
+    if const_expr(curr_diag_idx is not None):
+        for iter_idx in cutlass.range(curr_diag_cnt * subtile_factor, unroll=1):
+            m_block = (
+                curr_diag_idx[iter_idx // subtile_factor] * subtile_factor
+                + iter_idx % subtile_factor
+            )
+            if m_block < m_block_max:
+                producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
+                    m_block, producer_state_Q, producer_state_dO, *load_args, load_kv=not kv_loaded
                 )
                 kv_loaded = True
 
@@ -1400,34 +1474,26 @@ def consume_block_sparse_mma_bwd_sm90(
     aux_tensors=None,
     fastdiv_mods=(None, None),
 ):
-    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
+    (
+        curr_q_cnt,
+        curr_q_idx,
+        curr_full_cnt,
+        curr_full_idx,
+        curr_diag_cnt,
+        curr_diag_idx,
+        _total,
+    ) = get_block_sparse_iteration_info_bwd(
+        blocksparse_tensors, batch_idx, head_idx, n_block, subtile_factor, m_block_max
+    )
 
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
-    else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+    mask_block_union = const_expr(
+        blocksparse_tensors.valid_block_upper is not None
+        and blocksparse_tensors.valid_block_lower is not None
+    )
 
     dKV_accumulate = False
 
-    mask_fn_partial = partial(
-        mask.apply_mask,
-        batch_idx=batch_idx,
-        head_idx=head_idx,
-        n_block=n_block,
-        thr_mma=thr_mma_SdP,
-        mask_seqlen=True,
-        mask_causal=is_causal,
-        mask_local=is_local,
-        mask_mod=mask_mod,
-        aux_tensors=aux_tensors,
-        fastdiv_mods=fastdiv_mods,
-    )
-
-    mask_fn_full = partial(
+    mask_fn_base = partial(
         mask.apply_mask,
         batch_idx=batch_idx,
         head_idx=head_idx,
@@ -1439,12 +1505,23 @@ def consume_block_sparse_mma_bwd_sm90(
         aux_tensors=aux_tensors,
         fastdiv_mods=fastdiv_mods,
     )
+    if const_expr(mask_block_union):
+        mask_fn_partial = partial(
+            mask_fn_base,
+            mask_block_union=True,
+            valid_block_upper=blocksparse_tensors.valid_block_upper,
+            valid_block_lower=blocksparse_tensors.valid_block_lower,
+            q_subtile_factor=subtile_factor,
+        )
+    else:
+        mask_fn_partial = partial(mask_fn_base, mask_mod=mask_mod)
+    mask_fn_full = mask_fn_base
+    mask_fn_diag = partial(mask_fn_base, mask_diagonal=True)
 
     for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
-        sparse_idx = iter_idx // subtile_factor
-        subtile_offset = iter_idx % subtile_factor
-        m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
-
+        m_block = (
+            curr_q_idx[iter_idx // subtile_factor] * subtile_factor + iter_idx % subtile_factor
+        )
         if m_block < m_block_max:
             consumer_state_Q, consumer_state_dO = mma_one_m_block_fn(
                 m_block,
@@ -1457,18 +1534,36 @@ def consume_block_sparse_mma_bwd_sm90(
             )
             dKV_accumulate = True
 
-    if const_expr(full_cnt is not None):
+    if const_expr(curr_full_idx is not None):
         for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
-            sparse_idx = iter_idx // subtile_factor
-            subtile_offset = iter_idx % subtile_factor
-            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
-
+            m_block = (
+                curr_full_idx[iter_idx // subtile_factor] * subtile_factor
+                + iter_idx % subtile_factor
+            )
             if m_block < m_block_max:
                 consumer_state_Q, consumer_state_dO = mma_one_m_block_fn(
                     m_block,
                     consumer_state_Q,
                     consumer_state_dO,
                     mask_fn=mask_fn_full,
+                    score_mod_fn=score_mod_fn,
+                    score_mod_bwd_fn=score_mod_bwd_fn,
+                    dKV_accumulate=dKV_accumulate,
+                )
+                dKV_accumulate = True
+
+    if const_expr(curr_diag_idx is not None):
+        for iter_idx in cutlass.range(curr_diag_cnt * subtile_factor, unroll=1):
+            m_block = (
+                curr_diag_idx[iter_idx // subtile_factor] * subtile_factor
+                + iter_idx % subtile_factor
+            )
+            if m_block < m_block_max:
+                consumer_state_Q, consumer_state_dO = mma_one_m_block_fn(
+                    m_block,
+                    consumer_state_Q,
+                    consumer_state_dO,
+                    mask_fn=mask_fn_diag,
                     score_mod_fn=score_mod_fn,
                     score_mod_bwd_fn=score_mod_bwd_fn,
                     dKV_accumulate=dKV_accumulate,
@@ -1521,44 +1616,47 @@ def dQaccum_store_block_sparse_bwd_sm90(
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
 ):
-    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
+    (
+        curr_q_cnt,
+        curr_q_idx,
+        curr_full_cnt,
+        curr_full_idx,
+        curr_diag_cnt,
+        curr_diag_idx,
+        _total,
+    ) = get_block_sparse_iteration_info_bwd(
+        blocksparse_tensors, batch_idx, head_idx, n_block, subtile_factor, m_block_max
+    )
 
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
-    else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+    store_args = (
+        sdQaccum,
+        gdQaccum,
+        num_dQ_warp_groups,
+        num_threads_per_warp_group,
+        tma_copy_bytes_dQ,
+    )
 
     for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
-        sparse_idx = iter_idx // subtile_factor
-        subtile_offset = iter_idx % subtile_factor
-        m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
-
+        m_block = (
+            curr_q_idx[iter_idx // subtile_factor] * subtile_factor + iter_idx % subtile_factor
+        )
         if m_block < m_block_max:
-            _store_one_dQaccum_sm90(
-                m_block,
-                sdQaccum,
-                gdQaccum,
-                num_dQ_warp_groups,
-                num_threads_per_warp_group,
-                tma_copy_bytes_dQ,
-            )
+            _store_one_dQaccum_sm90(m_block, *store_args)
 
-    if const_expr(full_cnt is not None):
+    if const_expr(curr_full_idx is not None):
         for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
-            sparse_idx = iter_idx // subtile_factor
-            subtile_offset = iter_idx % subtile_factor
-            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
-
+            m_block = (
+                curr_full_idx[iter_idx // subtile_factor] * subtile_factor
+                + iter_idx % subtile_factor
+            )
             if m_block < m_block_max:
-                _store_one_dQaccum_sm90(
-                    m_block,
-                    sdQaccum,
-                    gdQaccum,
-                    num_dQ_warp_groups,
-                    num_threads_per_warp_group,
-                    tma_copy_bytes_dQ,
-                )
+                _store_one_dQaccum_sm90(m_block, *store_args)
+
+    if const_expr(curr_diag_idx is not None):
+        for iter_idx in cutlass.range(curr_diag_cnt * subtile_factor, unroll=1):
+            m_block = (
+                curr_diag_idx[iter_idx // subtile_factor] * subtile_factor
+                + iter_idx % subtile_factor
+            )
+            if m_block < m_block_max:
+                _store_one_dQaccum_sm90(m_block, *store_args)

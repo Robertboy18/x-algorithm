@@ -99,14 +99,27 @@ object UnderTheHoodCommon {
   def latestAsOfPostLabelRows(
     rows: TypedPipe[UthDailyPostLabel],
     reducers: Int
-  ): TypedPipe[UthDailyPostLabel] =
-    applyReducers(
-      rows.groupBy(r => (r.userId, r.authoredYyyymmdd, r.label)),
+  ): TypedPipe[UthDailyPostLabel] = {
+    def asOf(r: UthDailyPostLabel): Int = r.asOfYyyymmdd.getOrElse(Int.MinValue)
+    val isTakedown = (r: UthDailyPostLabel) =>
+      r.label.exists(TakedownLabels.parseLabel(_).isDefined)
+
+    val safety = applyReducers(
+      rows.filterNot(isTakedown).groupBy(r => (r.userId, r.authoredYyyymmdd, r.label)),
       reducers
-    ).reduce { (a, b) =>
-      if (a.asOfYyyymmdd.getOrElse(Int.MinValue) >= b.asOfYyyymmdd.getOrElse(Int.MinValue)) a
-      else b
-    }.values
+    ).reduce { (a, b) => if (asOf(a) >= asOf(b)) a else b }.values
+
+    val takedown = applyReducers(
+      rows.filter(isTakedown).groupBy(r => (r.userId, r.authoredYyyymmdd)),
+      reducers
+    ).toList.values
+      .flatMap { group =>
+        val freshest = group.map(asOf).max
+        group.filter(asOf(_) == freshest).groupBy(_.label).values.map(_.head)
+      }.filter(_.carried.exists(_ > 0))
+
+    safety ++ takedown
+  }
 
   def parseUserIds(args: Args): Set[Long] = {
     val raw = args.list("userIds").flatMap(_.split(",")).map(_.trim).filter(_.nonEmpty)

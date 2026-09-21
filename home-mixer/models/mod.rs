@@ -1,6 +1,7 @@
 pub mod brand_safety;
 pub mod candidate;
 pub mod candidate_features;
+pub mod content_features;
 pub mod engagement_signals;
 
 pub mod in_network_reply;

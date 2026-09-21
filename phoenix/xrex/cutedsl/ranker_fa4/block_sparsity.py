@@ -55,6 +55,8 @@ class BlockSparseTensors(NamedTuple):
     diag_block_cnt: cute.Tensor | None = None
     diag_block_idx: cute.Tensor | None = None
     dq_write_order_diag: cute.Tensor | None = None
+    valid_block_upper: cute.Tensor | None = None
+    valid_block_lower: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -82,6 +84,8 @@ class BlockSparseTensorsTorch(NamedTuple):
     diag_block_cnt: torch.Tensor | None = None
     diag_block_idx: torch.Tensor | None = None
     dq_write_order_diag: torch.Tensor | None = None
+    valid_block_upper: torch.Tensor | None = None
+    valid_block_lower: torch.Tensor | None = None
 
 
 def _ordered_to_dense_simple(
@@ -454,6 +458,27 @@ def normalize_block_sparse_tensors(
         hint,
         mask_cnt.device,
     )
+    metadata_block_shape = expected_count_shape
+    valid_block_upper = _check_and_expand_metadata_tensor(
+        "valid_block_upper",
+        tensors.valid_block_upper,
+        metadata_block_shape,
+        context,
+        hint,
+        mask_cnt.device,
+    )
+    valid_block_lower = _check_and_expand_metadata_tensor(
+        "valid_block_lower",
+        tensors.valid_block_lower,
+        metadata_block_shape,
+        context,
+        hint,
+        mask_cnt.device,
+    )
+    if (valid_block_upper is None) != (valid_block_lower is None):
+        raise ValueError(
+            "valid_block_upper and valid_block_lower must both be provided or both be None"
+        )
     spt = tensors.spt
     if spt is not None and not isinstance(spt, bool):
         raise ValueError("spt must be a bool when provided")
@@ -474,6 +499,8 @@ def normalize_block_sparse_tensors(
         diag_block_cnt=diag_cnt,
         diag_block_idx=diag_idx,
         dq_write_order_diag=dq_write_order_diag,
+        valid_block_upper=valid_block_upper,
+        valid_block_lower=valid_block_lower,
     )
 
 
@@ -501,6 +528,8 @@ def get_block_sparse_broadcast_pattern(
         tensors.diag_block_cnt,
         tensors.diag_block_idx,
         tensors.dq_write_order_diag,
+        tensors.valid_block_upper,
+        tensors.valid_block_lower,
     ):
         if tensor is not None:
             patterns.append(get_broadcast_dims(tensor))
@@ -658,6 +687,12 @@ def to_cute_block_sparse_tensors(
         if tensors.dq_write_order_diag is not None
         else None
     )
+    valid_block_upper_tensor, valid_block_lower_tensor = [
+        to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
+        if t is not None
+        else None
+        for t in (tensors.valid_block_upper, tensors.valid_block_lower)
+    ]
 
     return BlockSparseTensors(
         mask_block_cnt_tensor,
@@ -671,6 +706,8 @@ def to_cute_block_sparse_tensors(
         diag_block_cnt_tensor,
         diag_block_idx_tensor,
         dq_write_order_diag_tensor,
+        valid_block_upper_tensor,
+        valid_block_lower_tensor,
     )
 
 

@@ -70,7 +70,7 @@ GCS_CREDENTIALS_DIR: str = os.environ.get("XREX_GCS_CREDENTIALS_DIR", ".credenti
 GCS_MIRROR_BUCKET: str = os.environ.get("XREX_GCS_MIRROR_BUCKET", "")
 GCS_MIRROR_PREFIX: str = os.environ.get("GCS_PREFIX", "")
 
-ADS_S3_ENV_PREFIX: str = os.environ.get("XREX_ADS_S3_ENV_PREFIX", "")
+O2_ENV_PREFIX: str = os.environ.get("XREX_O2_ENV_PREFIX", "")
 
 PHOENIX_INDEX_BASE: str = os.environ.get("PHOENIX_INDEX_BASE", "phoenix_index")
 

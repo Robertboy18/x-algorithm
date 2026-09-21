@@ -5,7 +5,7 @@ from cachetools import TTLCache
 from grox.core.data_loaders.data_types import Post
 from grox.core.schedules.types import TaskContext
 from grox.core.tasks.task_rate_limit import TaskTTLDedupeWithPost
-from grox.flows.ptos.constants import SAFETY_PTOS_DELUXE
+from grox.flows.ptos.constants import DELUXE_TIER_TASK_TYPES
 
 
 class TaskRateLimitSafetyPtosAnnotationWithPost(TaskTTLDedupeWithPost):
@@ -15,7 +15,7 @@ class TaskRateLimitSafetyPtosAnnotationWithPost(TaskTTLDedupeWithPost):
     @override
     @classmethod
     async def _eligible_with_post(cls, post: Post, ctx: TaskContext) -> bool:
-        is_deluxe = ctx.payload.task_type == SAFETY_PTOS_DELUXE
+        is_deluxe = ctx.payload.task_type in DELUXE_TIER_TASK_TYPES
         cache = (
             cls.POST_CACHE_FOR_SAFETY_PTOS_DELUXE
             if is_deluxe
@@ -23,6 +23,18 @@ class TaskRateLimitSafetyPtosAnnotationWithPost(TaskTTLDedupeWithPost):
         )
         name = "safety ptos deluxe" if is_deluxe else "safety ptos"
         return cls._dedupe(post.id, cache, name)
+
+
+class TaskRateLimitSafetyPtosAdultContentLeadingFrames(TaskTTLDedupeWithPost):
+    DEDUPE_CACHE = TTLCache(maxsize=10_000, ttl=60)
+    DEDUPE_NAME = "safety ptos adult content leading frames"
+
+
+class TaskRateLimitSafetyPtosMediaInjectedAdultInfraredVideoSpamDetection(
+    TaskTTLDedupeWithPost
+):
+    DEDUPE_CACHE = TTLCache(maxsize=10_000, ttl=60)
+    DEDUPE_NAME = "safety ptos media injected adult infrared video spam detection"
 
 
 class TaskRateLimitSafetyPtosRealtimeWithSignals(TaskTTLDedupeWithPost):

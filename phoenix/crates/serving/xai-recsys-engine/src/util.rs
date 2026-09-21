@@ -11,7 +11,8 @@ use xai_recsys::{
     model_config::ModelConfig,
     util::{
         InputBuffer, PRODUCT_SURFACE_CATEGORICAL_IDX, compute_user_ip_hashes, parse_ipv4_to_u32,
-        stamp_i32_as_categorical, stamp_local_time_features,
+        record_sid_coverage, stamp_i32_as_categorical, stamp_local_time_features,
+        stamp_semantic_ids,
     },
 };
 use xai_recsys_proto as pb;
@@ -63,6 +64,8 @@ impl RetrievalInputBuffer {
         let mut history_impr_ts = vec![0i32; history_seq_len];
         let mut history_tz_enums = vec![0i16; history_seq_len];
         let mut history_post_ids = vec![0i64; history_seq_len];
+        let sid_num_levels = model_config.sid_num_levels;
+        let mut history_semantic_ids = vec![0u16; history_seq_len * sid_num_levels];
 
         let user_id = match sequence {
             Some(sequence) => sequence.user_id as i64,
@@ -118,6 +121,12 @@ impl RetrievalInputBuffer {
                 }
 
                 history_post_ids[valid_entry_count] = tweet_id;
+                stamp_semantic_ids(
+                    &mut history_semantic_ids,
+                    valid_entry_count,
+                    sid_num_levels,
+                    &tweet_info.semantic_ids,
+                );
 
                 let base_idx = valid_entry_count * output_vocab_size;
                 let continuous_base_idx = valid_entry_count * num_continuous_actions;
@@ -173,6 +182,13 @@ impl RetrievalInputBuffer {
             }
         }
 
+        if sid_num_levels > 0 {
+            let present = (0..valid_entry_count)
+                .filter(|&i| history_semantic_ids[i * sid_num_levels] != 0)
+                .count() as u64;
+            record_sid_coverage("history", present, valid_entry_count as u64);
+        }
+
         let n_post_cat = model_config.hash_table.num_post_categorical_features;
         let n_post_bool = model_config.hash_table.num_post_bool_features;
         let n_post_float = model_config.hash_table.num_post_float_features;
@@ -216,7 +232,7 @@ impl RetrievalInputBuffer {
             history_float_features: vec![0.0f32; history_seq_len * n_post_float],
             history_int64_features: vec![0i64; history_seq_len * n_post_int64],
             history_post_ids,
-            history_semantic_ids: vec![0u16; history_seq_len * model_config.sid_num_levels],
+            history_semantic_ids,
         }
     }
 
@@ -256,6 +272,8 @@ impl RetrievalInputBuffer {
         let mut history_impr_ts = vec![0i32; history_seq_len];
         let mut history_tz_enums = vec![0i16; history_seq_len];
         let mut history_post_ids = vec![0i64; history_seq_len];
+        let sid_num_levels = model_config.sid_num_levels;
+        let mut history_semantic_ids = vec![0u16; history_seq_len * sid_num_levels];
 
         let cursor = Cursor::new(columnar_bytes);
         let mut reader = StreamReader::try_new(cursor, None)?;
@@ -291,7 +309,7 @@ impl RetrievalInputBuffer {
                     history_float_features: vec![0.0f32; history_seq_len * n_post_float],
                     history_int64_features: vec![0i64; history_seq_len * n_post_int64],
                     history_post_ids: vec![0i64; history_seq_len],
-                    history_semantic_ids: vec![0u16; history_seq_len * model_config.sid_num_levels],
+                    history_semantic_ids,
                 });
             }
         };
@@ -315,6 +333,7 @@ impl RetrievalInputBuffer {
         let col_timezone_id = batch
             .column_by_name("timezoneId")
             .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+        let col_semantic_id = batch.column_by_name("semanticId");
 
         let start_row = num_rows.saturating_sub(history_seq_len);
         let mut valid_entry_count = 0;
@@ -341,6 +360,20 @@ impl RetrievalInputBuffer {
             }
 
             history_post_ids[valid_entry_count] = tweet_id;
+            if let Some(sid_col) = col_semantic_id {
+                let fsl = sid_col.as_fixed_size_list();
+                if !fsl.is_null(row_idx) {
+                    let inner = fsl.value(row_idx);
+                    if let Some(codes) = inner.as_any().downcast_ref::<Int32Array>() {
+                        stamp_semantic_ids(
+                            &mut history_semantic_ids,
+                            valid_entry_count,
+                            sid_num_levels,
+                            codes.values(),
+                        );
+                    }
+                }
+            }
 
             if let Some(ps) = product_surfaces {
                 history_product_surfaces[valid_entry_count] = ps.value(row_idx);
@@ -379,6 +412,13 @@ impl RetrievalInputBuffer {
             }
 
             valid_entry_count += 1;
+        }
+
+        if sid_num_levels > 0 {
+            let present = (0..valid_entry_count)
+                .filter(|&i| history_semantic_ids[i * sid_num_levels] != 0)
+                .count() as u64;
+            record_sid_coverage("history", present, valid_entry_count as u64);
         }
 
         let n_post_cat = model_config.hash_table.num_post_categorical_features;
@@ -424,7 +464,7 @@ impl RetrievalInputBuffer {
             history_float_features: vec![0.0f32; history_seq_len * n_post_float],
             history_int64_features: vec![0i64; history_seq_len * n_post_int64],
             history_post_ids,
-            history_semantic_ids: vec![0u16; history_seq_len * model_config.sid_num_levels],
+            history_semantic_ids,
         })
     }
 }
@@ -434,6 +474,7 @@ pub struct PredictRequestItem {
     pub return_logprob: bool,
     pub top_logprobs_num: u32,
     pub return_log_map: bool,
+    pub return_logits_list: bool,
     pub requested_action_indices: Vec<u32>,
     pub requested_continuous_action_indices: Vec<u32>,
     pub return_candidate_tweet_id_only: bool,
@@ -452,6 +493,7 @@ impl Default for PredictRequestItem {
             return_logprob: false,
             top_logprobs_num: 0,
             return_log_map: false,
+            return_logits_list: false,
             requested_action_indices: Vec::new(),
             requested_continuous_action_indices: Vec::new(),
             return_candidate_tweet_id_only: false,
@@ -479,4 +521,81 @@ pub struct RetrieveRequestItem {
     pub eligible_posts_bloom_filter: Vec<u8>,
     pub mm_query_embeddings: Option<Vec<half::f16>>,
     pub mm_query_seed_post_ids: Option<Vec<u64>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sid_test_config() -> ModelConfig {
+        let mut mc = ModelConfig::from_params(
+            8,
+            vec![1],
+            vec![0],
+            1009,
+            8,
+            0,
+            vec![1],
+            vec![0],
+            1009,
+            8,
+            vec![1],
+            vec![0],
+            1009,
+            4,
+            2,
+            4,
+            1,
+            0,
+            0,
+            0,
+            vec![],
+            vec![],
+            1009,
+            0,
+            7,
+            0,
+            4,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            false,
+        );
+        mc.sid_num_levels = 3;
+        mc
+    }
+
+    #[test]
+    fn proto_history_semantic_ids_are_read_from_tweet_info() {
+        let sequence = Some(pb::UserActionSequence {
+            user_actions_data: Some(pb::UserActionSequenceDataContainer {
+                data: Some(
+                    pb::user_action_sequence_data_container::Data::OrderedAggregatedUserActionsList(
+                        pb::AggregatedUserActionList {
+                            aggregated_user_actions: vec![pb::AggregatedUserAction {
+                                tweet_info: Some(pb::TweetInfo {
+                                    tweet_id: 11,
+                                    author_id: 21,
+                                    semantic_ids: vec![0, 7, -1],
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            }),
+            ..Default::default()
+        });
+        let buf =
+            RetrievalInputBuffer::compute_for_item(&sid_test_config(), &sequence, "", None, None);
+        assert_eq!(
+            buf.history_semantic_ids,
+            vec![1, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
 }

@@ -2,6 +2,7 @@
 pub enum Decision {
     Skip(String),
     Act(Vec<ActionSpec>),
+    ActRequestedActions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

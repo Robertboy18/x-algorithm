@@ -206,8 +206,8 @@ class CutedslRankerAttention(CustomAttention):
         from xrex.utils.gpu import GpuArch, gpu_arch
 
         arch = gpu_arch()
-        assert arch in (GpuArch.GB200, GpuArch.GB300), (
-            f"CuTeDSL FA4 requires GB200 or GB300 (got {arch})"
+        assert arch in (GpuArch.A100, GpuArch.H100, GpuArch.GB200, GpuArch.GB300), (
+            f"CuTeDSL ranker attention requires A100, H100, GB200 or GB300 (got {arch})"
         )
         config = self.config
         sm_scale = self.scale_config.attn_output_scale(self.config.key_size)
@@ -218,11 +218,25 @@ class CutedslRankerAttention(CustomAttention):
         )
 
         def sharded_mha(q, k, v, segment_ids, segment_ids_k, temp):
-            del segment_ids, segment_ids_k, temp
-            batch_size, seq_len, num_q_heads, _ = q.shape
+            del segment_ids_k, temp
+            _, seq_len, num_q_heads, _ = q.shape
             hist_len = config.num_user_prefix_tokens + config.history_seq_len
-            bs_layout = build_dense_block_sparse_layout(batch_size, seq_len, hist_len, num_q_heads)
-            return ranker_attention_fa4(q, k, v, sm_scale, bs_layout), None
+            hist_valid_len = jnp.sum(segment_ids[:, :hist_len] == 1, axis=-1, dtype=jnp.int32)
+            fwd_bs, bwd_bs, valid_upper, valid_lower = build_dense_block_sparse_layout(
+                seq_len, hist_len, num_q_heads, hist_valid_len
+            )
+            return (
+                ranker_attention_fa4(
+                    q,
+                    k,
+                    v,
+                    sm_scale,
+                    (fwd_bs, bwd_bs),
+                    valid_block_upper=valid_upper,
+                    valid_block_lower=valid_lower,
+                ),
+                None,
+            )
 
         return sharded_mha, ()
 
@@ -239,8 +253,8 @@ class CutedslRankerVarlenAttention(CustomAttention):
         from xrex.utils.gpu import GpuArch, gpu_arch
 
         arch = gpu_arch()
-        assert arch in (GpuArch.GB200, GpuArch.GB300), (
-            f"CuTeDSL FA4 requires GB200 or GB300 (got {arch})"
+        assert arch in (GpuArch.H100, GpuArch.GB200, GpuArch.GB300), (
+            f"CuTeDSL ranker varlen attention requires H100, GB200 or GB300 (got {arch})"
         )
         sm_scale = self.scale_config.attn_output_scale(self.config.key_size)
 
@@ -265,6 +279,8 @@ class CutedslRankerVarlenAttention(CustomAttention):
             bsp_bwd_full_idx,
             bsp_bwd_diag_cnt,
             bsp_bwd_diag_idx,
+            bsp_valid_block_upper,
+            bsp_valid_block_lower,
         ):
             del segment_ids, segment_ids_k, temp
             fwd_bs = (
@@ -290,6 +306,8 @@ class CutedslRankerVarlenAttention(CustomAttention):
                     v,
                     sm_scale,
                     block_sparse_layout=(fwd_bs, bwd_bs),
+                    valid_block_upper=bsp_valid_block_upper,
+                    valid_block_lower=bsp_valid_block_lower,
                 ),
                 None,
             )
@@ -310,6 +328,8 @@ class CutedslRankerVarlenAttention(CustomAttention):
             "bsp_bwd_full_idx",
             "bsp_bwd_diag_cnt",
             "bsp_bwd_diag_idx",
+            "bsp_valid_block_upper",
+            "bsp_valid_block_lower",
         )
         extras = tuple((name, _rep) for name in bsp_names)
         return sharded_mha, extras

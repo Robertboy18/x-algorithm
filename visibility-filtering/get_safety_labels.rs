@@ -58,18 +58,6 @@ impl GetSafetyLabelsEndpoint {
             metrics::record_lookup_failures(kind, count);
         }
 
-        tracing::info!(
-            requested_count = outcome.requested_count(),
-            success_count = outcome.success_count(),
-            failure_count = failed_count,
-            manhattan_fetch_failure_count = outcome.failures[FailureKind::ManhattanFetch],
-            manhattan_decode_failure_count = outcome.failures[FailureKind::ManhattanDecode],
-            other_failure_count = outcome.failures[FailureKind::Other],
-            is_partial = outcome.is_partial_failure(),
-            is_full_failure = outcome.is_full_failure(),
-            "GetSafetyLabels lookup complete"
-        );
-
         Ok(Response::new(vf_pb::GetSafetyLabelsResponse {
             results: outcome.results,
             failed_ids: outcome.failed_ids,
@@ -87,7 +75,7 @@ pub(crate) struct GetSafetyLabelsOutcome {
 
 impl GetSafetyLabelsOutcome {
     pub(crate) fn try_from_resolved(
-        resolved: HashMap<u64, Result<vf_pb::SafetyLabelMap, LookupError>>,
+        resolved: HashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, LookupError>>,
         requested_count: usize,
     ) -> Result<Self, Status> {
         let mut results = HashMap::with_capacity(resolved.len());
@@ -97,7 +85,7 @@ impl GetSafetyLabelsOutcome {
         for (id, lookup_result) in resolved {
             match lookup_result {
                 Ok(label_map) => {
-                    results.insert(id, label_map);
+                    results.insert(id, Arc::unwrap_or_clone(label_map));
                 }
                 Err(e) => {
                     failed_ids.push(id);
@@ -126,28 +114,12 @@ impl GetSafetyLabelsOutcome {
         Ok(result)
     }
 
-    pub(crate) fn requested_count(&self) -> usize {
-        self.requested_count
-    }
-
     pub(crate) fn success_count(&self) -> usize {
         self.results.len()
     }
 
     pub(crate) fn failure_count(&self) -> usize {
         self.failed_ids.len()
-    }
-
-    pub(crate) fn has_failures(&self) -> bool {
-        !self.failed_ids.is_empty()
-    }
-
-    pub(crate) fn is_partial_failure(&self) -> bool {
-        self.has_failures() && self.failure_count() < self.requested_count
-    }
-
-    pub(crate) fn is_full_failure(&self) -> bool {
-        self.has_failures() && self.failure_count() == self.requested_count
     }
 
     fn accounted_count(&self) -> usize {
@@ -182,28 +154,24 @@ mod tests {
     fn try_from_resolved_reports_all_success() {
         let outcome = GetSafetyLabelsOutcome::try_from_resolved(
             HashMap::from([
-                (1, Ok(labels_with_entry(11))),
-                (2, Ok(labels_with_entry(22))),
+                (1, Ok(Arc::new(labels_with_entry(11)))),
+                (2, Ok(Arc::new(labels_with_entry(22)))),
             ]),
             2,
         )
         .unwrap();
 
-        assert_eq!(outcome.requested_count(), 2);
         assert_eq!(outcome.success_count(), 2);
         assert_eq!(outcome.failure_count(), 0);
         assert!(outcome.failed_ids.is_empty());
         assert!(outcome.failures.values().all(|&c| c == 0));
-        assert!(!outcome.has_failures());
-        assert!(!outcome.is_partial_failure());
-        assert!(!outcome.is_full_failure());
     }
 
     #[test]
     fn try_from_resolved_reports_partial_failure() {
         let outcome = GetSafetyLabelsOutcome::try_from_resolved(
             HashMap::from([
-                (1, Ok(labels_with_entry(11))),
+                (1, Ok(Arc::new(labels_with_entry(11)))),
                 (
                     2,
                     Err(LookupError::new(FailureKind::ManhattanDecode, "decode")),
@@ -217,16 +185,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.requested_count(), 3);
         assert_eq!(outcome.success_count(), 1);
         assert_eq!(outcome.results.len(), 1);
         assert_eq!(outcome.failed_ids, vec![2, 3]);
         assert_eq!(outcome.failures[FailureKind::ManhattanFetch], 1);
         assert_eq!(outcome.failures[FailureKind::ManhattanDecode], 1);
-        assert_eq!(outcome.failures[FailureKind::Other], 0);
         assert_eq!(outcome.failure_count(), 2);
-        assert!(outcome.is_partial_failure());
-        assert!(!outcome.is_full_failure());
     }
 
     #[test]
@@ -246,22 +210,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.requested_count(), 2);
         assert_eq!(outcome.success_count(), 0);
         assert!(outcome.results.is_empty());
         assert_eq!(outcome.failed_ids, vec![4, 5]);
         assert_eq!(outcome.failures[FailureKind::ManhattanFetch], 2);
         assert_eq!(outcome.failures[FailureKind::ManhattanDecode], 0);
-        assert_eq!(outcome.failures[FailureKind::Other], 0);
         assert_eq!(outcome.failure_count(), 2);
-        assert!(!outcome.is_partial_failure());
-        assert!(outcome.is_full_failure());
     }
 
     #[test]
     fn try_from_resolved_rejects_missing_ids() {
         let status = GetSafetyLabelsOutcome::try_from_resolved(
-            HashMap::from([(7, Ok(labels_with_entry(22)))]),
+            HashMap::from([(7, Ok(Arc::new(labels_with_entry(22))))]),
             2,
         )
         .unwrap_err();

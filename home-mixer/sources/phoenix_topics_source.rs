@@ -73,6 +73,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixTopicsSource {
                 sequence.clone(),
                 query.columnar_retrieval_sequence.clone(),
                 max_results,
+                0,
                 topic_entity_ids,
                 Some(topic_filter_mode),
                 None,

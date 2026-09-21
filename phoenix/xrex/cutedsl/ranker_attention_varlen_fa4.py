@@ -33,12 +33,25 @@ def _build_packed_block_sparse(
     block_size=128,
     max_hist_blocks=None,
     num_blocks=None,
+    real_history_starts=None,
+    num_user_prefix_tokens=0,
 ):
-    assert all(h % block_size == 0 for h in hist_sizes), (
+    hist_sizes = np.asarray(hist_sizes, dtype=np.int32)
+    assert np.all(hist_sizes % block_size == 0), (
         f"hist_sizes must be multiples of block_size={block_size}, got {hist_sizes}"
     )
     assert transformer_candidate_seq_len % block_size == 0
-    h_blocks = [h // block_size for h in hist_sizes]
+    assert 0 <= num_user_prefix_tokens <= block_size
+    if real_history_starts is None:
+        real_history_starts = np.zeros_like(hist_sizes)
+        num_user_prefix_tokens = 0
+    else:
+        real_history_starts = np.asarray(real_history_starts, dtype=np.int32)
+        assert real_history_starts.shape == hist_sizes.shape
+        assert np.all(real_history_starts >= num_user_prefix_tokens)
+        assert np.all(real_history_starts <= hist_sizes)
+
+    h_blocks = (hist_sizes // block_size).tolist()
     cand_blocks_per_user = transformer_candidate_seq_len // block_size
     actual_num_blocks = sum(hb + cand_blocks_per_user for hb in h_blocks)
     if num_blocks is None:
@@ -48,21 +61,6 @@ def _build_packed_block_sparse(
             f"num_blocks={num_blocks} too small for hist_sizes (need {actual_num_blocks})"
         )
 
-    example_id_per_block = np.full(num_blocks, -1, dtype=np.int32)
-    is_cand_per_block = np.zeros(num_blocks, dtype=bool)
-    hist_block_start_per_user: list[int] = []
-    cand_block_start_per_user: list[int] = []
-    cur = 0
-    for i, hb in enumerate(h_blocks):
-        hist_block_start_per_user.append(cur)
-        example_id_per_block[cur : cur + hb] = i
-        cur += hb
-        cand_block_start_per_user.append(cur)
-        for j in range(cand_blocks_per_user):
-            example_id_per_block[cur + j] = i
-            is_cand_per_block[cur + j] = True
-        cur += cand_blocks_per_user
-
     actual_max_hist_blocks = max(h_blocks) if h_blocks else 1
     if max_hist_blocks is None:
         max_hist_blocks = actual_max_hist_blocks
@@ -70,58 +68,109 @@ def _build_packed_block_sparse(
         assert max_hist_blocks >= actual_max_hist_blocks, (
             f"max_hist_blocks={max_hist_blocks} too small (max h={actual_max_hist_blocks})"
         )
+    max_hist_blocks = max(max_hist_blocks, 1)
     max_q_per_n = max_hist_blocks + cand_blocks_per_user
 
-    fwd_mask_cnt = np.zeros((num_blocks,), dtype=np.int32)
-    fwd_mask_idx = np.zeros((num_blocks, 1), dtype=np.int32)
-    fwd_full_cnt = np.zeros((num_blocks,), dtype=np.int32)
-    fwd_full_idx = np.zeros((num_blocks, max_hist_blocks), dtype=np.int32)
-    fwd_diag_cnt = np.zeros((num_blocks,), dtype=np.int32)
-    fwd_diag_idx = np.zeros((num_blocks, 1), dtype=np.int32)
-    for m in range(num_blocks):
-        ex_id = int(example_id_per_block[m])
-        if ex_id < 0:
-            continue
-        hb = h_blocks[ex_id]
-        hstart = hist_block_start_per_user[ex_id]
-        fwd_full_cnt[m] = hb
-        for j in range(hb):
-            fwd_full_idx[m, j] = hstart + j
-        if is_cand_per_block[m]:
-            fwd_diag_cnt[m] = 1
-            fwd_diag_idx[m, 0] = m
+    valid_block_upper = np.zeros(num_blocks, dtype=np.int32)
+    valid_block_lower = np.full(num_blocks, block_size, dtype=np.int32)
+    is_partial_per_block = np.zeros(num_blocks, dtype=bool)
+    is_empty_per_block = np.ones(num_blocks, dtype=bool)
+    example_id_per_block = np.full(num_blocks, -1, dtype=np.int32)
+    is_cand_per_block = np.zeros(num_blocks, dtype=bool)
+    hist_block_start_per_user: list[int] = []
 
-    bwd_mask_cnt = np.zeros((num_blocks,), dtype=np.int32)
-    bwd_mask_idx = np.zeros((num_blocks, 1), dtype=np.int32)
-    bwd_full_cnt = np.zeros((num_blocks,), dtype=np.int32)
-    bwd_full_idx = np.zeros((num_blocks, max_q_per_n), dtype=np.int32)
-    bwd_diag_cnt = np.zeros((num_blocks,), dtype=np.int32)
-    bwd_diag_idx = np.zeros((num_blocks, 1), dtype=np.int32)
-    for n_blk in range(num_blocks):
-        ex_id = int(example_id_per_block[n_blk])
-        if ex_id < 0:
+    cur = 0
+    for user_idx, hb in enumerate(h_blocks):
+        hist_block_start_per_user.append(cur)
+        example_id_per_block[cur : cur + hb] = user_idx
+        real_start = int(real_history_starts[user_idx])
+        for local_block in range(hb):
+            physical_block = cur + local_block
+            tile_start = local_block * block_size
+            upper = int(np.clip(num_user_prefix_tokens - tile_start, 0, block_size))
+            lower = int(np.clip(real_start - tile_start, 0, block_size))
+            if upper >= lower:
+                upper = lower = 0
+                is_empty = False
+                is_partial = False
+            elif upper == 0 and lower == block_size:
+                is_empty = True
+                is_partial = False
+            else:
+                is_empty = False
+                is_partial = True
+            valid_block_upper[physical_block] = upper
+            valid_block_lower[physical_block] = lower
+            is_empty_per_block[physical_block] = is_empty
+            is_partial_per_block[physical_block] = is_partial
+        cur += hb
+
+        for j in range(cand_blocks_per_user):
+            physical_block = cur + j
+            example_id_per_block[physical_block] = user_idx
+            is_cand_per_block[physical_block] = True
+            is_empty_per_block[physical_block] = False
+            valid_block_upper[physical_block] = 0
+            valid_block_lower[physical_block] = 0
+        cur += cand_blocks_per_user
+
+    fwd_mask_cnt = np.zeros(num_blocks, dtype=np.int32)
+    fwd_mask_idx = np.zeros((num_blocks, max_hist_blocks), dtype=np.int32)
+    fwd_full_cnt = np.zeros(num_blocks, dtype=np.int32)
+    fwd_full_idx = np.zeros((num_blocks, max_hist_blocks), dtype=np.int32)
+    fwd_diag_cnt = np.zeros(num_blocks, dtype=np.int32)
+    fwd_diag_idx = np.zeros((num_blocks, 1), dtype=np.int32)
+
+    for m_block in range(num_blocks):
+        user_idx = int(example_id_per_block[m_block])
+        if user_idx < 0 or (not is_cand_per_block[m_block] and is_empty_per_block[m_block]):
             continue
-        if is_cand_per_block[n_blk]:
-            bwd_diag_cnt[n_blk] = 1
-            bwd_diag_idx[n_blk, 0] = n_blk
-        else:
-            hb = h_blocks[ex_id]
-            hstart = hist_block_start_per_user[ex_id]
-            cand_blk_start = cand_block_start_per_user[ex_id]
-            cnt = 0
-            for j in range(hb):
-                bwd_full_idx[n_blk, cnt] = hstart + j
-                cnt += 1
-            for j in range(cand_blocks_per_user):
-                bwd_full_idx[n_blk, cnt] = cand_blk_start + j
-                cnt += 1
-            bwd_full_cnt[n_blk] = cnt
+        hstart = hist_block_start_per_user[user_idx]
+        for n_block in range(hstart, hstart + h_blocks[user_idx]):
+            if is_empty_per_block[n_block]:
+                continue
+            is_mask_edge = is_partial_per_block[m_block] or is_partial_per_block[n_block]
+            if is_mask_edge:
+                idx = int(fwd_mask_cnt[m_block])
+                fwd_mask_idx[m_block, idx] = n_block
+                fwd_mask_cnt[m_block] += 1
+            else:
+                idx = int(fwd_full_cnt[m_block])
+                fwd_full_idx[m_block, idx] = n_block
+                fwd_full_cnt[m_block] += 1
+        if is_cand_per_block[m_block]:
+            fwd_diag_cnt[m_block] = 1
+            fwd_diag_idx[m_block, 0] = m_block
+
+    bwd_mask_lists: list[list[int]] = [[] for _ in range(num_blocks)]
+    bwd_full_lists: list[list[int]] = [[] for _ in range(num_blocks)]
+    bwd_diag_lists: list[list[int]] = [[] for _ in range(num_blocks)]
+    for m_block in range(num_blocks):
+        for i in range(int(fwd_mask_cnt[m_block])):
+            bwd_mask_lists[int(fwd_mask_idx[m_block, i])].append(m_block)
+        for i in range(int(fwd_full_cnt[m_block])):
+            bwd_full_lists[int(fwd_full_idx[m_block, i])].append(m_block)
+        for i in range(int(fwd_diag_cnt[m_block])):
+            bwd_diag_lists[int(fwd_diag_idx[m_block, i])].append(m_block)
+
+    bwd_mask_cnt = np.asarray([len(xs) for xs in bwd_mask_lists], dtype=np.int32)
+    bwd_mask_idx = np.zeros((num_blocks, max_q_per_n), dtype=np.int32)
+    bwd_full_cnt = np.asarray([len(xs) for xs in bwd_full_lists], dtype=np.int32)
+    bwd_full_idx = np.zeros((num_blocks, max_q_per_n), dtype=np.int32)
+    bwd_diag_cnt = np.asarray([len(xs) for xs in bwd_diag_lists], dtype=np.int32)
+    bwd_diag_idx = np.zeros((num_blocks, 1), dtype=np.int32)
+    for n_block in range(num_blocks):
+        bwd_mask_idx[n_block, : len(bwd_mask_lists[n_block])] = bwd_mask_lists[n_block]
+        bwd_full_idx[n_block, : len(bwd_full_lists[n_block])] = bwd_full_lists[n_block]
+        bwd_diag_idx[n_block, : len(bwd_diag_lists[n_block])] = bwd_diag_lists[n_block]
 
     return dict(
         total_seq_len=num_blocks * block_size,
         num_blocks=num_blocks,
         fwd=(fwd_mask_cnt, fwd_mask_idx, fwd_full_cnt, fwd_full_idx, fwd_diag_cnt, fwd_diag_idx),
         bwd=(bwd_mask_cnt, bwd_mask_idx, bwd_full_cnt, bwd_full_idx, bwd_diag_cnt, bwd_diag_idx),
+        valid_block_upper=valid_block_upper,
+        valid_block_lower=valid_block_lower,
     )
 
 
@@ -140,6 +189,8 @@ class BlockSparseLayout:
     bwd_full_idx: np.ndarray
     bwd_diag_cnt: np.ndarray
     bwd_diag_idx: np.ndarray
+    valid_block_upper: np.ndarray
+    valid_block_lower: np.ndarray
 
 
 def build_block_sparse_layout(
@@ -147,6 +198,8 @@ def build_block_sparse_layout(
     transformer_candidate_seq_len: int,
     max_history_seq_len: int,
     packed_seq_len: int | None = None,
+    padding_mask: np.ndarray | None = None,
+    num_user_prefix_tokens: int = 0,
 ) -> BlockSparseLayout:
     per_user_lens = np.diff(cu_seqlens, axis=-1)
     block_size = get_device_tuning_config().block_q
@@ -154,8 +207,15 @@ def build_block_sparse_layout(
     assert transformer_candidate_seq_len % block_size == 0, (
         "Candidate sequence length must be block-aligned"
     )
+    assert 0 <= num_user_prefix_tokens <= block_size
 
-    num_devices, _ = per_user_lens.shape
+    num_devices, bs_per_device = per_user_lens.shape
+    if padding_mask is not None:
+        padding_mask = np.asarray(padding_mask, dtype=np.bool_)
+        assert padding_mask.ndim == 2 and padding_mask.shape[0] == num_devices
+        if packed_seq_len is not None:
+            assert padding_mask.shape[1] == packed_seq_len
+
     if packed_seq_len is not None:
         assert packed_seq_len % block_size == 0, (
             f"packed_seq_len={packed_seq_len} must be a multiple of block_size={block_size}"
@@ -167,22 +227,48 @@ def build_block_sparse_layout(
         total_blocks_per_device = packed_seq_len // block_size
     else:
         total_blocks_per_device = int(per_user_lens[0].sum()) // block_size
-    max_hist_blocks = max_history_seq_len // block_size
+    max_hist_blocks = (max_history_seq_len + block_size - 1) // block_size
 
     fwd_arrays: list[list[np.ndarray]] = [[] for _ in range(6)]
     bwd_arrays: list[list[np.ndarray]] = [[] for _ in range(6)]
+    valid_upper_arrays: list[np.ndarray] = []
+    valid_lower_arrays: list[np.ndarray] = []
     for d in range(num_devices):
         hist_sizes = per_user_lens[d] - transformer_candidate_seq_len
+        if padding_mask is None:
+            real_history_starts = None
+        else:
+            real_history_starts = np.zeros(bs_per_device, dtype=np.int32)
+            for user_idx in range(bs_per_device):
+                seq_start = int(cu_seqlens[d, user_idx])
+                hist_size = int(hist_sizes[user_idx])
+                hist_valid = padding_mask[
+                    d,
+                    seq_start + num_user_prefix_tokens : seq_start + hist_size,
+                ]
+                valid_offsets = np.flatnonzero(hist_valid)
+                real_start = (
+                    num_user_prefix_tokens + int(valid_offsets[0])
+                    if valid_offsets.size
+                    else hist_size
+                )
+                assert np.all(hist_valid[: real_start - num_user_prefix_tokens] == 0)
+                assert np.all(hist_valid[real_start - num_user_prefix_tokens :] == 1)
+                real_history_starts[user_idx] = real_start
         info = _build_packed_block_sparse(
             hist_sizes,
             transformer_candidate_seq_len=transformer_candidate_seq_len,
             max_hist_blocks=max_hist_blocks,
             num_blocks=total_blocks_per_device,
+            real_history_starts=real_history_starts,
+            num_user_prefix_tokens=num_user_prefix_tokens,
         )
         for i, arr in enumerate(info["fwd"]):
             fwd_arrays[i].append(arr)
         for i, arr in enumerate(info["bwd"]):
             bwd_arrays[i].append(arr)
+        valid_upper_arrays.append(info["valid_block_upper"])
+        valid_lower_arrays.append(info["valid_block_lower"])
 
     fwd = [np.stack(arrs, axis=0) for arrs in fwd_arrays]
     bwd = [np.stack(arrs, axis=0) for arrs in bwd_arrays]
@@ -199,23 +285,33 @@ def build_block_sparse_layout(
         bwd_full_idx=bwd[3],
         bwd_diag_cnt=bwd[4],
         bwd_diag_idx=bwd[5],
+        valid_block_upper=np.stack(valid_upper_arrays, axis=0),
+        valid_block_lower=np.stack(valid_lower_arrays, axis=0),
     )
 
 
 _FA4_PACKED_CACHE = {}
 
 
-def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
+def ranker_attention_varlen_fa4(
+    q,
+    k,
+    v,
+    sm_scale,
+    block_sparse_layout,
+    valid_block_upper=None,
+    valid_block_lower=None,
+):
     import cuda.bindings.driver as cuda_driver
     import cutlass
     import cutlass.cute as cute
     from cutlass.jax import cutlass_call
 
+    from xrex.cutedsl.ranker_attention_fa4 import cutedsl_arch
     from xrex.cutedsl.ranker_fa4.block_sparsity import BlockSparseTensors
     from xrex.cutedsl.ranker_fa4.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-    from xrex.cutedsl.ranker_fa4.flash_bwd_sm100 import FlashAttentionBackwardSm100
-    from xrex.cutedsl.ranker_fa4.flash_fwd_sm100 import FlashAttentionForwardSm100
 
+    arch = cutedsl_arch()
     batch_size, packed_S, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[2]
     qpk = num_q_heads // num_kv_heads
@@ -223,10 +319,22 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
     hdr = ((head_dim + 31) // 32) * 32
     sr_q = ((packed_S + block_size - 1) // block_size) * block_size
     sr_k = sr_q
-    dKV_postprocess = True
+    if arch == 90:
+        bwd_tile_m = 64
+        dKV_postprocess = qpk > 1
+    else:
+        bwd_tile_m = block_size
+        dKV_postprocess = True
     use_pack_gqa = qpk > 1 and (block_size % qpk == 0)
 
     fwd_bs, _ = block_sparse_layout
+    if valid_block_upper is None or valid_block_lower is None:
+        if valid_block_upper is not None or valid_block_lower is not None:
+            raise ValueError("valid_block_upper and valid_block_lower must be provided together")
+        valid_block_upper = jnp.zeros(fwd_bs[2].shape, dtype=jnp.int32)
+        valid_block_lower = jnp.zeros(fwd_bs[2].shape, dtype=jnp.int32)
+    valid_block_upper = jnp.broadcast_to(valid_block_upper, fwd_bs[2].shape)
+    valid_block_lower = jnp.broadcast_to(valid_block_lower, fwd_bs[2].shape)
     bs_max_hist_blocks = int(fwd_bs[3].shape[-1])
     bs_num_blocks = int(fwd_bs[3].shape[-2])
 
@@ -241,6 +349,7 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
 
     cache_key = (
         "packed",
+        arch,
         head_dim,
         num_q_heads,
         num_kv_heads,
@@ -252,17 +361,40 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
     )
 
     if cache_key not in _FA4_PACKED_CACHE:
-        fa_fwd = FlashAttentionForwardSm100(
-            head_dim=head_dim,
-            head_dim_v=head_dim,
-            qhead_per_kvhead=qpk,
-            is_causal=False,
-            is_local=False,
-            pack_gqa=use_pack_gqa,
-            is_persistent=True,
-            mask_mod=None,
-            q_stage=1,
-        )
+        if arch == 90:
+            from xrex.cutedsl.ranker_fa4.flash_fwd_sm90 import FlashAttentionForwardSm90
+
+            fa_fwd = FlashAttentionForwardSm90(
+                cutlass.BFloat16,
+                head_dim,
+                head_dim,
+                qpk,
+                is_causal=False,
+                is_local=False,
+                pack_gqa=use_pack_gqa,
+                tile_m=block_size,
+                tile_n=block_size,
+                num_stages=2,
+                num_threads=384,
+                Q_in_regs=False,
+                intra_wg_overlap=True,
+                mma_pv_is_rs=True,
+                mask_mod=None,
+            )
+        else:
+            from xrex.cutedsl.ranker_fa4.flash_fwd_sm100 import FlashAttentionForwardSm100
+
+            fa_fwd = FlashAttentionForwardSm100(
+                head_dim=head_dim,
+                head_dim_v=head_dim,
+                qhead_per_kvhead=qpk,
+                is_causal=False,
+                is_local=False,
+                pack_gqa=use_pack_gqa,
+                is_persistent=True,
+                mask_mod=None,
+                q_stage=1,
+            )
         q_shape = (batch_size, packed_S, num_q_heads, head_dim)
         k_shape = (batch_size, packed_S, num_kv_heads, head_dim)
         lse_shape = (batch_size, num_q_heads, packed_S)
@@ -279,6 +411,8 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
             mFullIdx,
             mDiagCnt,
             mDiagIdx,
+            mValidUpper,
+            mValidLower,
             mO,
             mLSE,
             softmax_scale: cutlass.Float32,
@@ -295,6 +429,8 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
                 diag_block_cnt=mDiagCnt,
                 diag_block_idx=mDiagIdx,
                 dq_write_order_diag=None,
+                valid_block_upper=mValidUpper,
+                valid_block_lower=mValidLower,
             )
             fa_fwd(
                 mQ,
@@ -303,18 +439,8 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
                 mO,
                 mLSE,
                 softmax_scale,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                bs,
-                None,
-                stream,
+                blocksparse_tensors=bs,
+                stream=stream,
             )
 
         fwd_call = cutlass_call(
@@ -327,162 +453,120 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
             softmax_scale=cutlass.Float32(sm_scale),
         )
 
-        fa_bwd = FlashAttentionBackwardSm100(
-            head_dim=head_dim,
-            head_dim_v=head_dim,
-            qhead_per_kvhead=qpk,
-            is_causal=False,
-            is_local=False,
-            mask_mod=None,
-        )
+        if arch == 90:
+            from xrex.cutedsl.ranker_fa4.flash_bwd_sm90 import FlashAttentionBackwardSm90
+
+            bwd_atom_layout_dkv = 2
+            fa_bwd = FlashAttentionBackwardSm90(
+                cutlass.BFloat16,
+                head_dim,
+                head_dim,
+                qpk,
+                False,
+                is_local=False,
+                deterministic=False,
+                tile_m=bwd_tile_m,
+                tile_n=block_size,
+                Q_stage=2,
+                dO_stage=2,
+                PdS_stage=2,
+                SdP_swapAB=True,
+                dKV_swapAB=False,
+                dQ_swapAB=False,
+                AtomLayoutMSdP=1,
+                AtomLayoutNdKV=bwd_atom_layout_dkv,
+                AtomLayoutMdQ=1,
+                num_threads=384,
+                mask_mod=None,
+                subtile_factor=block_size // bwd_tile_m,
+            )
+            post_threads = 256
+        else:
+            from xrex.cutedsl.ranker_fa4.flash_bwd_sm100 import FlashAttentionBackwardSm100
+
+            bwd_atom_layout_dkv = 1
+            fa_bwd = FlashAttentionBackwardSm100(
+                head_dim=head_dim,
+                head_dim_v=head_dim,
+                qhead_per_kvhead=qpk,
+                is_causal=False,
+                is_local=False,
+                mask_mod=None,
+            )
+            post_threads = 128
         dq_accum_shape = (batch_size, num_q_heads, sr_q * hdr)
         dk_accum_shape = (batch_size, num_kv_heads, sr_k * hdr)
+        dkv_out = jax.ShapeDtypeStruct(
+            dk_accum_shape if dKV_postprocess else k_shape,
+            jnp.float32 if dKV_postprocess else jnp.bfloat16,
+        )
 
-        if dKV_postprocess:
-
-            @cute.jit
-            def launch_bwd(
-                stream: cuda_driver.CUstream,
+        @cute.jit
+        def launch_bwd(
+            stream: cuda_driver.CUstream,
+            mQ,
+            mK,
+            mV,
+            mdO,
+            mLSE,
+            mdPsum,
+            mMaskCnt,
+            mMaskIdx,
+            mFullCnt,
+            mFullIdx,
+            mDiagCnt,
+            mDiagIdx,
+            mValidUpper,
+            mValidLower,
+            mdQa,
+            mdKa,
+            mdVa,
+            softmax_scale: cutlass.Float32,
+        ):
+            bs = BlockSparseTensors(
+                mask_block_cnt=mMaskCnt,
+                mask_block_idx=mMaskIdx,
+                full_block_cnt=mFullCnt,
+                full_block_idx=mFullIdx,
+                cu_total_m_blocks=None,
+                cu_block_idx_offsets=None,
+                dq_write_order=None,
+                dq_write_order_full=None,
+                diag_block_cnt=mDiagCnt,
+                diag_block_idx=mDiagIdx,
+                dq_write_order_diag=None,
+                valid_block_upper=mValidUpper,
+                valid_block_lower=mValidLower,
+            )
+            fa_bwd(
                 mQ,
                 mK,
                 mV,
                 mdO,
                 mLSE,
                 mdPsum,
-                mMaskCnt,
-                mMaskIdx,
-                mFullCnt,
-                mFullIdx,
-                mDiagCnt,
-                mDiagIdx,
                 mdQa,
                 mdKa,
                 mdVa,
-                softmax_scale: cutlass.Float32,
-            ):
-                bs = BlockSparseTensors(
-                    mask_block_cnt=mMaskCnt,
-                    mask_block_idx=mMaskIdx,
-                    full_block_cnt=mFullCnt,
-                    full_block_idx=mFullIdx,
-                    cu_total_m_blocks=None,
-                    cu_block_idx_offsets=None,
-                    dq_write_order=None,
-                    dq_write_order_full=None,
-                    diag_block_cnt=mDiagCnt,
-                    diag_block_idx=mDiagIdx,
-                    dq_write_order_diag=None,
-                )
-                fa_bwd(
-                    mQ,
-                    mK,
-                    mV,
-                    mdO,
-                    mLSE,
-                    mdPsum,
-                    mdQa,
-                    mdKa,
-                    mdVa,
-                    softmax_scale,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    bs,
-                    stream,
-                )
-
-            bwd_call = cutlass_call(
-                launch_bwd,
-                output_shape_dtype=[
-                    jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32),
-                    jax.ShapeDtypeStruct(dk_accum_shape, jnp.float32),
-                    jax.ShapeDtypeStruct(dk_accum_shape, jnp.float32),
-                ],
-                input_output_aliases={12: 0, 13: 1, 14: 2},
-                use_static_tensors=False,
-                softmax_scale=cutlass.Float32(sm_scale),
+                softmax_scale,
+                blocksparse_tensors=bs,
+                stream=stream,
             )
-        else:
 
-            @cute.jit
-            def launch_bwd(
-                stream: cuda_driver.CUstream,
-                mQ,
-                mK,
-                mV,
-                mdO,
-                mLSE,
-                mdPsum,
-                mMaskCnt,
-                mMaskIdx,
-                mFullCnt,
-                mFullIdx,
-                mDiagCnt,
-                mDiagIdx,
-                mdQa,
-                mdK,
-                mdV,
-                softmax_scale: cutlass.Float32,
-            ):
-                bs = BlockSparseTensors(
-                    mask_block_cnt=mMaskCnt,
-                    mask_block_idx=mMaskIdx,
-                    full_block_cnt=mFullCnt,
-                    full_block_idx=mFullIdx,
-                    cu_total_m_blocks=None,
-                    cu_block_idx_offsets=None,
-                    dq_write_order=None,
-                    dq_write_order_full=None,
-                    diag_block_cnt=mDiagCnt,
-                    diag_block_idx=mDiagIdx,
-                    dq_write_order_diag=None,
-                )
-                fa_bwd(
-                    mQ,
-                    mK,
-                    mV,
-                    mdO,
-                    mLSE,
-                    mdPsum,
-                    mdQa,
-                    mdK,
-                    mdV,
-                    softmax_scale,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    bs,
-                    stream,
-                )
-
-            bwd_call = cutlass_call(
-                launch_bwd,
-                output_shape_dtype=[
-                    jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32),
-                    jax.ShapeDtypeStruct(k_shape, jnp.float32),
-                    jax.ShapeDtypeStruct(k_shape, jnp.float32),
-                ],
-                input_output_aliases={12: 0},
-                use_static_tensors=False,
-                softmax_scale=cutlass.Float32(sm_scale),
-            )
+        bwd_call = cutlass_call(
+            launch_bwd,
+            output_shape_dtype=[
+                jax.ShapeDtypeStruct(dq_accum_shape, jnp.float32),
+                dkv_out,
+                dkv_out,
+            ],
+            input_output_aliases={14: 0, 15: 1, 16: 2},
+            use_static_tensors=False,
+            softmax_scale=cutlass.Float32(sm_scale),
+        )
 
         fa_post_dq = FlashAttentionBackwardPostprocess(
-            cutlass.BFloat16, head_dim, 100, tile_m=block_size, num_threads=128
+            cutlass.BFloat16, head_dim, arch, tile_m=bwd_tile_m, num_threads=post_threads
         )
 
         @cute.jit
@@ -499,7 +583,12 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
         post_dk_call = post_dv_call = None
         if dKV_postprocess:
             fa_post_dk = FlashAttentionBackwardPostprocess(
-                cutlass.BFloat16, head_dim, 100, tile_m=block_size, num_threads=128
+                cutlass.BFloat16,
+                head_dim,
+                arch,
+                tile_m=block_size,
+                num_threads=post_threads,
+                AtomLayoutMdQ=bwd_atom_layout_dkv,
             )
 
             @cute.jit
@@ -514,7 +603,12 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
             )
 
             fa_post_dv = FlashAttentionBackwardPostprocess(
-                cutlass.BFloat16, head_dim, 100, tile_m=block_size, num_threads=128
+                cutlass.BFloat16,
+                head_dim,
+                arch,
+                tile_m=block_size,
+                num_threads=post_threads,
+                AtomLayoutMdQ=bwd_atom_layout_dkv,
             )
 
             @cute.jit
@@ -536,7 +630,8 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
             post_dv_call=post_dv_call,
             dKV_postprocess=dKV_postprocess,
             dq_accum_shape=dq_accum_shape,
-            dk_accum_shape=dk_accum_shape,
+            dkv_shape=dkv_out.shape,
+            dkv_dtype=dkv_out.dtype,
             sr_q=sr_q,
             hdr=hdr,
         )
@@ -547,19 +642,22 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
     @jax.custom_vjp
     def _attention(q, k, v, *bs_args):
         fbs = bs_args[:6]
-        out, _lse = c["fwd_call"](q, k, v, *fbs)
+        valid_bounds = bs_args[12:]
+        out, _lse = c["fwd_call"](q, k, v, *fbs, *valid_bounds)
         return out
 
     def _attention_fwd(q, k, v, *bs_args):
         fbs = bs_args[:6]
-        out, lse = c["fwd_call"](q, k, v, *fbs)
-        out = checkpoint_name(out, "attn_outputs")
-        lse = checkpoint_name(lse, "attn_outputs")
+        valid_bounds = bs_args[12:]
+        out, lse = c["fwd_call"](q, k, v, *fbs, *valid_bounds)
+        out = checkpoint_name(out, "cutedsl_attn_outputs")
+        lse = checkpoint_name(lse, "cutedsl_attn_outputs")
         return out, (q, k, v, out, lse, bs_args)
 
     def _attention_bwd(res, g):
         q, k, v, out, lse, bs_args = res
-        bbs = bs_args[6:]
+        bbs = bs_args[6:12]
+        valid_bounds = bs_args[12:]
         dpsum = jnp.sum(out.astype(jnp.float32) * g.astype(jnp.float32), axis=-1).transpose(0, 2, 1)
         if dpsum.shape[-1] < c["sr_q"]:
             dpsum = jnp.pad(dpsum, ((0, 0), (0, 0), (0, c["sr_q"] - dpsum.shape[-1])))
@@ -568,41 +666,35 @@ def ranker_attention_varlen_fa4(q, k, v, sm_scale, block_sparse_layout):
             lse_log2 = jnp.pad(lse_log2, ((0, 0), (0, 0), (0, c["sr_q"] - lse_log2.shape[-1])))
 
         dq_accum_init = jnp.zeros(c["dq_accum_shape"], dtype=jnp.float32)
-
+        dk_init = jnp.zeros(c["dkv_shape"], dtype=c["dkv_dtype"])
+        dv_init = jnp.zeros_like(dk_init)
+        dq_accum, dk, dv = c["bwd_call"](
+            q,
+            k,
+            v,
+            g,
+            lse_log2,
+            dpsum,
+            *bbs,
+            *valid_bounds,
+            dq_accum_init,
+            dk_init,
+            dv_init,
+        )
+        (dq,) = c["post_dq_call"](dq_accum)
         if c["dKV_postprocess"]:
-            dk_accum_init = jnp.zeros(c["dk_accum_shape"], dtype=jnp.float32)
-            dv_accum_init = jnp.zeros_like(dk_accum_init)
-            dq_accum, dk_accum, dv_accum = c["bwd_call"](
-                q,
-                k,
-                v,
-                g,
-                lse_log2,
-                dpsum,
-                *bbs,
-                dq_accum_init,
-                dk_accum_init,
-                dv_accum_init,
-            )
-            (dq,) = c["post_dq_call"](dq_accum)
-            (dk,) = c["post_dk_call"](dk_accum)
-            (dv,) = c["post_dv_call"](dv_accum)
-        else:
-            dq_accum, dk_f32, dv_f32 = c["bwd_call"](
-                q,
-                k,
-                v,
-                g,
-                lse_log2,
-                dpsum,
-                *bbs,
-                dq_accum_init,
-            )
-            (dq,) = c["post_dq_call"](dq_accum)
-            dk = dk_f32.astype(k.dtype)
-            dv = dv_f32.astype(v.dtype)
+            (dk,) = c["post_dk_call"](dk)
+            (dv,) = c["post_dv_call"](dv)
 
         return (dq, dk, dv) + (None,) * len(bs_args)
 
     _attention.defvjp(_attention_fwd, _attention_bwd)
-    return _attention(q, k, v, *fwd_bs, *bwd_bs)
+    return _attention(
+        q,
+        k,
+        v,
+        *fwd_bs,
+        *bwd_bs,
+        valid_block_upper,
+        valid_block_lower,
+    )

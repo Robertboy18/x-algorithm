@@ -11,18 +11,28 @@ production-scale recipe. Supply those parts for your own deployment.
 
 ## Optimizers and training step
 
-The dense-parameter optimizer in this export is **standard Optax AdamW**. The
-internal deployment uses a tuned RMS-normalized-Adam derivative in that
-optimizer slot. AdamW is the validated equivalent for the released recipes;
-every shipped config trains with it end to end.
+Two dense-parameter optimizer families ship in this export:
 
-Embedding tables use a separate sparse rowwise AdaGrad optimizer. At a high
+- **Muon** (`xrex/optimizers/recsys/muon.py`): the production home-ranker
+  recipe — consistent-RMS scaling with decoupled weight decay on the matrix
+  and embedding partitions. The flagship ranking configs and
+  `home_direct_packed_nano` select it (`optim="muon"`), so the nano trains
+  with the same dense-optimizer recipe production runs.
+- **Standard Optax AdamW**: the slot used by the remaining shipped configs
+  (two-tower retrieval, gen-recs, and the legacy ranking presets). The
+  internal deployment uses a tuned RMS-normalized-Adam derivative in that
+  slot; AdamW is the validated equivalent for those released recipes, and
+  every config on that slot trains with it end to end.
+
+Embedding tables use a separate sparse rowwise AdaGrad optimizer; the ranking
+flagship recipe (and the nano) additionally runs it with accumulator
+half-life decay, lazy per-row decay, and decoupled weight decay. At a high
 level, each step:
 
 1. looks up and deduplicates the embedding rows used by the batch;
 2. computes the loss and gradients for dense parameters and embeddings;
-3. applies AdamW to dense parameters and rowwise AdaGrad to the referenced
-   embedding rows; and
+3. applies the config's dense optimizer to dense parameters and rowwise
+   AdaGrad to the referenced embedding rows; and
 4. skips updates when gradients are non-finite.
 
 The runnable reference implementation is

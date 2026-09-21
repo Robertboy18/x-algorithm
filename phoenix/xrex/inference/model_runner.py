@@ -76,6 +76,7 @@ from xrex.train.trainer_recsys import (
 )
 from xrex.utils import ocdbt
 from xrex.utils.aot import JittedOrCompiled
+from xrex.utils.gpu import schedulable_cpus
 from xrex.utils.log_timer import Timer
 from xrex.utils.profiler import start_trace, stop_trace
 from xrex.utils.utils import get_peak_bytes_in_use
@@ -120,9 +121,12 @@ MAX_INFLIGHT_COPY_PORT_PROBES = 4
 
 
 def _resolve_copy_url_to_http(copy_url: str) -> str:
+    scheme = "http"
+    if "://" in copy_url:
+        scheme, copy_url = copy_url.split("://", 1)
     name, port = copy_url.split(":")
     addr_info = socket.getaddrinfo(name, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
-    return ",".join(f"http://{x[4][0]}:{port}" for x in addr_info)
+    return ",".join(f"{scheme}://{x[4][0]}:{port}" for x in addr_info)
 
 
 _SHM_WEIGHTS_PATH = "/dev/shm/model_weights.bin"
@@ -160,6 +164,29 @@ def _process_start_time_epoch() -> float | None:
             return None
         return btime + starttime_ticks / clk_tck
     except (OSError, ValueError, IndexError):
+        return None
+
+
+_malloc_trim_fn: Any = None
+
+
+def _glibc_malloc_trim() -> tuple[bool, float] | None:
+    global _malloc_trim_fn
+    if _malloc_trim_fn is False:
+        return None
+    try:
+        if _malloc_trim_fn is None:
+            import ctypes
+
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            _malloc_trim_fn = libc.malloc_trim
+            _malloc_trim_fn.argtypes = [ctypes.c_size_t]
+            _malloc_trim_fn.restype = ctypes.c_int
+        t0 = time.time()
+        released = _malloc_trim_fn(0)
+        return bool(released), time.time() - t0
+    except Exception:
+        _malloc_trim_fn = False
         return None
 
 
@@ -475,8 +502,6 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     readiness_port: int | None = None
     max_inflight_requests: int = 4096
 
-    sid_endpoint: str | None = None
-
     channel_size: int = 2048
     enqueue_timeout_ms: int = 1000
     queue_max_staleness_ms: int = 1200
@@ -489,7 +514,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     _service_timer: Timer | None = field(default=None, init=False)
     use_pipelining: bool = True
     embedding_gather_threads: int = 16
-    use_pinned_d2h: bool = False
+    use_pinned_d2h: bool = True
     pinned_d2h_num_buffers: int = 3
 
     log_rotate: bool = False
@@ -631,6 +656,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
 
     hotswap_stage_rate_limit_gbps: float | None = None
     hotswap_stage_chunk_mib: int = 32
+    hotswap_malloc_trim: bool = True
 
     _emb_table_slots: list[np.ndarray] = field(default_factory=list, init=False)
     _active_emb_slot: int = field(default=0, init=False)
@@ -638,6 +664,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     _host_state_slots: list[Any] = field(default_factory=list, init=False)
     _active_host_slot: int = field(default=0, init=False)
     _reload_requested: threading.Event = field(default_factory=threading.Event, init=False)
+    _hotswap_cycle_inflight: threading.Event = field(default_factory=threading.Event, init=False)
     _swap_ready: threading.Event = field(default_factory=threading.Event, init=False)
     _swap_complete: threading.Event = field(default_factory=threading.Event, init=False)
     _hotswap_stop: threading.Event = field(default_factory=threading.Event, init=False)
@@ -859,17 +886,19 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                     self.h2d_states[rid] = self.h2d_states[rid]._replace(emb_table=slot0)
                 del old_heap_emb
 
+            t_slot1 = time.time()
             slot1 = create_memmap_emb_table(
                 "/dev/shm/emb_table_standby.dat",
                 emb_table_shape,
                 self.model_config.embedding_dtype,
-                prefault=False,
+                prefault=True,
             )
-            self._standby_emb_prefaulted = False
+            self._standby_emb_prefaulted = True
             logger.info(
-                "[hotswap] Standby emb_table created sparsely (%.2f GiB); page "
-                "prefault deferred to the coordinator thread",
+                "[hotswap] Standby emb_table created and prefaulted (%.2f GiB) "
+                "in %.1fs, before readiness",
                 slot1.nbytes / (1 << 30),
+                time.time() - t_slot1,
             )
         else:
             logger.info(
@@ -1493,6 +1522,24 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         pe_key = "post_embeddings.embeddings"
         self._spawn_loader_subprocess(emb_table_shape, pe_key)
 
+    def _hotswap_cycle_busy(self) -> bool:
+        return (
+            self._reload_requested.is_set()
+            or self._hotswap_cycle_inflight.is_set()
+            or self._swap_ready.is_set()
+            or self._live_swap_ready.is_set()
+        )
+
+    def _reset_server_reload_request(self) -> None:
+        server = self._server_for_hotswap
+        reset = getattr(server, "reset_reload_request", None) if server is not None else None
+        if reset is None:
+            return
+        try:
+            reset()
+        except Exception as e:
+            logger.warning("[hotswap] reset_reload_request failed: %s", e)
+
     def _abort_hotswap_cycle(self, stage: str, reason: str) -> None:
         logger.warning(
             "[hotswap] Reload cycle aborted at stage=%s (%s); keeping current "
@@ -1511,6 +1558,22 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         if self.is_multi_worker:
             self._write_reload_done()
         self._hotswap_aborted.set()
+        self._reset_server_reload_request()
+
+    def _malloc_trim_after_swap(self) -> None:
+        if not self.hotswap_malloc_trim:
+            return
+        result = _glibc_malloc_trim()
+        if result is None:
+            self.hotswap_malloc_trim = False
+            logger.warning("[hotswap] malloc_trim unavailable; per-cycle trim disabled")
+            return
+        released, secs = result
+        if self.metrics_publisher is not None:
+            self.metrics_publisher.checkpoint_reload_step_seconds.labels(
+                step="malloc_trim"
+            ).observe(secs)
+        logger.info("[hotswap] malloc_trim(0) released_any=%s in %.3fs", released, secs)
 
     def _coordinator_loop(self) -> None:
         logger.info("[hotswap] Coordinator thread started (subprocess loader).")
@@ -1535,97 +1598,105 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             if not triggered:
                 continue
 
-            self._reload_requested.clear()
-            logger.info("[hotswap] Coordinator: reload triggered, sending to subprocess.")
-            bg_start = time.time()
-
+            self._hotswap_cycle_inflight.set()
             try:
-                assert self._request_pipe is not None
-                assert self._result_pipe is not None
-                verify_in_subprocess = (
-                    self.checkpoint_config.verify_checksums and self._live_swap_enabled
-                )
-                self._request_pipe.send(
-                    (self.elapsed_samples, self._active_emb_slot, verify_in_subprocess)
-                )
-                result = self._result_pipe.recv()
-            except (BrokenPipeError, EOFError, OSError) as e:
-                self._abort_hotswap_cycle("subprocess_crash", f"subprocess pipe broken: {e}")
-                self._respawn_loader_subprocess()
-                continue
+                self._reload_requested.clear()
+                logger.info("[hotswap] Coordinator: reload triggered, sending to subprocess.")
+                bg_start = time.time()
 
-            bg_elapsed = time.time() - bg_start
-
-            if self.metrics_publisher is not None:
-                self.metrics_publisher.hotswap_background_load_seconds.observe(bg_elapsed)
-                self.metrics_publisher.checkpoint_reload_step_seconds.labels(
-                    step="hotswap_background_load"
-                ).observe(bg_elapsed)
-
-            if result[0] == "error":
-                error_msg = result[1]
-                if "no greater than old prefix" in error_msg:
-                    logger.info("[hotswap] Subprocess: no new checkpoint (%.2fs)", bg_elapsed)
-                    self._reload_noop.set()
-                    if self.is_multi_worker:
-                        self._write_reload_done()
-                    if self._hotswap_standby_meta_file is not None:
-                        self._publish_standby_metadata({"status": "noop"})
-                else:
-                    self._abort_hotswap_cycle(
-                        "background_load",
-                        f"subprocess download failed after {bg_elapsed:.2f}s: {error_msg}",
+                try:
+                    assert self._request_pipe is not None
+                    assert self._result_pipe is not None
+                    verify_in_subprocess = (
+                        self.checkpoint_config.verify_checksums and self._live_swap_enabled
                     )
-                    if self._hotswap_standby_meta_file is not None:
-                        self._publish_standby_metadata({"status": "error", "error": error_msg})
-                continue
+                    self._request_pipe.send(
+                        (self.elapsed_samples, self._active_emb_slot, verify_in_subprocess)
+                    )
+                    result = self._result_pipe.recv()
+                except (BrokenPipeError, EOFError, OSError) as e:
+                    self._abort_hotswap_cycle("subprocess_crash", f"subprocess pipe broken: {e}")
+                    self._respawn_loader_subprocess()
+                    continue
 
-            _, prefix, checksums, created_ts, emb_checksum, pe_checksum = result
-            self._pending_prefix = prefix
-            self._pending_checksums = checksums
-            self._pending_emb_checksum = emb_checksum
-            self._pending_pe_checksum = pe_checksum
-            self._pending_elapsed_samples = int(prefix.split("_")[2].split("/")[0])
-            self._pending_checkpoint_timestamp = created_ts if created_ts > 0 else time.time()
+                bg_elapsed = time.time() - bg_start
 
-            logger.info(
-                "[hotswap] Subprocess download complete (%.2fs), prefix=%s",
-                bg_elapsed,
-                prefix,
-            )
+                if self.metrics_publisher is not None:
+                    self.metrics_publisher.hotswap_background_load_seconds.observe(bg_elapsed)
+                    self.metrics_publisher.checkpoint_reload_step_seconds.labels(
+                        step="hotswap_background_load"
+                    ).observe(bg_elapsed)
 
-            if self._live_swap_enabled:
-                staged = self._stage_live_params()
-                if staged and self._live_pe_enabled:
-                    staged = self._stage_live_post_embeddings()
-                if staged:
-                    t_stage = time.time() - bg_start
-                    if self.metrics_publisher is not None:
-                        self.metrics_publisher.checkpoint_reload_step_seconds.labels(
-                            step="hotswap_live_stage"
-                        ).observe(t_stage)
-                    logger.info("[hotswap-live] Standby GPU state staged (%.2fs)", t_stage)
-                    self._live_swap_ready.set()
-                    self._swap_complete.wait()
-                    self._swap_complete.clear()
-                continue
+                if result[0] == "error":
+                    error_msg = result[1]
+                    if "no greater than old prefix" in error_msg:
+                        logger.info("[hotswap] Subprocess: no new checkpoint (%.2fs)", bg_elapsed)
+                        self._reload_noop.set()
+                        if self.is_multi_worker:
+                            self._write_reload_done()
+                        if self._hotswap_standby_meta_file is not None:
+                            self._publish_standby_metadata({"status": "noop"})
+                        self._reset_server_reload_request()
+                    else:
+                        self._abort_hotswap_cycle(
+                            "background_load",
+                            f"subprocess download failed after {bg_elapsed:.2f}s: {error_msg}",
+                        )
+                        if self._hotswap_standby_meta_file is not None:
+                            self._publish_standby_metadata({"status": "error", "error": error_msg})
+                    continue
 
-            if self._hotswap_standby_meta_file is not None:
-                self._publish_standby_metadata(
-                    {
-                        "status": "success",
-                        "prefix": prefix,
-                        "checksums": checksums,
-                        "emb_checksum": emb_checksum,
-                        "pe_checksum": pe_checksum,
-                        "created_ts": created_ts,
-                        "elapsed_samples": self._pending_elapsed_samples,
-                    }
+                _, prefix, checksums, created_ts, emb_checksum, pe_checksum = result
+                self._pending_prefix = prefix
+                self._pending_checksums = checksums
+                self._pending_emb_checksum = emb_checksum
+                self._pending_pe_checksum = pe_checksum
+                self._pending_elapsed_samples = int(prefix.split("_")[2].split("/")[0])
+                self._pending_checkpoint_timestamp = created_ts if created_ts > 0 else time.time()
+
+                logger.info(
+                    "[hotswap] Subprocess download complete (%.2fs), prefix=%s",
+                    bg_elapsed,
+                    prefix,
                 )
 
-            self._swap_ready.set()
-            self._swap_complete.wait()
-            self._swap_complete.clear()
+                if self._live_swap_enabled:
+                    staged = self._stage_live_params()
+                    if staged and self._live_pe_enabled:
+                        staged = self._stage_live_post_embeddings()
+                    if staged:
+                        t_stage = time.time() - bg_start
+                        if self.metrics_publisher is not None:
+                            self.metrics_publisher.checkpoint_reload_step_seconds.labels(
+                                step="hotswap_live_stage"
+                            ).observe(t_stage)
+                        logger.info("[hotswap-live] Standby GPU state staged (%.2fs)", t_stage)
+                        self._live_swap_ready.set()
+                        self._swap_complete.wait()
+                        self._swap_complete.clear()
+                        self._malloc_trim_after_swap()
+                    continue
+
+                if self._hotswap_standby_meta_file is not None:
+                    self._publish_standby_metadata(
+                        {
+                            "status": "success",
+                            "prefix": prefix,
+                            "checksums": checksums,
+                            "emb_checksum": emb_checksum,
+                            "pe_checksum": pe_checksum,
+                            "created_ts": created_ts,
+                            "elapsed_samples": self._pending_elapsed_samples,
+                        }
+                    )
+
+                self._swap_ready.set()
+                self._swap_complete.wait()
+                self._swap_complete.clear()
+                self._malloc_trim_after_swap()
+
+            finally:
+                self._hotswap_cycle_inflight.clear()
 
         logger.info("[hotswap] Coordinator thread exiting.")
 
@@ -1676,68 +1747,77 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                 break
             if not triggered:
                 continue
-            self._reload_requested.clear()
-
-            t_wait = time.time()
-            while not self._hotswap_stop.is_set():
-                try:
-                    with open(self._hotswap_standby_version_file) as f:
-                        cur = int(f.read().strip() or "0")
-                except (FileNotFoundError, ValueError):
-                    cur = last_version
-                if cur > last_version:
-                    last_version = cur
-                    break
-                if time.time() - t_wait > 1800:
-                    logger.warning(
-                        "[hotswap] Worker %d: timed out waiting for leader's "
-                        "standby payload after 30 min, giving up this cycle",
-                        wid,
-                    )
-                    break
-                time.sleep(0.5)
-            else:
-                continue
-
+            self._hotswap_cycle_inflight.set()
             try:
-                with open(self._hotswap_standby_meta_file) as f:
-                    meta = _json.load(f)
-            except (FileNotFoundError, _json.JSONDecodeError) as e:
-                logger.warning(
-                    "[hotswap] Worker %d: failed to read leader metadata: %s",
-                    wid,
-                    e,
-                )
-                continue
+                self._reload_requested.clear()
 
-            status = meta.get("status")
-            if status == "success":
-                self._pending_prefix = meta["prefix"]
-                self._pending_checksums = meta["checksums"]
-                self._pending_emb_checksum = meta.get("emb_checksum")
-                self._pending_pe_checksum = meta.get("pe_checksum")
-                self._pending_elapsed_samples = meta["elapsed_samples"]
-                created_ts = meta.get("created_ts", 0)
-                self._pending_checkpoint_timestamp = created_ts if created_ts > 0 else time.time()
-                logger.info(
-                    "[hotswap] Worker %d: leader standby ready (version=%d, prefix=%s)",
-                    wid,
-                    last_version,
-                    self._pending_prefix,
-                )
-                self._swap_ready.set()
-                self._swap_complete.wait()
-                self._swap_complete.clear()
-            elif status == "noop":
-                logger.info("[hotswap] Worker %d: leader reported noop (no new ckpt)", wid)
-                self._reload_noop.set()
-                if self.is_multi_worker:
-                    self._write_reload_done()
-            else:
-                self._abort_hotswap_cycle(
-                    "leader_error",
-                    f"worker {wid}: leader reported error/unknown status {status!r}",
-                )
+                t_wait = time.time()
+                while not self._hotswap_stop.is_set():
+                    try:
+                        with open(self._hotswap_standby_version_file) as f:
+                            cur = int(f.read().strip() or "0")
+                    except (FileNotFoundError, ValueError):
+                        cur = last_version
+                    if cur > last_version:
+                        last_version = cur
+                        break
+                    if time.time() - t_wait > 1800:
+                        logger.warning(
+                            "[hotswap] Worker %d: timed out waiting for leader's "
+                            "standby payload after 30 min, giving up this cycle",
+                            wid,
+                        )
+                        break
+                    time.sleep(0.5)
+                else:
+                    continue
+
+                try:
+                    with open(self._hotswap_standby_meta_file) as f:
+                        meta = _json.load(f)
+                except (FileNotFoundError, _json.JSONDecodeError) as e:
+                    logger.warning(
+                        "[hotswap] Worker %d: failed to read leader metadata: %s",
+                        wid,
+                        e,
+                    )
+                    continue
+
+                status = meta.get("status")
+                if status == "success":
+                    self._pending_prefix = meta["prefix"]
+                    self._pending_checksums = meta["checksums"]
+                    self._pending_emb_checksum = meta.get("emb_checksum")
+                    self._pending_pe_checksum = meta.get("pe_checksum")
+                    self._pending_elapsed_samples = meta["elapsed_samples"]
+                    created_ts = meta.get("created_ts", 0)
+                    self._pending_checkpoint_timestamp = (
+                        created_ts if created_ts > 0 else time.time()
+                    )
+                    logger.info(
+                        "[hotswap] Worker %d: leader standby ready (version=%d, prefix=%s)",
+                        wid,
+                        last_version,
+                        self._pending_prefix,
+                    )
+                    self._swap_ready.set()
+                    self._swap_complete.wait()
+                    self._swap_complete.clear()
+                    self._malloc_trim_after_swap()
+                elif status == "noop":
+                    logger.info("[hotswap] Worker %d: leader reported noop (no new ckpt)", wid)
+                    self._reload_noop.set()
+                    if self.is_multi_worker:
+                        self._write_reload_done()
+                    self._reset_server_reload_request()
+                else:
+                    self._abort_hotswap_cycle(
+                        "leader_error",
+                        f"worker {wid}: leader reported error/unknown status {status!r}",
+                    )
+
+            finally:
+                self._hotswap_cycle_inflight.clear()
 
         logger.info("[hotswap] Follower coordinator (worker %d) exiting.", wid)
 
@@ -2719,8 +2799,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             nodes = numa.memory.get_allocation_allowed_nodes()
             if len(nodes) <= 1:
                 return
-            numa.schedule.run_on_nodes(*nodes)
             numa.memory.set_membind_nodes(*nodes)
+            os.sched_setaffinity(0, schedulable_cpus(*nodes))
             logger.info("NUMA: re-bound CPU+memory to nodes %s", nodes)
         except Exception as e:
             logger.warning("NUMA: failed to re-bind nodes: %s", e)
@@ -3065,12 +3145,15 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                 buffer_key = (x.shape, np.dtype(x.dtype))
                 if buffer_key not in self._pinned_buffers:
                     n_shards = self.parallel_config.num_devices_per_process
-                    self._pinned_buffers[buffer_key] = PinnedD2HBuffer(
+                    min_buffers = len(self.retrieval_dataset_types) + 1
+                    buf = PinnedD2HBuffer(
                         shape=x.shape,
                         dtype=np.dtype(x.dtype),
                         num_shards=n_shards,
-                        num_buffers=self.pinned_d2h_num_buffers,
+                        num_buffers=max(self.pinned_d2h_num_buffers, min_buffers),
                     )
+                    buf.begin_cycle()
+                    self._pinned_buffers[buffer_key] = buf
                 return self._pinned_buffers[buffer_key].transfer(x)
             if x.dtype == jnp.bfloat16:
                 return np.asarray(x, dtype=np.float32)
@@ -3116,6 +3199,10 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                 batch_id=last_batch_id,
                 approx_output_bytes=approx_output_bytes,
             ):
+                if self.use_pinned_d2h:
+                    for pinned_buf in self._pinned_buffers.values():
+                        pinned_buf.begin_cycle()
+
                 if isinstance(last_out, jax.Array):
                     with jax_profiler.TraceAnnotation(
                         "block_until_ready",
@@ -3165,7 +3252,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                         )
                         *model_out_jax, has_nan_jax = last_out
                         output_array = tuple(as_np_array(x) for x in model_out_jax)
-                        has_nan = bool(np.asarray(has_nan_jax))
+                        has_nan = bool(np.any(np.asarray(has_nan_jax)))
                         logger.info(
                             f"[batch={last_batch_id}] as_np_array took {as_np_array_t.elapsed() * 1000:.2f}ms"
                         )
@@ -3229,11 +3316,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                     break
 
             reload_triggered = False
-            hotswap_busy = self.enable_hotswap and (
-                self._reload_requested.is_set()
-                or self._swap_ready.is_set()
-                or self._live_swap_ready.is_set()
-            )
+            hotswap_busy = self.enable_hotswap and self._hotswap_cycle_busy()
             if check_reload and not hotswap_busy:
                 if self.is_multi_worker and self._observe_peer_reload_trigger():
                     reload_triggered = True
@@ -3269,11 +3352,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
 
             if self.enable_hotswap and restart_timeout is not None:
                 if time.time() - hotswap_last_reload_trigger >= restart_timeout:
-                    if (
-                        not self._reload_requested.is_set()
-                        and not self._swap_ready.is_set()
-                        and not self._live_swap_ready.is_set()
-                    ):
+                    if not self._hotswap_cycle_busy():
                         logger.info(
                             "[hotswap] Periodic reload trigger (every %.0fs)",
                             restart_timeout,
@@ -4043,6 +4122,11 @@ class RankingModelRunner(
             num_user_installed_apps=recsys_batch.NUM_USER_INSTALLED_APPS,
             num_post_categorical_features=recsys_batch.POST_CATEGORICAL_FEATURE_SIZE,
             num_post_bool_features=recsys_batch.POST_BOOL_FEATURE_SIZE,
+            enable_stale_post=bool(
+                getattr(
+                    getattr(self.model_config, "feature_prep", None), "enable_stale_post", False
+                )
+            ),
             num_post_float_features=recsys_batch.POST_FLOAT_FEATURE_SIZE,
             num_post_int64_features=recsys_batch.POST_INT64_FEATURE_SIZE,
             enable_async_response_compression=self.enable_async_response_compression,
@@ -4191,10 +4275,13 @@ class RankingModelRunner(
             logits, candidate_continuous_predictions = model.forward(batch, recsys_embeddings)
             log_probs = jax.nn.log_sigmoid(logits).astype(jnp.float32)
             cont_preds = candidate_continuous_predictions.astype(jnp.float32)
-            has_nan = jnp.any(jnp.isnan(log_probs))
+            has_nan = jnp.any(jnp.isnan(log_probs), axis=tuple(range(1, log_probs.ndim)))
             return log_probs, cont_preds, has_nan
 
         self.forward_fn = forward_fn
+        nan_sharding = jax.sharding.NamedSharding(
+            self.data_sharding.mesh, P(self.data_sharding.spec[0])
+        )
 
         forward_jit = JittedOrCompiled(
             jax.jit(
@@ -4205,7 +4292,7 @@ class RankingModelRunner(
                     self.data_sharding,
                     self.data_sharding,
                 ),
-                out_shardings=(self.data_sharding, self.data_sharding, None),
+                out_shardings=(self.data_sharding, self.data_sharding, nan_sharding),
             ),
             name=f"forward_fn_bs{bs}",
         )
@@ -4664,21 +4751,8 @@ class RetrievalModelRunner(
         assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
         hash_keys = self.dataset.hash_table.hash_keys
 
-        sid_client = None
-        _use_post_sid = self.model_config.user_tower_config.use_post_sid
-        sid_num_levels = self.model_config.user_tower_config.sid_num_levels
-        if _use_post_sid and self.sid_endpoint and sid_num_levels > 0:
-            sid_client = xai_recsys_engine.PySemanticIdClient(
-                self.sid_endpoint,
-                sid_num_levels,
-            )
-            logger.info(
-                "SID client connected: endpoint=%s, sid_num_levels=%d",
-                self.sid_endpoint,
-                sid_num_levels,
-            )
-        elif _use_post_sid and not self.sid_endpoint:
-            raise ValueError("use_post_sid=True but no sid_endpoint configured")
+        user_tower = self.model_config.user_tower_config
+        sid_num_levels = user_tower.sid_num_levels if user_tower.use_post_sid else 0
 
         return xai_recsys_engine.RecsysRetrievalPredictorServer(
             self.grpc_port,
@@ -4695,7 +4769,6 @@ class RetrievalModelRunner(
             service_time_ewma_alpha=self.service_time_ewma_alpha,
             pipeline_depth=1 if self.use_pipelining else 0,
             mm_client=mm_client,
-            sid_client=sid_client,
             user_id_table_size=hash_keys.user_id_table_size,
             user_hash_scales=hash_keys.user_hash_scales,
             user_biases=hash_keys.user_biases,
@@ -4710,7 +4783,7 @@ class RetrievalModelRunner(
             author_biases=hash_keys.author_biases,
             author_modulus=hash_keys.author_modulus,
             output_vocab_size=self.dataset.hash_table.output_vocab_size,
-            num_continuous_actions=self.model_config.num_continuous_actions,
+            num_continuous_actions=self.dataset.num_continuous_actions,
             history_seq_len=self.history_seq_len,
             candidate_seq_len=self.candidate_seq_len,
             multimodal_embedding_dim=getattr(self.model_config, "multimodal_embedding_dim", 0),
@@ -4725,10 +4798,15 @@ class RetrievalModelRunner(
             num_user_installed_apps=recsys_batch.NUM_USER_INSTALLED_APPS,
             num_post_categorical_features=recsys_batch.POST_CATEGORICAL_FEATURE_SIZE,
             num_post_bool_features=recsys_batch.POST_BOOL_FEATURE_SIZE,
+            enable_stale_post=bool(
+                getattr(
+                    getattr(self.model_config, "feature_prep", None), "enable_stale_post", False
+                )
+            ),
             num_post_float_features=recsys_batch.POST_FLOAT_FEATURE_SIZE,
             num_post_int64_features=recsys_batch.POST_INT64_FEATURE_SIZE,
             enable_async_response_compression=self.enable_async_response_compression,
-            sid_num_levels=sid_num_levels if sid_client is not None else 0,
+            sid_num_levels=sid_num_levels,
         )
 
     def create_executable(self) -> None:

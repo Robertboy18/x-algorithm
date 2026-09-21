@@ -57,6 +57,7 @@ from xrex.models.recsys_model import (
 )
 from xrex.models.scaling import ScaleConfig
 from xrex.models.sharding_context import ShardingContext
+from xrex.pallas.ranker_attention_utils import HISTORY_SEGMENT_ID, PADDING_SEGMENT_ID
 from xrex.train.misc import PostEmbeddings
 from xrex.utils.utils import Summary
 
@@ -64,6 +65,20 @@ logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
 EPS = 1e-12
 INF = 1e12
+
+
+def user_tower_segment_ids(
+    batch: int,
+    seq_len: int,
+    *,
+    use_history_segment_ids: bool,
+    padding_mask: jax.Array | None = None,
+) -> jax.Array:
+    if use_history_segment_ids:
+        return jnp.full((batch, seq_len), HISTORY_SEGMENT_ID, dtype=jnp.int32)
+    if padding_mask is None:
+        return jnp.zeros((batch, seq_len), dtype=jnp.int32)
+    return jnp.where(padding_mask, HISTORY_SEGMENT_ID, PADDING_SEGMENT_ID).astype(jnp.int32)
 
 
 def _l2_normalize_candidates(embeddings: jax.Array) -> jax.Array:
@@ -1196,7 +1211,7 @@ class RecsysTwoTowerModel(hk.Module):
                 "pallas_ranker_varlen_attn",
                 "cutedsl_ranker_varlen_attn",
             )
-            user_outputs, _ = self.user_tower(
+            user_outputs, _, _ = self.user_tower(
                 user_embeddings,
                 user_padding_mask,
                 is_training=is_training,
@@ -1245,23 +1260,26 @@ class RecsysTwoTowerModel(hk.Module):
                 user_representation, P(self.data_axis, None)
             )
         else:
-            user_embeddings, user_padding_mask, _, _, _, _, _, _, _, _, _ = (
-                pad_to_next_128_multiple(
-                    user_embeddings,
-                    user_padding_mask,
-                    jnp.zeros_like(user_padding_mask),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+            user_embeddings, user_padding_mask, *_ = pad_to_next_128_multiple(
+                user_embeddings,
+                user_padding_mask,
+                jnp.zeros_like(user_padding_mask),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
 
             B, T = user_padding_mask.shape
-            user_segment_ids = jnp.zeros((B, T), dtype=jnp.int32)
+            user_segment_ids = user_tower_segment_ids(
+                B,
+                T,
+                use_history_segment_ids=self.config.use_history_segment_ids,
+                padding_mask=user_padding_mask,
+            )
 
             if self.config.user_tower_config.right_anchored_rope:
                 user_positions = right_anchored_rope_positions(
@@ -1272,7 +1290,7 @@ class RecsysTwoTowerModel(hk.Module):
             else:
                 user_positions = jnp.full((B, T, 3), 0, dtype=jnp.float32)
                 user_positions = user_positions.at[:, :, 0].set(jnp.arange(start=0, stop=T))
-            user_outputs, _ = self.user_tower(
+            user_outputs, _, _ = self.user_tower(
                 user_embeddings,
                 user_padding_mask,
                 is_training=is_training,
@@ -1595,7 +1613,7 @@ class RecsysTwoTowerModelConfig(Config):
 
     ads_only_candidates: bool = False
 
-    num_continuous_actions: int = 0
+    use_history_segment_ids: bool = False
 
     multimodal_embedding_type: EmbeddingType | None = None
 

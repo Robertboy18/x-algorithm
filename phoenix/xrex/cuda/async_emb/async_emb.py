@@ -13,13 +13,12 @@ from xrex.cuda.async_emb.comm_utils import (
 )
 
 try:
-    from xrex.cuda.async_emb.src import async_emb_api
-except ImportError as e:
+    import xrex_cuda_kernels.async_emb_api as async_emb_api
+except ModuleNotFoundError as e:
     raise ImportError(
-        "no compiled async_emb binding: xrex.cuda.async_emb.src has no "
-        "async_emb_api extension on this box (compile src/ per the "
-        "xrex/cuda/__init__.py build notes). use_async_emb requires the "
-        "kernels."
+        "no compiled async_emb binding: the xrex-cuda-kernels package is not "
+        "installed in this environment."
+        " use_async_emb requires the kernels."
     ) from e
 
 try:
@@ -39,6 +38,14 @@ try:
         fn={
             "initialize": async_emb_api.rowwise_adagrad_update_start_init(),
             "execute": async_emb_api.rowwise_adagrad_update_start(),
+        },
+        platform="CUDA",
+    )
+    jax.ffi.register_ffi_target(
+        "xrex_async_emb_rowwise_adagrad_lazy_update_start",
+        fn={
+            "initialize": async_emb_api.rowwise_adagrad_lazy_update_start_init(),
+            "execute": async_emb_api.rowwise_adagrad_lazy_update_start(),
         },
         platform="CUDA",
     )
@@ -186,6 +193,7 @@ def rowwise_adagrad_update_start(
     learning_rate: float,
     eps: float,
     decay_factor: float,
+    weight_decay_factor: float = 1.0,
 ):
     assert grads.shape == (ctx.tokens_per_rank, ctx.emb_width) and grads.dtype == jnp.bfloat16
     assert math.prod(segment_ids.shape) == ctx.tokens_per_rank
@@ -215,6 +223,61 @@ def rowwise_adagrad_update_start(
             learning_rate=float(learning_rate),
             eps=float(eps),
             decay_factor=float(decay_factor),
+            weight_decay_factor=float(weight_decay_factor),
+        )
+    return tuple(outs)
+
+
+def rowwise_adagrad_lazy_update_start(
+    grads: jax.Array,
+    segment_ids: jax.Array,
+    unique_tokens: jax.Array,
+    table: jax.Array,
+    row_state: jax.Array,
+    last_step: jax.Array,
+    step: jax.Array,
+    pending: jax.Array,
+    gate: jax.Array,
+    ctx: AsyncEmbContextHandle,
+    *,
+    learning_rate: float,
+    eps: float,
+    accum_decay_rate: float,
+    weight_decay_rate: float,
+):
+    assert grads.shape == (ctx.tokens_per_rank, ctx.emb_width) and grads.dtype == jnp.bfloat16
+    assert math.prod(segment_ids.shape) == ctx.tokens_per_rank
+    assert math.prod(unique_tokens.shape) == ctx.num_unique
+    assert last_step.shape == row_state.shape and last_step.dtype == jnp.int32
+    flat_segment_ids = segment_ids.reshape(-1).astype(jnp.int32)
+    flat_unique_tokens = unique_tokens.reshape(-1).astype(jnp.int32)
+    with jax.named_scope("async_emb.rowwise_adagrad_lazy_update_start"):
+        outs = jax.ffi.ffi_call(
+            "xrex_async_emb_rowwise_adagrad_lazy_update_start",
+            [
+                jax.ShapeDtypeStruct(grads.shape, grads.dtype),
+                jax.ShapeDtypeStruct(flat_segment_ids.shape, jnp.int32),
+                jax.ShapeDtypeStruct(flat_unique_tokens.shape, jnp.int32),
+                jax.ShapeDtypeStruct(table.shape, table.dtype),
+                jax.ShapeDtypeStruct(row_state.shape, row_state.dtype),
+                jax.ShapeDtypeStruct(last_step.shape, jnp.int32),
+            ],
+            input_output_aliases={0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5},
+        )(
+            grads,
+            flat_segment_ids,
+            flat_unique_tokens,
+            table,
+            row_state,
+            last_step,
+            step.astype(jnp.int32).reshape(1),
+            pending.astype(jnp.int32).reshape(1),
+            gate,
+            **ctx.attrs(),
+            learning_rate=float(learning_rate),
+            eps=float(eps),
+            accum_decay_rate=float(accum_decay_rate),
+            weight_decay_rate=float(weight_decay_rate),
         )
     return tuple(outs)
 

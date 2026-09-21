@@ -20,7 +20,7 @@ use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 const FINAL_RESULT_SIZE_SCOPE: [(&str, &str); 1] = [("requests", "result_size")];
 const FINAL_RESULT_EMPTY_SCOPE: [(&str, &str); 1] = [("requests", "result_empty")];
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, strum::IntoStaticStr)]
 pub enum PipelineStage {
     QueryHydrator,
     DependentQueryHydrator,
@@ -32,6 +32,20 @@ pub enum PipelineStage {
     Scorer,
     Selector,
     SideEffect,
+}
+
+impl PipelineStage {
+    pub fn stat_labels(
+        self,
+        component: &'static str,
+        requests: &'static str,
+    ) -> [(&'static str, &'static str); 3] {
+        [
+            ("requests", requests),
+            ("stage", self.into()),
+            ("component", component),
+        ]
+    }
 }
 
 pub struct PipelineComponents {
@@ -210,7 +224,9 @@ where
         let all = self.query_hydrators();
         let hydrators: Vec<_> = all.iter().filter(|h| h.enable(&query)).collect();
         stats.record_components(all.len(), hydrators.len());
-        let hydrate_futures = hydrators.iter().map(|h| h.run(&query));
+        let hydrate_futures = hydrators
+            .iter()
+            .map(|h| h.run(&query, PipelineStage::QueryHydrator));
         let results = join_all(hydrate_futures).await;
 
         let mut hydrated_query = query;
@@ -235,7 +251,9 @@ where
         let stats = StageStats::begin(PipelineStage::DependentQueryHydrator);
         let hydrators: Vec<_> = all.iter().filter(|h| h.enable(&query)).collect();
         stats.record_components(all.len(), hydrators.len());
-        let hydrate_futures = hydrators.iter().map(|h| h.run(&query));
+        let hydrate_futures = hydrators
+            .iter()
+            .map(|h| h.run(&query, PipelineStage::DependentQueryHydrator));
         let results = join_all(hydrate_futures).await;
 
         let mut hydrated_query = query;
@@ -258,7 +276,7 @@ where
         let all = self.sources();
         let sources: Vec<_> = all.iter().filter(|s| s.enable(query)).collect();
         stats.record_components(all.len(), sources.len());
-        let source_futures = sources.iter().map(|s| s.run(query));
+        let source_futures = sources.iter().map(|s| s.run(query, PipelineStage::Source));
         let results = join_all(source_futures).await;
 
         let mut collected = Vec::new();
@@ -303,7 +321,7 @@ where
         let stats = StageStats::begin(stage);
         let enabled: Vec<_> = hydrators.iter().filter(|h| h.enable(query)).collect();
         stats.record_components(hydrators.len(), enabled.len());
-        let hydrate_futures = enabled.iter().map(|h| h.run(query, &candidates));
+        let hydrate_futures = enabled.iter().map(|h| h.run(query, &candidates, stage));
         let results = join_all(hydrate_futures).await;
         for (hydrator, result) in enabled.iter().zip(results) {
             hydrator.update_all(&mut candidates, result);
@@ -354,7 +372,7 @@ where
         let mut all_removed = Vec::new();
         let mut removed_per_filter: Vec<(String, usize)> = Vec::new();
         for filter in enabled {
-            let result = filter.run(query, candidates);
+            let result = filter.run(query, candidates, stage);
             if !result.removed.is_empty() {
                 removed_per_filter.push((filter.name().to_string(), result.removed.len()));
             }
@@ -375,7 +393,7 @@ where
         let scorers: Vec<_> = all.iter().filter(|s| s.enable(query)).collect();
         stats.record_components(all.len(), scorers.len());
         for scorer in scorers {
-            let scored = scorer.run(query, &candidates).await;
+            let scored = scorer.run(query, &candidates, PipelineStage::Scorer).await;
             scorer.update_all(&mut candidates, scored);
         }
         stats.finish_with_size(candidates.len());
@@ -384,7 +402,8 @@ where
 
     fn select(&self, query: &Q, candidates: Vec<C>) -> SelectResult<C> {
         if self.selector().enable(query) {
-            self.selector().run(query, candidates)
+            self.selector()
+                .run(query, candidates, PipelineStage::Selector)
         } else {
             SelectResult {
                 selected: candidates,
@@ -395,14 +414,13 @@ where
 
     fn run_side_effects(&self, input: Arc<SideEffectInput<Q, C>>) {
         let side_effects = self.side_effects();
-        let pipeline_label = vec![("pipeline".to_string(), self.name().to_string())];
         tokio::spawn(xai_stats_receiver::with_scoped_metric_labels(
-            pipeline_label,
+            vec![("pipeline".to_string(), self.name().to_string())],
             async move {
                 let futures = side_effects
                     .iter()
                     .filter(|se| se.enable(input.query.clone()))
-                    .map(|se| se.run(input.clone()));
+                    .map(|se| se.run(input.clone(), PipelineStage::SideEffect));
                 let _ = join_all(futures).await;
             },
         ));

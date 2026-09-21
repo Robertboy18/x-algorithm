@@ -5,7 +5,7 @@ import logging
 
 from xai_configlib import Config
 from xrex.configs.config_loader import replace_cli_subs
-from xrex.driver.driver_local import LocalDriverConfig
+from xrex.driver.local import LocalDriverConfig
 
 logger = logging.getLogger(__name__)
 

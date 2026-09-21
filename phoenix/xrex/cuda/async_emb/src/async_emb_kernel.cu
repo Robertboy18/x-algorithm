@@ -302,6 +302,7 @@ __global__ void rowwise_adagrad_apply(
     const float* row_sq_sums,
     const int32_t* unique_tokens,
     float* row_state,
+    int32_t* last_step,
     __nv_bfloat16* table_shard,
     UpdateScalars* scalars,
     AdagradParams adagrad,
@@ -311,6 +312,8 @@ __global__ void rowwise_adagrad_apply(
 ) {
   const float norm = sqrtf(__ldg(row_sq_sums + num_unique));
   const bool apply = isfinite(norm) && __ldg(&scalars->pending) != 0;
+  const bool lazy = last_step != nullptr;
+  const int32_t clock = lazy ? __ldg(&scalars->step) : 0;
   const int64_t thread_id = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
   if (thread_id == 0) {
     scalars->norm = norm;
@@ -330,16 +333,28 @@ __global__ void rowwise_adagrad_apply(
     }
     const bool ok = in_range && apply && token >= 0 && token < vocab_rows;
     float accum = 0.f;
+    float wd = 1.f;
     if (ok && col == 0) {
-      accum = row_state[token] * adagrad.decay + __ldg(row_sq_sums + row) * adagrad.inv_emb_width;
+      float accum_factor = adagrad.decay;
+      if (lazy) {
+        const float delta = fmaxf(0.f, float(clock - last_step[token]));
+        accum_factor = expf(-adagrad.accum_decay_rate * delta);
+        wd = __ldg(row_sq_sums + row) > 0.f ? expf(-adagrad.weight_decay_rate * delta) : 1.f;
+        last_step[token] = clock;
+      } else {
+        wd = __ldg(row_sq_sums + row) > 0.f ? adagrad.weight_decay_factor : 1.f;
+      }
+      accum = row_state[token] * accum_factor + __ldg(row_sq_sums + row) * adagrad.inv_emb_width;
     }
     accum = __shfl_sync(0xffffffffu, accum, lane - col);
+    wd = __shfl_sync(0xffffffffu, wd, lane - col);
     if (ok) {
       const float step = (-adagrad.lr) * (1.f / (sqrtf(accum) + adagrad.eps));
       const float grad = __bfloat162float(__float2bfloat16(grad_accum[elem]));
       const float delta = __bfloat162float(__float2bfloat16(step * grad));
       __nv_bfloat16* cell = table_shard + token * shard_width + col;
-      *cell = __float2bfloat16(__bfloat162float(*cell) + delta);
+      const float decayed = __bfloat162float(__float2bfloat16(__bfloat162float(*cell) * wd));
+      *cell = __float2bfloat16(decayed + delta);
       if (col == 0) {
         row_state[token] = accum;
       }
@@ -355,6 +370,7 @@ void launch_rowwise_adagrad_apply(
     const float* row_sq_sums,
     const int32_t* unique_tokens,
     float* row_state,
+    int32_t* last_step,
     __nv_bfloat16* table_shard,
     int64_t vocab_rows,
     UpdateScalars* scalars,
@@ -368,6 +384,7 @@ void launch_rowwise_adagrad_apply(
       row_sq_sums,
       unique_tokens,
       row_state,
+      last_step,
       table_shard,
       scalars,
       adagrad,

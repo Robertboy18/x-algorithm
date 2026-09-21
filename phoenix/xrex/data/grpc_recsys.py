@@ -90,6 +90,7 @@ class PhoenixGrpcDataset(PhoenixDataset):
             output_vocab_size=self.hash_table.output_vocab_size,
             history_seq_len=self.history_seq_len,
             candidate_seq_len=self.candidate_seq_len,
+            enable_stale_post=self.enable_stale_post,
         )
 
         prefetch_queue = Queue(maxsize=2)
@@ -252,6 +253,9 @@ class PhoenixGrpcDataset(PhoenixDataset):
                 ),
                 product_surface=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
                 client_app_id=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
+                trained_candidate_mask=np.ones(
+                    (batch_size, self.candidate_seq_len), dtype=np.bool_
+                ),
                 post_creation_ts_sec=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
                 post_ids=None,
                 promoted_ids=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int64),
@@ -368,6 +372,7 @@ class PhoenixGrpcDataset(PhoenixDataset):
             post_ids=None,
             product_surface=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
             client_app_id=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
+            trained_candidate_mask=np.ones((batch_size, candidate_seq_len), dtype=np.bool_),
             post_creation_ts_sec=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
             continuous_actions=np.zeros((batch_size, candidate_seq_len, 2), dtype=np.float32),
             promoted_ids=np.zeros((batch_size, candidate_seq_len), dtype=np.int64),

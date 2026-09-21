@@ -1,5 +1,5 @@
 mod cached_value;
-pub mod codec;
+pub(crate) mod codec;
 mod expiring_cache;
 pub(crate) mod lookup;
 pub(crate) mod manhattan;
@@ -9,6 +9,7 @@ mod proto;
 pub mod source;
 pub(crate) mod twemcache;
 pub(crate) mod types;
+pub(crate) mod warmer;
 
 pub use lookup::LookupError;
 pub use mh_client::{ManhattanLabelFetcher, MhLabelClient};

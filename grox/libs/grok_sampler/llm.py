@@ -2,7 +2,7 @@ import time
 import logging
 import traceback
 from abc import ABC, abstractmethod
-from typing import Generic, TypeVar, AsyncGenerator
+from typing import Callable, Generic, TypeVar, AsyncGenerator
 from contextlib import aclosing
 
 from monitor.logging import Logging
@@ -69,6 +69,7 @@ class LiteLLM(ABC, Generic[T]):
         keep_separator = kwargs.get("keep_separator", False)
         separator = kwargs.get("separator", SEPARATOR)
         log_prompt = kwargs.get("log_prompt", False)
+        stop_predicate: Callable[[str], bool] | None = kwargs.get("stop_predicate")
         request = await self._get_sample_request(query, separator, **kwargs)
         prompt_len = self._prompt_len(request)
         logger.info(f"Started sampling request, prompt_len={prompt_len}")
@@ -84,19 +85,32 @@ class LiteLLM(ABC, Generic[T]):
         tokens_received = 0
         start = time.perf_counter()
         try:
-            async for tok in self._sample_streaming_raw(request, **kwargs):
-                if tokens_received == 0:
-                    ttft = time.perf_counter() - start
-                    Metrics.histogram("llm.sample.ttft").record(
-                        ttft, attributes=attributes
+            async with aclosing(
+                self._sample_streaming_raw(request, **kwargs)
+            ) as raw_stream:
+                async for tok in raw_stream:
+                    if tokens_received == 0:
+                        ttft = time.perf_counter() - start
+                        Metrics.histogram("llm.sample.ttft").record(
+                            ttft, attributes=attributes
+                        )
+                        logger.info(f"Time to first token: {ttft:.3f}")
+                    tokens_received += 1
+                    Metrics.counter("llm.sample.token.count").add(
+                        1, attributes=attributes
                     )
-                    logger.info(f"Time to first token: {ttft:.3f}")
-                tokens_received += 1
-                Metrics.counter("llm.sample.token.count").add(1, attributes=attributes)
-                if not keep_separator:
-                    tok.text = tok.text.replace(separator, "")
-                resp += tok.text
-                yield tok.text
+                    if not keep_separator:
+                        tok.text = tok.text.replace(separator, "")
+                    resp += tok.text
+                    yield tok.text
+                    if stop_predicate is not None and stop_predicate(resp):
+                        logger.info(
+                            f"Response complete after {tokens_received} tokens, cancelling the stream"
+                        )
+                        Metrics.counter("llm.sample.early_stop.count").add(
+                            1, attributes=attributes
+                        )
+                        break
             logger.info(
                 f"Finished sampling request in {time.perf_counter() - start:.2f} seconds"
             )

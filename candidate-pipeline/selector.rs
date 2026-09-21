@@ -1,12 +1,9 @@
-use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery};
+use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery, PipelineStage};
 use crate::util;
 use crate::SPAN_LEVEL;
 use std::any::type_name_of_val;
 use tracing::{field::Empty, Span};
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
-
-const RESULT_SIZE_SCOPE: [(&str, &str); 1] = [("requests", "result_size")];
-const RESULT_EMPTY_SCOPE: [(&str, &str); 1] = [("requests", "result_empty")];
 
 pub struct SelectResult<C> {
     pub selected: Vec<C>,
@@ -39,19 +36,12 @@ where
         selected_count = Empty,
         non_selected_count = Empty,
     ))]
-    fn run(&self, query: &Q, candidates: Vec<C>) -> SelectResult<C> {
+    fn run(&self, query: &Q, candidates: Vec<C>, stage: PipelineStage) -> SelectResult<C> {
         let result = self.select(query, candidates);
         let span = Span::current();
         span.record("selected_count", result.selected.len());
         span.record("non_selected_count", result.non_selected.len());
-        #[cfg(feature = "quiet-spans")]
-        tracing::info!(
-            component = self.name(),
-            selected_count = result.selected.len(),
-            non_selected_count = result.non_selected.len(),
-            "selector"
-        );
-        self.stat(&result);
+        self.stat(&result, stage);
         result
     }
 
@@ -91,18 +81,22 @@ where
         util::short_type_name(type_name_of_val(self))
     }
 
-    fn stat(&self, result: &SelectResult<C>) {
+    fn stat(&self, result: &SelectResult<C>, stage: PipelineStage) {
         if let Some(receiver) = global_stats_receiver() {
             let metric_name = format!("{}.run", self.name());
             let result_size = result.len() as f64;
             receiver.observe(
                 metric_name.as_str(),
-                &RESULT_SIZE_SCOPE,
+                &stage.stat_labels(self.name(), "result_size"),
                 result_size,
                 HistogramBuckets::Bucket0To50,
             );
             if result_size == 0.0 {
-                receiver.incr(metric_name.as_str(), &RESULT_EMPTY_SCOPE, 1u64);
+                receiver.incr(
+                    metric_name.as_str(),
+                    &stage.stat_labels(self.name(), "result_empty"),
+                    1u64,
+                );
             }
         }
     }

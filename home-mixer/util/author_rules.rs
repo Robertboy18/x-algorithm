@@ -77,7 +77,6 @@ mod tests {
                 impressor,
                 None,
                 false,
-                None,
             )
             .unwrap(),
         )

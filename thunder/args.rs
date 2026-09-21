@@ -69,6 +69,9 @@ pub struct Args {
     #[arg(long, default_value = "/s/kafka/phoenix-kafka-scram-bootstrap")]
     pub in_network_events_consumer_dest: String,
 
+    #[arg(long)]
+    pub in_network_events_consumer_mtls_zone: Option<String>,
+
     #[arg(long, default_value = "innetwork-posts")]
     pub o2_bucket: String,
 

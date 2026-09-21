@@ -3,6 +3,12 @@ from grox.core.generators.stream_generator import StreamTaskGenerator
 from grox.core.registry import register
 from grox.flows.ptos.constants import (
     POST_MIN_IMPRESSION_STREAM_FOR_GROX_PTOS,
+    SAFETY_PTOS_ADULT_CONTENT_LEADING_FRAMES,
+    SAFETY_PTOS_MEDIA_INJECTED_ADULT_INFRARED_VIDEO_SPAM_DETECTION,
+    SAFETY_PTOS_SPECIAL_VIDEO,
+    TOPIC_ADULT_CONTENT_LEADING_FRAMES,
+    TOPIC_MEDIA_INJECTED_ADULT_INFRARED_VIDEO_SPAM_DETECTION,
+    TOPIC_SPECIAL_VIDEO,
     POST_MIN_TRACTION_STREAM_FOR_GROX_PTOS,
     SAFETY_PTOS_BACKFILL,
     SAFETY_PTOS_DELUXE,
@@ -19,6 +25,13 @@ from grox.flows.ptos.constants import (
 )
 from grox.flows.ptos.kafka_loader import KafkaLiveClusterAnchorLoader
 from grox.flows.ptos.plan_safety_ptos import PlanSafetyPtos
+from grox.flows.ptos.plan_safety_ptos_adult_content_leading_frames import (
+    PlanSafetyPtosAdultContentLeadingFrames,
+)
+from grox.flows.ptos.plan_safety_ptos_media_injected_adult_infrared_video_spam_detection import (
+    PlanSafetyPtosMediaInjectedAdultInfraredVideoSpamDetection,
+)
+from grox.flows.ptos.plan_safety_ptos_special_video import PlanSafetyPtosSpecialVideo
 from grox.flows.ptos.plan_safety_ptos_live_cluster_anchors import (
     PlanSafetyPtosLiveClusterAnchors,
 )
@@ -88,3 +101,32 @@ class SafetyPtosLiveClusterAnchorsStreamTaskGenerator(StreamTaskGenerator):
 
     def _get_loader(self):
         return KafkaLiveClusterAnchorLoader(TOPIC_LIVE_CLUSTER_ANCHORS)
+
+
+@register
+class SafetyPtosSpecialVideoStreamTaskGenerator(StreamTaskGenerator):
+    TASK_GENERATOR_TYPE = SAFETY_PTOS_SPECIAL_VIDEO
+    PLANS_TO_INJECT = {PlanSafetyPtosSpecialVideo.KEY}
+
+    def _get_loader(self):
+        return KafkaPostLoader(TOPIC_SPECIAL_VIDEO)
+
+
+@register
+class SafetyPtosAdultContentLeadingFramesStreamTaskGenerator(StreamTaskGenerator):
+    TASK_GENERATOR_TYPE = SAFETY_PTOS_ADULT_CONTENT_LEADING_FRAMES
+    PLANS_TO_INJECT = {PlanSafetyPtosAdultContentLeadingFrames.KEY}
+
+    def _get_loader(self):
+        return KafkaPostLoader(TOPIC_ADULT_CONTENT_LEADING_FRAMES)
+
+
+@register
+class SafetyPtosMediaInjectedAdultInfraredVideoSpamDetectionStreamTaskGenerator(
+    StreamTaskGenerator
+):
+    TASK_GENERATOR_TYPE = SAFETY_PTOS_MEDIA_INJECTED_ADULT_INFRARED_VIDEO_SPAM_DETECTION
+    PLANS_TO_INJECT = {PlanSafetyPtosMediaInjectedAdultInfraredVideoSpamDetection.KEY}
+
+    def _get_loader(self):
+        return KafkaPostLoader(TOPIC_MEDIA_INJECTED_ADULT_INFRARED_VIDEO_SPAM_DETECTION)

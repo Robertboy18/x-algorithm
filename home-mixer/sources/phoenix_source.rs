@@ -1,8 +1,8 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    EnablePhoenixRetrievalFallback, EnablePhoenixSource, PhoenixMaxResults,
-    PhoenixRetrievalInferenceClusterId, PhoenixRetrievalNewUserHistoryThreshold,
+    EnablePhoenixRetrievalFallback, EnablePhoenixSource, PhoenixColdStartMaxResults,
+    PhoenixMaxResults, PhoenixRetrievalInferenceClusterId, PhoenixRetrievalNewUserHistoryThreshold,
     PhoenixRetrievalNewUserInferenceClusterId, PhoenixXdsRetrievalMaxRetries,
 };
 use crate::util::egress::RetrievalDispatch;
@@ -12,6 +12,7 @@ use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client
 use xai_candidate_pipeline::component_library::utils::quality_factor;
 use xai_candidate_pipeline::source::Source;
 use xai_home_mixer_proto as pb;
+use xai_recsys_proto::RetrieveTopKCandidatesResponse;
 
 pub struct PhoenixSource {
     pub dispatch: RetrievalDispatch,
@@ -87,6 +88,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
                 sequence.clone(),
                 query.columnar_retrieval_sequence.clone(),
                 quality_factor::apply(query.params.get(PhoenixMaxResults)),
+                query.params.get(PhoenixColdStartMaxResults),
                 vec![],
                 None,
                 client_context,
@@ -97,25 +99,39 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixSource {
             .await
             .map_err(|e| format!("PhoenixSource: {e}"))?;
 
-        let candidates: Vec<PostCandidate> = response
-            .top_k_candidates
-            .into_iter()
-            .flat_map(|scored_candidates| scored_candidates.candidates)
-            .filter_map(|scored_candidate| scored_candidate.candidate)
-            .map(|tweet_info| PostCandidate {
-                tweet_id: tweet_info.tweet_id,
-                author_id: tweet_info.author_id,
-                in_reply_to_tweet_id: (tweet_info.in_reply_to_tweet_id != 0)
-                    .then_some(tweet_info.in_reply_to_tweet_id),
-                retweeted_tweet_id: (tweet_info.retweeted_tweet_id != 0)
-                    .then_some(tweet_info.retweeted_tweet_id),
-                served_type: Some(pb::ServedType::ForYouPhoenixRetrieval),
+        Ok(candidates_from_response(response))
+    }
+}
+
+const HOME_COLD_DATASET_TYPE: u32 = 13;
+
+fn served_type_for_dataset(dataset_type: u32) -> pb::ServedType {
+    if dataset_type == HOME_COLD_DATASET_TYPE {
+        pb::ServedType::ForYouPhoenixRetrievalCold
+    } else {
+        pb::ServedType::ForYouPhoenixRetrieval
+    }
+}
+
+fn candidates_from_response(response: RetrieveTopKCandidatesResponse) -> Vec<PostCandidate> {
+    response
+        .top_k_candidates
+        .into_iter()
+        .flat_map(|scored_candidates| scored_candidates.candidates)
+        .filter_map(|scored| {
+            let tweet = scored.candidate?;
+            Some(PostCandidate {
+                tweet_id: tweet.tweet_id,
+                author_id: tweet.author_id,
+                in_reply_to_tweet_id: (tweet.in_reply_to_tweet_id != 0)
+                    .then_some(tweet.in_reply_to_tweet_id),
+                retweeted_tweet_id: (tweet.retweeted_tweet_id != 0)
+                    .then_some(tweet.retweeted_tweet_id),
+                served_type: Some(served_type_for_dataset(scored.dataset_type)),
                 ..Default::default()
             })
-            .collect();
-
-        Ok(candidates)
-    }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -149,5 +165,37 @@ mod tests {
             ..Default::default()
         };
         assert!(!source().enable(&query));
+    }
+
+    #[test]
+    fn candidates_from_response_sets_served_type() {
+        use xai_recsys_proto::{ScoredCandidate, ScoredCandidates, TweetInfo};
+
+        let tweet = |id, author, dataset_type| ScoredCandidate {
+            candidate: Some(TweetInfo {
+                tweet_id: id,
+                author_id: author,
+                ..Default::default()
+            }),
+            dataset_type,
+            ..Default::default()
+        };
+        let response = RetrieveTopKCandidatesResponse {
+            top_k_candidates: vec![ScoredCandidates {
+                user_id: 1,
+                candidates: vec![tweet(10, 1, 1), tweet(11, 2, HOME_COLD_DATASET_TYPE)],
+            }],
+        };
+        let got: Vec<(u64, pb::ServedType)> = candidates_from_response(response)
+            .into_iter()
+            .map(|c| (c.tweet_id, c.served_type.unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (10, pb::ServedType::ForYouPhoenixRetrieval),
+                (11, pb::ServedType::ForYouPhoenixRetrievalCold),
+            ]
+        );
     }
 }

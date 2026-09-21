@@ -29,12 +29,13 @@ def duration(secs: float) -> str:
 class Timer:
     def __init__(self) -> None:
         self.start = time.time()
+        self._start_perf_counter = time.perf_counter()
 
     def __repr__(self) -> str:
         return duration(self.elapsed())
 
     def elapsed(self) -> float:
-        return time.time() - self.start
+        return time.perf_counter() - self._start_perf_counter
 
     __float__ = elapsed
 

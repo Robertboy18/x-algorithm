@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use xai_stats_receiver::{HistogramBuckets, global_stats_receiver};
 
@@ -9,9 +9,25 @@ use crate::rules::{SafetyLevel, Verdict};
 
 const REQUESTS: &str = "filter_tweets_requests";
 const LATENCY_MS: &str = "filter_tweets_latency_ms";
-const BATCH_SIZE: &str = "filter_tweets_batch_size";
+pub(crate) const BATCH_SIZE: &str = "filter_tweets_batch_size";
 const VERDICTS: &str = "filter_tweets_verdicts";
 const VERDICTS_BY_RULE: &str = "filter_tweets_verdicts_by_rule";
+const LOGGED_OUT_VIEWER: &str = "filter_tweets_logged_out_viewer";
+const VIEWER_ID_NORMALIZED: &str = "filter_tweets_viewer_id_normalized";
+const PHASE_MS: &str = "filter_tweets_phase_ms";
+const DEADLINE: &str = "filter_tweets_deadline";
+const DEADLINE_REMAINING_MS: &str = "filter_tweets_deadline_remaining_ms";
+const DEADLINE_OVERRUN_MS: &str = "filter_tweets_deadline_overrun_ms";
+
+pub(crate) fn record_viewer_state(raw: Option<u64>, normalized: Option<u64>) {
+    if normalized.is_some() {
+        return;
+    }
+    incr(LOGGED_OUT_VIEWER, &[], 1);
+    if raw.is_some() {
+        incr(VIEWER_ID_NORMALIZED, &[], 1);
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AggregatedVerdicts {
@@ -48,7 +64,7 @@ pub(crate) fn record_verdicts<'a>(
     verdicts: impl IntoIterator<Item = &'a Verdict>,
 ) {
     let aggregated = aggregate_verdicts(verdicts);
-    let level = safety_level.as_str();
+    let level = <&str>::from(safety_level);
     for (action, count) in &aggregated.mix {
         incr_nonzero(
             VERDICTS,
@@ -66,43 +82,68 @@ pub(crate) fn record_verdicts<'a>(
 }
 
 pub(crate) struct RequestMetricsGuard {
+    requests: &'static str,
+    latency_ms: &'static str,
     start: Instant,
-    success: Cell<bool>,
+    outcome: Cell<&'static str>,
 }
 
 impl RequestMetricsGuard {
     pub(crate) fn new() -> Self {
-        incr(REQUESTS, &[("outcome", "started")], 1);
+        Self::named(REQUESTS, LATENCY_MS)
+    }
+
+    pub(crate) fn named(requests: &'static str, latency_ms: &'static str) -> Self {
+        incr(requests, &[("outcome", "started")], 1);
         Self {
+            requests,
+            latency_ms,
             start: Instant::now(),
-            success: Cell::new(false),
+            outcome: Cell::new("cancelled"),
         }
     }
 
     pub(crate) fn mark_success(&self) {
-        self.success.set(true);
+        self.outcome.set("success");
     }
+
+    pub(crate) fn mark_failure(&self) {
+        self.outcome.set("failure");
+    }
+
+    pub(crate) fn record_deadline(&self, grpc_timeout: Option<Duration>) {
+        let Some(deadline) = grpc_timeout else {
+            incr(DEADLINE, &[("outcome", "absent")], 1);
+            return;
+        };
+        let elapsed = self.start.elapsed();
+        if elapsed <= deadline {
+            incr(DEADLINE, &[("outcome", "within")], 1);
+            observe_vm(DEADLINE_REMAINING_MS, &[], millis(deadline - elapsed));
+        } else {
+            incr(DEADLINE, &[("outcome", "overrun")], 1);
+            observe_vm(DEADLINE_OVERRUN_MS, &[], millis(elapsed - deadline));
+        }
+    }
+}
+
+pub(crate) fn record_phase(stage: &'static str, elapsed: Duration) {
+    observe_vm(PHASE_MS, &[("stage", stage)], millis(elapsed));
+}
+
+fn millis(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
 }
 
 impl Drop for RequestMetricsGuard {
     fn drop(&mut self) {
-        let outcome = if self.success.get() {
-            "success"
-        } else {
-            "cancelled"
-        };
-        incr(REQUESTS, &[("outcome", outcome)], 1);
-        observe_vm(LATENCY_MS, &[], self.start.elapsed().as_secs_f64() * 1000.0);
+        incr(self.requests, &[("outcome", self.outcome.get())], 1);
+        observe_vm(self.latency_ms, &[], millis(self.start.elapsed()));
     }
 }
 
-pub(crate) fn record_batch_size(size: usize) {
-    observe(
-        BATCH_SIZE,
-        &[],
-        size as f64,
-        HistogramBuckets::Bucket50To500,
-    );
+pub(crate) fn record_batch_size(metric: &str, size: usize) {
+    observe(metric, &[], size as f64, HistogramBuckets::Bucket50To500);
 }
 
 fn incr_nonzero(metric: &str, labels: &[(&str, &str)], count: u64) {

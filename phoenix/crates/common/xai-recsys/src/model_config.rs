@@ -1,6 +1,74 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 X.AI Corp.
-#[derive(Debug, Clone)]
+use std::fmt;
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MultimodalEmbeddingType {
+    #[default]
+    None,
+    V1,
+    V3,
+    V5,
+    V6,
+    V8,
+}
+
+impl MultimodalEmbeddingType {
+    pub const fn dim(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::V1 => 1536,
+            Self::V3 | Self::V5 | Self::V6 | Self::V8 => 1024,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::V1 => "v1",
+            Self::V3 => "v3",
+            Self::V5 => "v5",
+            Self::V6 => "v6",
+            Self::V8 => "v8",
+        }
+    }
+
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub fn trainer_override(self) -> Option<String> {
+        self.is_enabled()
+            .then(|| format!("multimodal_embedding_type={}", self.as_str()))
+    }
+}
+
+impl fmt::Display for MultimodalEmbeddingType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for MultimodalEmbeddingType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "none" | "null" => Ok(Self::None),
+            "v1" => Ok(Self::V1),
+            "v3" => Ok(Self::V3),
+            "v5" => Ok(Self::V5),
+            "v6" => Ok(Self::V6),
+            "v8" => Ok(Self::V8),
+            other => Err(format!(
+                "unknown multimodal_embedding_type {other:?} (expected none|v1|v3|v5|v6|v8)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct HashTableConfig {
     pub user_id_table_size: usize,
     pub user_hash_scales: Vec<i64>,
@@ -25,7 +93,6 @@ pub struct HashTableConfig {
 
     pub output_vocab_size: usize,
     pub num_continuous_actions: usize,
-    pub search_query_embedding_dim: usize,
 
     pub num_user_categorical_features: usize,
     pub num_user_bool_features: usize,
@@ -204,7 +271,7 @@ impl HashTableConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfig {
     pub hash_table: HashTableConfig,
     pub history_seq_len: usize,
@@ -274,7 +341,6 @@ impl ModelConfig {
                 ip_modulus,
                 output_vocab_size,
                 num_continuous_actions,
-                search_query_embedding_dim,
                 num_user_categorical_features,
                 num_user_bool_features,
                 num_user_float_features,
@@ -293,5 +359,33 @@ impl ModelConfig {
             num_categorical_features,
             sid_num_levels: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MultimodalEmbeddingType;
+
+    #[test]
+    fn type_dim_matches_python_embedding_config() {
+        assert_eq!(MultimodalEmbeddingType::None.dim(), 0);
+        assert_eq!(MultimodalEmbeddingType::V1.dim(), 1536);
+        assert_eq!(MultimodalEmbeddingType::V3.dim(), 1024);
+        assert_eq!(MultimodalEmbeddingType::V5.dim(), 1024);
+        assert_eq!(MultimodalEmbeddingType::V6.dim(), 1024);
+        assert_eq!(MultimodalEmbeddingType::V8.dim(), 1024);
+    }
+
+    #[test]
+    fn type_parses_cli_and_override_spellings() {
+        assert_eq!(
+            "none".parse::<MultimodalEmbeddingType>().unwrap(),
+            MultimodalEmbeddingType::None
+        );
+        assert_eq!(
+            "V8".parse::<MultimodalEmbeddingType>().unwrap(),
+            MultimodalEmbeddingType::V8
+        );
+        assert!("v2".parse::<MultimodalEmbeddingType>().is_err());
     }
 }

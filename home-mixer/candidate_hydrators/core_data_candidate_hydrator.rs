@@ -81,6 +81,20 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydrat
         let post_features = client
             .get_tweet_core_datas(core_data_fetch_ids(candidates))
             .await;
+        let source_ids: Vec<u64> = candidates
+            .iter()
+            .filter_map(|c| match post_features.get(&c.tweet_id) {
+                Some(Ok(Some(core_data))) => core_data.source_tweet_id,
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<u64>>()
+            .into_iter()
+            .collect();
+        let source_features = if source_ids.is_empty() {
+            HashMap::new()
+        } else {
+            client.get_tweet_core_datas(source_ids).await
+        };
 
         let mut hydrated_candidates = Vec::with_capacity(candidates.len());
         let mut hydrated_count = 0usize;
@@ -89,7 +103,14 @@ impl CachedHydrator<ScoredPostsQuery, PostCandidate> for CoreDataCandidateHydrat
             match post_features.get(&candidate.tweet_id) {
                 Some(Ok(Some(core_data))) => {
                     hydrated_count += 1;
-                    let text = core_data.text.clone();
+                    let source_text =
+                        core_data
+                            .source_tweet_id
+                            .and_then(|id| match source_features.get(&id) {
+                                Some(Ok(Some(source))) => Some(source.text.clone()),
+                                _ => None,
+                            });
+                    let text = source_text.unwrap_or_else(|| core_data.text.clone());
                     let ancestor_users = build_ancestor_users(candidate, core_data, &post_features);
                     let hydrated = PostCandidate {
                         author_id: core_data.author_id,

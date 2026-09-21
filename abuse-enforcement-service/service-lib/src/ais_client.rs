@@ -471,8 +471,10 @@ mod tests {
                     "additionalInfo": []
                 }}),
                 json!({"bounceViaSelection": {
-                    "userId": 1,
-                    "uncheckedTags": ["FAKE"]
+                    "target": {"user": {"userId": 1}},
+                    "tags": [],
+                    "uncheckedTags": ["FAKE"],
+                    "bounceActor": {"simpleService": {"serviceName": "xai-abuse-enforcement-service"}}
                 }}),
             ],
             "RtpPlugin",

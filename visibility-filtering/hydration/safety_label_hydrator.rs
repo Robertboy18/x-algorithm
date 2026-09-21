@@ -15,7 +15,7 @@ pub struct SafetyLabelHydrator {
 
 pub struct SafetyLabelHydration {
     pub label_types: HashMap<TweetId, SafetyLabelMap>,
-    pub label_response: HashMap<TweetId, vf_pb::SafetyLabelMap>,
+    pub label_response: HashMap<TweetId, Arc<vf_pb::SafetyLabelMap>>,
 }
 
 impl SafetyLabelHydrator {
@@ -48,7 +48,7 @@ impl SafetyLabelHydrator {
                 Some(label_map) => {
                     label_types
                         .insert(*tweet_id, SafetyLabelMap::from_proto_label_types(label_map));
-                    label_response.insert(*tweet_id, label_map.clone());
+                    label_response.insert(*tweet_id, Arc::clone(label_map));
                 }
                 None => {
                     label_types.insert(*tweet_id, SafetyLabelMap::default());
@@ -71,15 +71,15 @@ mod tests {
     use crate::safety_label_source::manhattan::ManhattanSource;
     use crate::safety_label_source::mh_client::{FetchResult, ManhattanLabelFetcher};
     use crate::safety_label_source::twemcache::{CacheRead, TwemcacheSource};
-    use crate::twemcache::{Key, Value};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use tonic::async_trait;
+    use xai_cache::{KVCacheError, Key, Value};
     use xai_manhattan::ManhattanError;
     use xai_safety_label_store::types::encode_lkey;
 
     struct FakeTwemcache {
-        results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
     }
 
     #[async_trait]
@@ -87,7 +87,7 @@ mod tests {
         async fn multi_get(
             &self,
             _keys: &[Key],
-        ) -> HashMap<Key, crate::twemcache::Result<Option<Value>>> {
+        ) -> HashMap<Key, std::result::Result<Option<Value>, KVCacheError>> {
             self.results.clone()
         }
     }
@@ -132,7 +132,7 @@ mod tests {
     }
 
     fn hydrator(
-        cache_results: HashMap<Key, crate::twemcache::Result<Option<Value>>>,
+        cache_results: HashMap<Key, std::result::Result<Option<Value>, KVCacheError>>,
         mh_items: HashMap<i64, Vec<crate::safety_label_source::codec::RawSafetyLabel>>,
         batch_error: Option<ManhattanError>,
     ) -> SafetyLabelHydrator {

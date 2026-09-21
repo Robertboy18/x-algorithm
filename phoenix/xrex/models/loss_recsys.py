@@ -8,6 +8,8 @@ import optax
 from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec as P
 
+from xrex.models.ads_head_masking import EARLY_RELABEL_STREAM_ID
+
 logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
 
@@ -90,6 +92,160 @@ def continuous_loss_compute(
     loss = jnp.sum(errors * weights) / jnp.maximum(num_loss_samples, 1.0)
 
     return loss, gt_clamped, pred_in_original_units, loss_mask, errors
+
+
+def purchase_value_valid_mask(
+    label_valid: jax.Array,
+    padding_mask: jax.Array,
+    negative_sample_mask: jax.Array,
+    sample_source: jax.Array,
+    has_click: jax.Array,
+    has_purchase: jax.Array,
+    keeper_mask: jax.Array,
+) -> jax.Array:
+    return (
+        label_valid.astype(jnp.bool_)
+        & padding_mask.astype(jnp.bool_)
+        & ~negative_sample_mask.astype(jnp.bool_)
+        & (sample_source == EARLY_RELABEL_STREAM_ID)
+        & has_click.astype(jnp.bool_)
+        & has_purchase.astype(jnp.bool_)
+        & keeper_mask.astype(jnp.bool_)
+    )
+
+
+def purchase_value_loss_compute(
+    raw_ratio: jax.Array,
+    pred_ratio: jax.Array,
+    baseline_mean_usd: jax.Array,
+    valid_mask: jax.Array,
+    delta: float = 1.0,
+    raw_weights: jax.Array | None = None,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    if not 0 < delta < float("inf"):
+        raise ValueError("purchase value Huber delta must be finite and positive")
+    ratio = raw_ratio.astype(jnp.float32)
+    baseline = baseline_mean_usd.astype(jnp.float32)
+    pred = pred_ratio.astype(jnp.float32)
+    valid = (
+        valid_mask.astype(jnp.bool_)
+        & jnp.isfinite(ratio)
+        & (ratio > 0)
+        & jnp.isfinite(baseline)
+        & (baseline > 0)
+    )
+    weights = jnp.ones_like(ratio) if raw_weights is None else raw_weights.astype(jnp.float32)
+    valid = valid & jnp.isfinite(weights) & (weights > 0)
+    weights = jnp.where(valid, weights, 0.0)
+    target = jnp.where(valid, ratio, 0.0)
+    error = jnp.where(valid, jnp.where(valid, pred, 0.0) - target, 0.0)
+    abs_error = jnp.abs(error)
+    quadratic = jnp.minimum(abs_error, delta)
+    errors = 0.5 * quadratic**2 + delta * (abs_error - quadratic)
+    weight_sum = jnp.sum(weights)
+    denominator = jnp.where(weight_sum > 0, weight_sum, 1.0)
+    loss = jnp.sum(errors * weights) / denominator
+    usd_abs_error = abs_error * jnp.where(valid, baseline, 0.0)
+    sums = jnp.stack(
+        [
+            jnp.sum(errors * weights),
+            jnp.sum(abs_error * weights),
+            jnp.sum(target * weights),
+            jnp.sum(jnp.where(valid, baseline, 0.0) * weights),
+            weight_sum,
+            jnp.sum(valid).astype(jnp.float32),
+            jnp.sum(jnp.abs(1.0 - target) * weights),
+            jnp.sum(usd_abs_error * weights),
+            jnp.sum(jnp.where(valid, pred, 0.0) * weights),
+        ]
+    )
+    stats = {
+        "purchase-value_delayed_clicked-loss": loss,
+        "purchase-value_delayed_clicked-valid-count": jnp.sum(valid),
+        "purchase-value_delayed_clicked-weight-sum": weight_sum,
+        "purchase-value_delayed_clicked-ratio-mae": sums[1] / denominator,
+        "purchase-value_delayed_clicked-target-ratio": sums[2] / denominator,
+        "purchase-value_delayed_clicked-baseline-mean-usd": sums[3] / denominator,
+        "purchase-value_delayed_clicked-usd-mae": sums[7] / denominator,
+        "purchase-value_delayed_clicked-calib": sums[8] / (sums[2] + 1e-12),
+        "_purchase-value-sums": sums,
+    }
+    return loss, stats
+
+
+def purchase_value_smoothed_stats(
+    sums: jax.Array,
+    slice_count: jax.Array,
+    rce_ema: dict[str, jax.Array],
+    batch_size: jax.Array,
+    smoothing_windows: tuple[int, ...],
+) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+    batch_stat = jnp.concatenate([sums, slice_count.astype(jnp.float32)[None]])
+    a = jnp.minimum(1.0, batch_size / jnp.array(smoothing_windows, dtype=jnp.float32))[:, None]
+    old = jnp.stack(
+        [
+            rce_ema.get(f"purchase_value/{ws}", jnp.zeros((10,), dtype=jnp.float32))
+            for ws in smoothing_windows
+        ]
+    )
+    raw_updated = (1.0 - a) * old + a * batch_stat[None, :]
+    updated = jnp.where(
+        jnp.isnan(raw_updated),
+        jnp.where(jnp.isnan(old), batch_stat[None, :], old),
+        raw_updated,
+    )
+    weight = jnp.maximum(updated[:, 4], 1e-12)
+    has_labels = updated[:, 5] > 0
+    stats: dict[str, jax.Array] = {}
+    new_ema: dict[str, jax.Array] = {}
+    for i, ws in enumerate(smoothing_windows):
+        new_ema[f"purchase_value/{ws}"] = updated[i]
+        prefix = "purchase-value_delayed_clicked-smoothed"
+        for name, col in (
+            ("loss", 0),
+            ("ratio-mae", 1),
+            ("target-ratio", 2),
+            ("baseline-mean-usd", 3),
+            ("usd-mae", 7),
+        ):
+            stats[f"{prefix}-{name}-{ws}"] = jnp.where(
+                has_labels[i], updated[i, col] / weight[i], 0.0
+            )
+        stats[f"{prefix}-mae-vs-prior-{ws}"] = jnp.where(
+            updated[i, 6] > 0, updated[i, 1] / jnp.maximum(updated[i, 6], 1e-12), 0.0
+        )
+        stats[f"{prefix}-calib-{ws}"] = jnp.where(
+            updated[i, 2] > 0, updated[i, 8] / jnp.maximum(updated[i, 2], 1e-12), 0.0
+        )
+        stats[f"{prefix}-ratio-valid-{ws}"] = updated[i, 5] / jnp.maximum(updated[i, 9], 1.0)
+        stats[f"{prefix}-valid-count-{ws}"] = updated[i, 5]
+    return stats, new_ema
+
+
+def binary_threshold_loss_compute(
+    gt_raw: jax.Array,
+    logit: jax.Array,
+    valid_mask: jax.Array,
+    negative_sample_mask: jax.Array,
+    threshold: float,
+    mask_negatives: bool = True,
+    raw_weights: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    logit = logit.astype(jnp.float32)
+    gt_binary = (gt_raw.astype(jnp.float32) > threshold).astype(jnp.float32)
+    per_element_loss = optax.sigmoid_binary_cross_entropy(logit, gt_binary)
+
+    if mask_negatives:
+        loss_mask = valid_mask & (~negative_sample_mask)
+    else:
+        loss_mask = valid_mask
+
+    weights = loss_mask if raw_weights is None else loss_mask * raw_weights
+    num_loss_samples = jnp.sum(weights)
+    loss = jnp.sum(per_element_loss * weights) / jnp.maximum(num_loss_samples, 1.0)
+
+    pred_prob = jax.nn.sigmoid(logit)
+    return loss, gt_binary, pred_prob, loss_mask, per_element_loss
 
 
 def tweedie_loss_compute(

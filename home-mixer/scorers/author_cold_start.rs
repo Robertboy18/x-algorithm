@@ -41,14 +41,52 @@ enum AuthorCorpus {
     Treatment,
 }
 
+struct ColdStartParams {
+    enabled: bool,
+    tracked_ids: String,
+    arm: ViewerArm,
+    follower_cap: i64,
+    impression_threshold: u64,
+    max_post_age: Duration,
+    max_position_ratio: f64,
+    slot_min: usize,
+    slot_max: usize,
+    use_thompson_sampling: bool,
+    beta_alpha0: f64,
+    beta_beta0: f64,
+    impression_scale: f64,
+    ts_top_k: usize,
+}
+
+impl ColdStartParams {
+    fn read(query: &ScoredPostsQuery) -> Self {
+        Self {
+            enabled: query.params.get(EnableViewerColdStart),
+            tracked_ids: query.params.get(ColdStartTrackedIds),
+            arm: viewer_arm(query),
+            follower_cap: query.params.get(ColdStartFollowerCap),
+            impression_threshold: query.params.get(ColdStartImpressionThreshold) as u64,
+            max_post_age: Duration::from_secs(query.params.get(ColdStartMaxPostAgeSecs)),
+            max_position_ratio: query.params.get(LowImpressionsMaxPositionRatio),
+            slot_min: query.params.get(ColdStartSlotMin) as usize,
+            slot_max: query.params.get(ColdStartSlotMax) as usize,
+            use_thompson_sampling: query.params.get(EnableColdStartThompsonSampling),
+            beta_alpha0: query.params.get(ColdStartBetaAlpha0),
+            beta_beta0: query.params.get(ColdStartBetaBeta0),
+            impression_scale: query.params.get(ColdStartImpressionScale),
+            ts_top_k: query.params.get(ColdStartTsTopK) as usize,
+        }
+    }
+}
+
 fn viewer_arm(query: &ScoredPostsQuery) -> ViewerArm {
-    if query.params.get(PhoenixMoeCodivertViewerIsTreatment) {
-        return ViewerArm::Treatment;
+    let is_treatment = query.params.get(PhoenixMoeCodivertViewerIsTreatment);
+    let is_control = query.params.get(PhoenixMoeCodivertViewerIsControl);
+    match (is_treatment, is_control) {
+        (true, _) => ViewerArm::Treatment,
+        (false, true) => ViewerArm::Control,
+        (false, false) => ViewerArm::Holdout,
     }
-    if query.params.get(PhoenixMoeCodivertViewerIsControl) {
-        return ViewerArm::Control;
-    }
-    ViewerArm::Holdout
 }
 
 fn positions_among_nonzero(scores: &[f64]) -> (Vec<usize>, usize) {
@@ -102,12 +140,7 @@ fn count_tracked_ids(
             continue;
         }
         let source = c.served_type.map(|t| t as i32).unwrap_or(0);
-        if tracked.contains(&c.tweet_id) {
-            *counts.entry((c.tweet_id, source)).or_insert(0) += 1;
-        }
-        if tracked.contains(&c.author_id) {
-            *counts.entry((c.author_id, source)).or_insert(0) += 1;
-        }
+        *counts.entry((c.tweet_id, source)).or_insert(0) += 1;
     }
     counts
 }
@@ -149,12 +182,12 @@ fn author_corpus(
     candidates
         .iter()
         .map(|c| {
-            if author_rules.get(c.author_id, AuthorIsTreatment) {
-                AuthorCorpus::Treatment
-            } else if author_rules.get(c.author_id, AuthorIsControl) {
-                AuthorCorpus::Control
-            } else {
-                AuthorCorpus::NotBucketed
+            let is_treatment = author_rules.get(c.author_id, AuthorIsTreatment);
+            let is_control = author_rules.get(c.author_id, AuthorIsControl);
+            match (is_treatment, is_control) {
+                (true, _) => AuthorCorpus::Treatment,
+                (false, true) => AuthorCorpus::Control,
+                (false, false) => AuthorCorpus::NotBucketed,
             }
         })
         .collect()
@@ -179,11 +212,11 @@ fn apply_moe_ranking_policy(
     out
 }
 
-fn cold_start_target(query: &ScoredPostsQuery, scores: &[f64]) -> Option<f64> {
+fn cold_start_target(params: &ColdStartParams, scores: &[f64]) -> Option<f64> {
     let mut ranked = scores.to_vec();
     ranked.sort_by(|a, b| b.total_cmp(a));
-    let hi = (query.params.get(ColdStartSlotMax) as usize).min(ranked.len());
-    let lo = (query.params.get(ColdStartSlotMin) as usize).min(hi);
+    let hi = params.slot_max.min(ranked.len());
+    let lo = params.slot_min.min(hi);
     if lo >= hi {
         return None;
     }
@@ -196,13 +229,6 @@ fn cold_start_corpus_eligible(arm: ViewerArm, c: &PostCandidate, corpus: AuthorC
         ViewerArm::Control => corpus == AuthorCorpus::Control && !is_phoenix_moe(c),
         ViewerArm::Treatment => corpus == AuthorCorpus::Treatment,
     }
-}
-
-fn cold_start_freshness_eligible(arm: ViewerArm, c: &PostCandidate, max_age: Duration) -> bool {
-    if arm != ViewerArm::Treatment {
-        return true;
-    }
-    duration_since_creation_opt(c.tweet_id).is_some_and(|age| age <= max_age)
 }
 
 fn pick_by_score(eligible: &[usize], scores: &[f64]) -> Option<usize> {
@@ -219,7 +245,7 @@ fn sample_reward<R: Rng + ?Sized>(
     scale: f64,
     rng: &mut R,
 ) -> f64 {
-    let n = scale * candidate.view_count.unwrap_or(0) as f64;
+    let n = scale * candidate.view_count_on_home.unwrap_or(0) as f64;
     let x = (candidate.fav_count.unwrap_or(0).max(0) as f64).min(n);
     let alpha = alpha0 + x;
     let beta = beta0 + (n - x).max(0.0);
@@ -255,43 +281,40 @@ fn pick_thompson<R: Rng + ?Sized>(
 }
 
 fn apply_cold_start(
-    query: &ScoredPostsQuery,
+    params: &ColdStartParams,
     candidates: &[PostCandidate],
     scores: &[f64],
     corpus: &[AuthorCorpus],
-    arm: ViewerArm,
     target: f64,
 ) -> Vec<f64> {
-    let follower_cap = query.params.get(ColdStartFollowerCap);
-    let threshold = query.params.get(ColdStartImpressionThreshold) as u64;
-    let max_post_age = Duration::from_secs(query.params.get(ColdStartMaxPostAgeSecs));
-    let use_ts = query.params.get(EnableColdStartThompsonSampling);
+    let arm = params.arm;
     let (positions, nonzero) = positions_among_nonzero(scores);
-    let max_cold_start_slot =
-        (query.params.get(LowImpressionsMaxPositionRatio) * nonzero as f64) as usize;
+    let max_cold_start_slot = (params.max_position_ratio * nonzero as f64) as usize;
 
     let eligible: Vec<usize> = candidates
         .iter()
         .enumerate()
         .filter(|(i, c)| {
-            cold_start_base_eligible(c, follower_cap)
+            cold_start_base_eligible(c, params.follower_cap)
                 && cold_start_corpus_eligible(arm, c, corpus[*i])
-                && cold_start_freshness_eligible(arm, c, max_post_age)
+                && duration_since_creation_opt(c.tweet_id)
+                    .is_some_and(|age| age <= params.max_post_age)
                 && positions[*i] < max_cold_start_slot
-                && c.view_count.is_some_and(|imp| imp < threshold)
+                && c.view_count_on_home
+                    .is_some_and(|imp| imp < params.impression_threshold)
         })
         .map(|(i, _)| i)
         .collect();
 
-    let best_idx = if use_ts {
+    let best_idx = if params.use_thompson_sampling {
         pick_thompson(
             &eligible,
             candidates,
             scores,
-            query.params.get(ColdStartBetaAlpha0),
-            query.params.get(ColdStartBetaBeta0),
-            query.params.get(ColdStartImpressionScale),
-            query.params.get(ColdStartTsTopK) as usize,
+            params.beta_alpha0,
+            params.beta_beta0,
+            params.impression_scale,
+            params.ts_top_k,
             &mut rand::rng(),
         )
     } else {
@@ -320,24 +343,24 @@ impl AuthorColdStart {
         candidates: &[PostCandidate],
         scores: &[f64],
     ) -> Vec<f64> {
-        let tracked_ids: String = query.params.get(ColdStartTrackedIds);
-        record_tracked_ids(candidates, &tracked_ids);
-
-        if !query.params.get(EnableViewerColdStart) {
-            return scores.to_vec();
-        }
-
-        let arm = viewer_arm(query);
-        let corpus = match arm {
+        let params = ColdStartParams::read(query);
+        record_tracked_ids(candidates, &params.tracked_ids);
+        let corpus = match params.arm {
             ViewerArm::Holdout => vec![AuthorCorpus::NotBucketed; candidates.len()],
             ViewerArm::Control | ViewerArm::Treatment => {
                 author_corpus(&self.author_rules, candidates)
             }
         };
 
+        if !params.enabled {
+            return scores.to_vec();
+        }
+
+        let arm = params.arm;
+
         let mut effective = apply_moe_ranking_policy(arm, candidates, &corpus, scores);
-        if let Some(target) = cold_start_target(query, scores) {
-            effective = apply_cold_start(query, candidates, &effective, &corpus, arm, target);
+        if let Some(target) = cold_start_target(&params, scores) {
+            effective = apply_cold_start(&params, candidates, &effective, &corpus, target);
         }
         effective
     }
@@ -350,7 +373,8 @@ mod tests {
     use xai_candidate_pipeline::component_library::utils::current_time_to_id;
     use xai_feature_switches::{
         BucketMembership, ExperimentBucket, ExperimentBucketsChooser, FeatureSwitches,
-        NullBucketImpressor, Recipient,
+        MockExperimentBucketsChooser, NullBucketImpressor, Recipient, RecipientBuilder,
+        SpyingBucketImpressor,
     };
 
     #[derive(Debug)]
@@ -385,6 +409,14 @@ mod tests {
     }
 
     fn cold_start_with_arms(treatment: Vec<u64>, control: Vec<u64>) -> AuthorColdStart {
+        cold_start_with_author_impressor(treatment, control, Arc::new(NullBucketImpressor::new()))
+    }
+
+    fn cold_start_with_author_impressor(
+        treatment: Vec<u64>,
+        control: Vec<u64>,
+        impressor: Arc<dyn xai_feature_switches::ExperimentBucketImpressor>,
+    ) -> AuthorColdStart {
         let yaml = r#"
 rust_home_mixer:
   description: "x"
@@ -402,10 +434,12 @@ rust_home_mixer:
         [moe_exp author_bucket_membership treatment]
       values:
         rust_home_mixer_author_is_treatment: true
+        rust_home_mixer_author_is_control: false
     - description: "moe control corpus"
       query: >
         [moe_exp author_bucket_membership control]
       values:
+        rust_home_mixer_author_is_treatment: false
         rust_home_mixer_author_is_control: true
 "#;
         let features = xai_feature_switches::load_yaml_string(yaml).unwrap();
@@ -413,10 +447,9 @@ rust_home_mixer:
             FeatureSwitches::with_options(
                 features,
                 Arc::new(ArmChooser { treatment, control }),
-                Arc::new(NullBucketImpressor::new()),
+                impressor,
                 None,
                 false,
-                None,
             )
             .unwrap(),
         );
@@ -433,34 +466,43 @@ rust_home_mixer:
         current_time_to_id() as u64 - ((age.as_millis() as u64) << 22)
     }
 
-    fn cold_start_candidate(author_id: u64, age: Duration, view_count: u64) -> PostCandidate {
-        cold_start_candidate_with_favs(author_id, age, view_count, 0)
+    fn cold_start_candidate(
+        author_id: u64,
+        age: Duration,
+        view_count_on_home: u64,
+    ) -> PostCandidate {
+        cold_start_candidate_with_favs(author_id, age, view_count_on_home, 0)
     }
 
     fn cold_start_candidate_with_favs(
         author_id: u64,
         age: Duration,
-        view_count: u64,
+        view_count_on_home: u64,
         fav_count: i64,
     ) -> PostCandidate {
         PostCandidate {
             author_id,
             tweet_id: tweet_id_with_age(age),
             author_followers_count: Some(100),
-            view_count: Some(view_count),
+            view_count_on_home: Some(view_count_on_home),
             fav_count: Some(fav_count),
             ..Default::default()
         }
     }
 
-    fn moe_candidate(author_id: u64, age: Duration, view_count: u64) -> PostCandidate {
+    fn moe_candidate(author_id: u64, age: Duration, view_count_on_home: u64) -> PostCandidate {
+        moe_candidate_with_favs(author_id, age, view_count_on_home, 0)
+    }
+
+    fn moe_candidate_with_favs(
+        author_id: u64,
+        age: Duration,
+        view_count_on_home: u64,
+        fav_count: i64,
+    ) -> PostCandidate {
         PostCandidate {
-            author_id,
-            tweet_id: tweet_id_with_age(age),
-            author_followers_count: Some(100),
-            view_count: Some(view_count),
             served_type: Some(pb::ServedType::ForYouPhoenixRetrievalMoe),
-            ..Default::default()
+            ..cold_start_candidate_with_favs(author_id, age, view_count_on_home, fav_count)
         }
     }
 
@@ -580,7 +622,7 @@ rust_home_mixer:
     }
 
     #[test]
-    fn treatment_viewer_keeps_treatment_moe_and_cold_starts_treatment_corpus() {
+    fn treatment_viewer_cold_starts_treatment_authors_only() {
         let author_cold_start = cold_start_with_arms(vec![1, 2], vec![3]);
         let candidates = vec![
             moe_candidate(1, minutes(10), 3),
@@ -590,19 +632,19 @@ rust_home_mixer:
         let result = author_cold_start.apply(
             &codivert_query(false, true),
             &candidates,
-            &[80.0, 50.0, 90.0],
+            &[50.0, 80.0, 90.0],
         );
-        assert_eq!(result[0], 90.0);
-        assert_eq!(result[1], 50.0);
+        assert_eq!(result[0], 50.0);
+        assert_eq!(result[1], 90.0);
         assert_eq!(result[2], 90.0);
     }
 
     #[test]
-    fn treatment_skips_post_older_than_max_post_age() {
-        let author_cold_start = cold_start_with_arms(vec![1], vec![]);
+    fn skips_post_older_than_max_post_age() {
+        let author_cold_start = cold_start_with_arms(vec![1, 2], vec![]);
         let candidates = vec![
-            cold_start_candidate(1, minutes(180), 3),
-            cold_start_candidate(2, minutes(30), 1000),
+            moe_candidate(1, minutes(180), 3),
+            moe_candidate(2, minutes(30), 1000),
         ];
         let result = author_cold_start.apply(
             &query_with_max_post_age(true, 7200),
@@ -610,21 +652,6 @@ rust_home_mixer:
             &[10.0, 90.0],
         );
         assert_eq!(result, vec![10.0, 90.0]);
-    }
-
-    #[test]
-    fn control_ignores_max_post_age() {
-        let author_cold_start = cold_start_with_arms(vec![], vec![1]);
-        let candidates = vec![
-            cold_start_candidate(1, minutes(180), 3),
-            cold_start_candidate(2, minutes(30), 1000),
-        ];
-        let result = author_cold_start.apply(
-            &query_with_max_post_age(false, 7200),
-            &candidates,
-            &[10.0, 90.0],
-        );
-        assert_eq!(result, vec![90.0, 90.0]);
     }
 
     #[test]
@@ -653,33 +680,116 @@ rust_home_mixer:
     fn ts_top_k_zero_falls_back_to_argmax_score() {
         let author_cold_start = cold_start_with_arms(vec![1, 2], vec![]);
         let candidates = vec![
-            cold_start_candidate_with_favs(1, minutes(10), 0, 0),
-            cold_start_candidate_with_favs(2, minutes(20), 3, 0),
+            moe_candidate_with_favs(1, minutes(10), 0, 0),
+            moe_candidate_with_favs(2, minutes(20), 3, 0),
         ];
         let result = author_cold_start.apply(&ts_query(true, 0), &candidates, &[10.0, 90.0]);
         assert_eq!(result, vec![10.0, 90.0]);
     }
 
-    #[test]
-    fn treatment_ts_among_top_k_picks_highest_score() {
-        let author_cold_start = cold_start_with_arms(vec![1, 2], vec![]);
-        let candidates = vec![
-            cold_start_candidate_with_favs(1, minutes(10), 0, 0),
-            cold_start_candidate_with_favs(2, minutes(20), 0, 0),
-        ];
-        let result = author_cold_start.apply(&ts_query(true, 10), &candidates, &[10.0, 90.0]);
-        assert_eq!(result, vec![10.0, 90.0]);
+    const CODIVERT_EXPERIMENT: &str = "moe_codivert_viewer";
+
+    const CODIVERT_YAML: &str = r#"
+rust_home_mixer:
+  description: "x"
+  owner: "t@example.com"
+  parameters:
+    rust_home_mixer_phoenix_moe_codivert_viewer_is_control:
+      type: boolean
+      default: false
+    rust_home_mixer_phoenix_moe_codivert_viewer_is_treatment:
+      type: boolean
+      default: false
+    rust_home_mixer_enable_viewer_cold_start_boost:
+      type: boolean
+      default: true
+  rules:
+    - description: "co-divert viewer treatment"
+      query: >
+        [moe_codivert_viewer bucket_membership treatment]
+      values:
+        rust_home_mixer_phoenix_moe_codivert_viewer_is_treatment: true
+        rust_home_mixer_phoenix_moe_codivert_viewer_is_control: false
+        rust_home_mixer_enable_viewer_cold_start_boost: true
+    - description: "co-divert viewer control"
+      query: >
+        [moe_codivert_viewer bucket_membership control]
+      values:
+        rust_home_mixer_phoenix_moe_codivert_viewer_is_treatment: false
+        rust_home_mixer_phoenix_moe_codivert_viewer_is_control: true
+        rust_home_mixer_enable_viewer_cold_start_boost: false
+"#;
+
+    fn codivert_viewer(arm: &str) -> (ScoredPostsQuery, Arc<SpyingBucketImpressor>) {
+        let mut buckets = BucketMembership::new();
+        buckets.add(ExperimentBucket::new(CODIVERT_EXPERIMENT, arm).with_version(1));
+        let impressor = Arc::new(SpyingBucketImpressor::new());
+        let fs = FeatureSwitches::with_options(
+            xai_feature_switches::load_yaml_string(CODIVERT_YAML).unwrap(),
+            Arc::new(MockExperimentBucketsChooser::with_buckets(buckets)),
+            impressor.clone(),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let query = ScoredPostsQuery {
+            params: fs
+                .match_recipient(&RecipientBuilder::new().user_id(7).build())
+                .into(),
+            ..Default::default()
+        };
+        (query, impressor)
     }
 
     #[test]
-    fn control_ts_among_top_k_picks_highest_score() {
-        let author_cold_start = cold_start_with_arms(vec![], vec![1, 2]);
+    fn both_arms_log_the_same_codivert_impressions() {
+        let author_cold_start = cold_start_with_arms(vec![2], vec![1]);
         let candidates = vec![
-            cold_start_candidate_with_favs(1, minutes(10), 0, 0),
-            cold_start_candidate_with_favs(2, minutes(20), 0, 0),
+            cold_start_candidate(1, minutes(10), 3),
+            moe_candidate(2, minutes(20), 3),
         ];
-        let result = author_cold_start.apply(&ts_query(false, 10), &candidates, &[10.0, 90.0]);
-        assert_eq!(result, vec![10.0, 90.0]);
+
+        let (control_query, control_impressor) = codivert_viewer("control");
+        author_cold_start.apply(&control_query, &candidates, &[5.0, 40.0]);
+
+        let (treatment_query, treatment_impressor) = codivert_viewer("treatment");
+        author_cold_start.apply(&treatment_query, &candidates, &[5.0, 40.0]);
+
+        assert_eq!(control_impressor.impression_count(CODIVERT_EXPERIMENT), 3);
+        assert_eq!(treatment_impressor.impression_count(CODIVERT_EXPERIMENT), 3);
+    }
+
+    fn viewer_query(control: bool, treatment: bool, cold_start: bool) -> ScoredPostsQuery {
+        let mut query = codivert_query(control, treatment);
+        let mut results = query.params.0.expect("params set");
+        results.override_fs(
+            "rust_home_mixer_enable_viewer_cold_start_boost".to_string(),
+            if cold_start { "true" } else { "false" },
+        );
+        query.params = results.into();
+        query
+    }
+
+    #[test]
+    fn both_viewer_arms_log_the_same_author_impressions() {
+        let candidates = vec![
+            cold_start_candidate(1, minutes(10), 3),
+            moe_candidate(2, minutes(20), 3),
+        ];
+        let scores = [5.0, 40.0];
+
+        let cases = [
+            viewer_query(true, false, false),
+            viewer_query(false, true, true),
+        ];
+        for query in cases {
+            let impressor = Arc::new(SpyingBucketImpressor::new());
+            let author_cold_start =
+                cold_start_with_author_impressor(vec![2], vec![1], impressor.clone());
+            author_cold_start.apply(&query, &candidates, &scores);
+            assert_eq!(impressor.impression_count("moe_exp"), 2);
+        }
     }
 
     #[test]
@@ -720,18 +830,22 @@ rust_home_mixer:
         ];
         let counts = count_tracked_ids(&candidates, &tracked);
         assert_eq!(
-            counts.get(&(10, pb::ServedType::ForYouPhoenixRetrieval as i32)),
+            counts.get(&(1, pb::ServedType::ForYouPhoenixRetrieval as i32)),
             Some(&1)
         );
         assert_eq!(
-            counts.get(&(10, pb::ServedType::ForYouPhoenixRetrievalMoe as i32)),
+            counts.get(&(2, pb::ServedType::ForYouPhoenixRetrievalMoe as i32)),
             Some(&1)
         );
         assert_eq!(
             counts.get(&(20, pb::ServedType::ForYouInNetwork as i32)),
             Some(&1)
         );
-        assert_eq!(counts.get(&(30, 0)), None);
+        assert_eq!(
+            counts.get(&(10, pb::ServedType::ForYouPhoenixRetrieval as i32)),
+            None
+        );
+        assert_eq!(counts.get(&(3, 0)), None);
     }
 
     #[test]

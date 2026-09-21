@@ -1,8 +1,8 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::{
-    EnablePhoenixRetrievalStatsExperimentBucket, PhoenixRetrievalInferenceClusterId,
-    PhoenixRetrievalMOEInferenceClusterId, TRACE_USER_IDS,
+    EnablePhoenixRetrievalStatsExperimentBucket, EnablePhoenixScoreStatsExperimentBucket,
+    PhoenixRetrievalInferenceClusterId, PhoenixRetrievalMOEInferenceClusterId, TRACE_USER_IDS,
 };
 
 use rand::random;
@@ -69,9 +69,21 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                 .query
                 .params
                 .experiment_buckets(EnablePhoenixRetrievalStatsExperimentBucket);
+            let score_buckets = input
+                .query
+                .params
+                .experiment_buckets(EnablePhoenixScoreStatsExperimentBucket);
 
-            if !experiment_buckets.is_empty() || random::<f64>() < DEFAULT_SAMPLING_RATE {
-                record_score_distributions(receiver.as_ref(), "score", candidates.iter());
+            let sampled = random::<f64>() < DEFAULT_SAMPLING_RATE;
+            if !score_buckets.is_empty() || sampled {
+                record_score_distributions(
+                    receiver.as_ref(),
+                    "score",
+                    candidates.iter(),
+                    &score_buckets,
+                );
+            }
+            if !experiment_buckets.is_empty() || sampled {
                 record_phoenix_retrieval_stats(
                     receiver.as_ref(),
                     &input.selected_candidates,
@@ -86,10 +98,17 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                     &moe_cluster,
                     &experiment_buckets,
                 );
+                record_phoenix_retrieval_cold_stats(
+                    receiver.as_ref(),
+                    &input.selected_candidates,
+                    &input.non_selected_candidates,
+                    &retrieval_cluster,
+                    &experiment_buckets,
+                );
             }
         } else {
             if random::<f64>() < DEFAULT_SAMPLING_RATE {
-                record_score_distributions(receiver.as_ref(), "score", candidates.iter());
+                record_score_distributions(receiver.as_ref(), "score", candidates.iter(), &[]);
             }
         }
 
@@ -122,8 +141,16 @@ fn record_head(
     metric: &str,
     name: &str,
     scores: impl Iterator<Item = Option<f64>>,
+    experiment_buckets: &[&ExperimentBucket],
 ) {
-    record_head_with_buckets(receiver, metric, name, scores, HistogramBuckets::Bucket0To1);
+    record_head_with_buckets(
+        receiver,
+        metric,
+        name,
+        scores,
+        HistogramBuckets::Bucket0To1,
+        experiment_buckets,
+    );
 }
 
 fn record_head_with_buckets(
@@ -132,9 +159,12 @@ fn record_head_with_buckets(
     name: &str,
     scores: impl Iterator<Item = Option<f64>>,
     buckets: HistogramBuckets,
+    experiment_buckets: &[&ExperimentBucket],
 ) {
     let distribution_key = format!("{METRIC_PREFIX}.{metric}Distribution.{name}");
     let missing_key = format!("{METRIC_PREFIX}.{metric}Missing.{name}");
+    let by_bucket_key = (!experiment_buckets.is_empty())
+        .then(|| format!("{METRIC_PREFIX}.{metric}DistributionByBucket.{name}"));
     let mut present = 0u64;
     let mut missing = 0u64;
     for score in scores {
@@ -142,6 +172,16 @@ fn record_head_with_buckets(
             Some(value) => {
                 present += 1;
                 receiver.observe(&distribution_key, &[], value, buckets);
+                if let Some(key) = &by_bucket_key {
+                    for b in experiment_buckets {
+                        receiver.observe(
+                            key,
+                            &[("ddg", &b.experiment), ("bucket", &b.bucket)],
+                            value,
+                            buckets,
+                        );
+                    }
+                }
             }
             None => {
                 missing += 1;
@@ -156,42 +196,49 @@ fn record_score_distributions<'a>(
     receiver: &dyn StatsReceiverExt,
     metric: &str,
     candidates: impl Iterator<Item = &'a PostCandidate> + Clone,
+    experiment_buckets: &[&ExperimentBucket],
 ) {
     record_head(
         receiver,
         metric,
         "favorite",
         candidates.clone().map(|c| c.phoenix_scores.favorite_score),
+        experiment_buckets,
     );
     record_head(
         receiver,
         metric,
         "reply",
         candidates.clone().map(|c| c.phoenix_scores.reply_score),
+        experiment_buckets,
     );
     record_head(
         receiver,
         metric,
         "retweet",
         candidates.clone().map(|c| c.phoenix_scores.retweet_score),
+        experiment_buckets,
     );
     record_head(
         receiver,
         metric,
         "click",
         candidates.clone().map(|c| c.phoenix_scores.click_score),
+        experiment_buckets,
     );
     record_head(
         receiver,
         metric,
         "vqv",
         candidates.clone().map(|c| c.phoenix_scores.vqv_score),
+        experiment_buckets,
     );
     record_head(
         receiver,
         metric,
         "share",
         candidates.clone().map(|c| c.phoenix_scores.share_score),
+        experiment_buckets,
     );
     record_head(
         receiver,
@@ -200,6 +247,16 @@ fn record_score_distributions<'a>(
         candidates
             .clone()
             .map(|c| c.phoenix_scores.not_interested_score),
+        experiment_buckets,
+    );
+    record_head(
+        receiver,
+        metric,
+        "not_dwelled",
+        candidates
+            .clone()
+            .map(|c| c.phoenix_scores.not_dwelled_score),
+        experiment_buckets,
     );
     record_head_with_buckets(
         receiver,
@@ -207,14 +264,22 @@ fn record_score_distributions<'a>(
         "dwellTime",
         candidates.clone().map(|c| c.phoenix_scores.dwell_time),
         HistogramBuckets::Bucket0To50,
+        experiment_buckets,
     );
     record_head(
         receiver,
         metric,
         "weightedScore",
         candidates.clone().map(|c| c.weighted_score),
+        experiment_buckets,
     );
-    record_head(receiver, metric, "finalScore", candidates.map(|c| c.score));
+    record_head(
+        receiver,
+        metric,
+        "finalScore",
+        candidates.map(|c| c.score),
+        experiment_buckets,
+    );
 }
 
 fn record_trace_author_score_distributions(
@@ -249,8 +314,8 @@ fn record_trace_author_score_distributions(
         .filter(is_original)
         .partition(|c| c.author_id == author_id);
 
-    record_score_distributions(receiver, "traceAuthorScore", author.iter().copied());
-    record_score_distributions(receiver, "traceOtherScore", others.iter().copied());
+    record_score_distributions(receiver, "traceAuthorScore", author.iter().copied(), &[]);
+    record_score_distributions(receiver, "traceOtherScore", others.iter().copied(), &[]);
 }
 
 fn post_type(candidate: &PostCandidate) -> &'static str {
@@ -339,6 +404,24 @@ fn record_phoenix_retrieval_moe_stats(
         experiment_buckets,
         ServedType::ForYouPhoenixRetrievalMoe,
         "PhoenixRetrievalMoeTweets",
+    );
+}
+
+fn record_phoenix_retrieval_cold_stats(
+    receiver: &dyn StatsReceiverExt,
+    selected_candidates: &[PostCandidate],
+    non_selected_candidates: &[PostCandidate],
+    retrieval_cluster: &str,
+    experiment_buckets: &[&ExperimentBucket],
+) {
+    record_retrieval_source_stats(
+        receiver,
+        selected_candidates,
+        non_selected_candidates,
+        retrieval_cluster,
+        experiment_buckets,
+        ServedType::ForYouPhoenixRetrievalCold,
+        "PhoenixRetrievalColdTweets",
     );
 }
 

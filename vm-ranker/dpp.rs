@@ -32,7 +32,12 @@ pub struct DppResult {
     pub score: f64,
 }
 
-pub fn rescore(inputs: &[DppInput], config: &DppConfig, _viewer_id: u64) -> Vec<DppResult> {
+pub fn rescore(
+    inputs: &[DppInput],
+    seed: Option<&DppInput>,
+    config: &DppConfig,
+    _viewer_id: u64,
+) -> Vec<DppResult> {
     let n = inputs.len();
     if n == 0 {
         return Vec::new();
@@ -86,43 +91,56 @@ pub fn rescore(inputs: &[DppInput], config: &DppConfig, _viewer_id: u64) -> Vec<
 
     let max_score = inputs[top_indices[0]].score.max(EPSILON);
 
-    let q: Vec<f64> = top_indices
-        .iter()
-        .map(|&i| inputs[i].score / max_score)
-        .collect();
-
     let theta = config.theta.clamp(0.0, 1.0 - EPSILON);
     let alpha = theta / (2.0 * (1.0 - theta));
 
-    let qf: Vec<f64> = q.iter().map(|&qi| (alpha * qi).exp()).collect();
+    let total = m + usize::from(seed.is_some());
+    let item_at = |ki: usize| -> &DppInput {
+        if ki < m {
+            &inputs[top_indices[ki]]
+        } else {
+            seed.expect("index m only exists when seed is present")
+        }
+    };
 
-    let norms: Vec<f64> = top_indices.iter().map(|&i| inputs[i].norm).collect();
+    let qf: Vec<f64> = (0..total)
+        .map(|ki| {
+            let q = if ki < m {
+                item_at(ki).score / max_score
+            } else {
+                1.0
+            };
+            (alpha * q).exp()
+        })
+        .collect();
 
-    let mut cos_matrix = vec![0.0f64; m * m];
-    let mut kernel = vec![0.0f64; m * m];
-    for i in 0..m {
-        cos_matrix[i * m + i] = 1.0;
-        kernel[i * m + i] = qf[i] * qf[i];
-        for j in (i + 1)..m {
+    let norms: Vec<f64> = (0..total).map(|ki| item_at(ki).norm).collect();
+
+    let mut kernel = vec![0.0f64; total * total];
+    for i in 0..total {
+        kernel[i * total + i] = qf[i] * qf[i];
+        for j in (i + 1)..total {
             let denom = norms[i] * norms[j];
             let cos = if denom > EPSILON {
-                dot_product(
-                    &inputs[top_indices[i]].embedding,
-                    &inputs[top_indices[j]].embedding,
-                ) / denom
+                dot_product(&item_at(i).embedding, &item_at(j).embedding) / denom
             } else {
                 0.0
             };
-            cos_matrix[i * m + j] = cos;
-            cos_matrix[j * m + i] = cos;
             let val = qf[i] * qf[j] * cos;
-            kernel[i * m + j] = val;
-            kernel[j * m + i] = val;
+            kernel[i * total + j] = val;
+            kernel[j * total + i] = val;
         }
     }
 
-    let dpp_result = greedy_dpp(&kernel, m, config.top_k);
-    let selected = &dpp_result.selected;
+    let pinned = seed.map(|_| m);
+    let dpp_result = greedy_dpp(&kernel, total, config.top_k, pinned);
+    let selected: Vec<(usize, f64)> = dpp_result
+        .selected
+        .iter()
+        .copied()
+        .filter(|&(ki, _)| ki < m)
+        .collect();
+    let selected = &selected;
 
     let reason = if dpp_result.rank_exhausted {
         "rank_exhausted"
@@ -202,7 +220,7 @@ struct GreedyDppResult {
     rank_exhausted: bool,
 }
 
-fn greedy_dpp(kernel: &[f64], n: usize, k: usize) -> GreedyDppResult {
+fn greedy_dpp(kernel: &[f64], n: usize, k: usize, pinned_first: Option<usize>) -> GreedyDppResult {
     if n == 0 || k == 0 {
         return GreedyDppResult {
             selected: Vec::new(),
@@ -210,19 +228,29 @@ fn greedy_dpp(kernel: &[f64], n: usize, k: usize) -> GreedyDppResult {
             rank_exhausted: true,
         };
     }
-    let max_items = k.min(n);
+    let pinned = pinned_first.filter(|&p| kernel[p * n + p] > EPSILON);
+    let max_items = match pinned {
+        Some(_) => (k + 1).min(n),
+        None => k.min(n),
+    };
     let mut selected: Vec<(usize, f64)> = Vec::with_capacity(max_items);
     let mut available = vec![true; n];
 
-    let mut first = 0;
-    let mut first_val = f64::NEG_INFINITY;
-    for i in 0..n {
-        let d = kernel[i * n + i];
-        if d > first_val {
-            first_val = d;
-            first = i;
+    let (first, first_val) = match pinned {
+        Some(p) => (p, kernel[p * n + p]),
+        None => {
+            let mut first = 0;
+            let mut first_val = f64::NEG_INFINITY;
+            for i in 0..n {
+                let d = kernel[i * n + i];
+                if d > first_val {
+                    first_val = d;
+                    first = i;
+                }
+            }
+            (first, first_val)
         }
-    }
+    };
     let mut log_det = first_val.ln();
     selected.push((first, log_det));
     available[first] = false;
@@ -346,14 +374,14 @@ mod tests {
 
     #[test]
     fn empty_input() {
-        let result = rescore(&[], &default_config(), 0);
+        let result = rescore(&[], None, &default_config(), 0);
         assert!(result.is_empty());
     }
 
     #[test]
     fn single_candidate() {
         let inputs = vec![make_input(1, 5.0, &[1.0, 0.0, 0.0])];
-        let result = rescore(&inputs, &default_config(), 0);
+        let result = rescore(&inputs, None, &default_config(), 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, 1);
         assert!((result[0].score - 5.0).abs() < 1e-9);
@@ -374,7 +402,7 @@ mod tests {
 
             debug_viewer_id: 0,
         };
-        let result = rescore(&inputs, &config, 0);
+        let result = rescore(&inputs, None, &config, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, 1);
     }
@@ -393,7 +421,7 @@ mod tests {
 
             debug_viewer_id: 0,
         };
-        let result = rescore(&inputs, &config, 0);
+        let result = rescore(&inputs, None, &config, 0);
         let ids: Vec<u64> = result.iter().map(|r| r.id).collect();
         assert!(ids.contains(&3), "orthogonal candidate should be selected");
         assert!(
@@ -417,7 +445,7 @@ mod tests {
 
             debug_viewer_id: 0,
         };
-        let result = rescore(&inputs, &config, 0);
+        let result = rescore(&inputs, None, &config, 0);
         assert!(result.len() <= 10, "at most top_k items returned");
         assert!(!result.is_empty(), "should select at least one item");
         for w in result.windows(2) {
@@ -450,12 +478,61 @@ mod tests {
 
             debug_viewer_id: 0,
         };
-        let result = rescore(&inputs, &config, 0);
+        let result = rescore(&inputs, None, &config, 0);
         assert!(result.len() <= 5, "at most top_k items");
         assert!(!result.is_empty());
         for r in &result {
             assert!(r.id < 10, "from top-10 pool");
         }
+    }
+
+    #[test]
+    fn seed_suppresses_near_duplicate() {
+        let seed = make_input(999, 0.0, &[1.0, 0.0]);
+        let inputs = vec![
+            make_input(1, 10.0, &[1.0, 0.0]),
+            make_input(2, 5.0, &[0.0, 1.0]),
+        ];
+        let config = DppConfig {
+            top_k: 2,
+            theta: 0.5,
+            max_selected_rank: 10,
+            debug_viewer_id: 0,
+        };
+
+        let ids: Vec<u64> = rescore(&inputs, None, &config, 0)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(ids.contains(&1) && ids.contains(&2));
+
+        let result = rescore(&inputs, Some(&seed), &config, 0);
+        let ids: Vec<u64> = result.iter().map(|r| r.id).collect();
+        assert!(
+            !ids.contains(&1),
+            "seed near-duplicate should be suppressed, got {ids:?}"
+        );
+        assert!(ids.contains(&2), "orthogonal candidate should survive");
+        assert!(!ids.contains(&999), "seed itself never returned");
+    }
+
+    #[test]
+    fn seed_does_not_consume_top_k_budget() {
+        let seed = make_input(999, 0.0, &[0.0, 0.0, 1.0]);
+        let inputs = vec![
+            make_input(1, 10.0, &[1.0, 0.0, 0.0]),
+            make_input(2, 5.0, &[0.0, 1.0, 0.0]),
+        ];
+        let config = DppConfig {
+            top_k: 2,
+            theta: 0.5,
+            max_selected_rank: 10,
+            debug_viewer_id: 0,
+        };
+        let result = rescore(&inputs, Some(&seed), &config, 0);
+        let ids: Vec<u64> = result.iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), 2, "seed must not eat top_k budget, got {ids:?}");
+        assert!(ids.contains(&1) && ids.contains(&2));
     }
 
     fn f16_vec(vals: &[f32]) -> Vec<f16> {

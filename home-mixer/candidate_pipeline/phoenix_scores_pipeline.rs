@@ -139,9 +139,11 @@ impl PhoenixScoresPipeline {
             Box::new(CoreDataCandidateHydrator::new(tes_client.clone()).await),
             Box::new(InNetworkCandidateHydrator),
             Box::new(GizmoduckCandidateHydrator::new(gizmoduck_client).await),
-            Box::new(MediaInfoHydrator::new(media_info_cache_client).await),
+            Box::new(MediaInfoHydrator::new(media_info_cache_client.clone()).await),
             Box::new(LanguageCodeHydrator::new(tes_client.clone()).await),
-            Box::new(QuoteHydrator::new(tes_client, socialgraph_client).await),
+            Box::new(
+                QuoteHydrator::new(tes_client, socialgraph_client, media_info_cache_client).await,
+            ),
             Box::new(SemanticIdHydrator::new(sid_client)),
         ];
 

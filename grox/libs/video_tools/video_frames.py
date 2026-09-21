@@ -8,13 +8,19 @@ import av
 import cv2
 import numpy as np
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import Field, BaseModel
 from av.stream import Stream
 from av.container import InputContainer
 
-from video_tools.image import resize_tile, enhance_image_with_clahe
+from video_tools.image import (
+    resize_tile,
+    enhance_image_with_clahe,
+    build_motion_reveal_images,
+)
 
 logger = logging.getLogger(__name__)
+
+_MOTION_REVEAL_DENSE_SAMPLES = 48
 
 
 class VideoFrame(BaseModel):
@@ -26,6 +32,7 @@ class VideoData(BaseModel):
     frames: list[VideoFrame]
     combined_bytes: bytes | None = None
     total_duration: float | None = None
+    motion_reveal_frames: list[bytes] = Field(default_factory=list)
 
 
 class VideoFramesExtractor:
@@ -37,6 +44,8 @@ class VideoFramesExtractor:
         tile_size: int | None = None,
         enable_clahe: bool = False,
         include_combined_video_bytes: bool = True,
+        enable_motion_reveal: bool = False,
+        max_duration: float | None = None,
     ) -> VideoData:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -47,6 +56,8 @@ class VideoFramesExtractor:
             tile_size,
             enable_clahe,
             include_combined_video_bytes,
+            enable_motion_reveal,
+            max_duration,
         )
 
     @classmethod
@@ -57,6 +68,8 @@ class VideoFramesExtractor:
         tile_size: int | None,
         enable_clahe: bool = False,
         include_combined_video_bytes: bool = True,
+        enable_motion_reveal: bool = False,
+        max_duration: float | None = None,
     ) -> VideoData:
         logger.info(f"Extracting maximum {max_frames} frames from video")
 
@@ -70,8 +83,39 @@ class VideoFramesExtractor:
                 logger.warning("No duration found for video")
                 c_duration = 0
             total_duration = float(c_duration / av.time_base)
+            if max_duration is not None:
+                total_duration = min(total_duration, max_duration)
             sample_times = cls._sample_frames(total_duration, max_frames)
             frames = cls._extract_frames_at_times(container, sample_times)
+
+            reveal_input = frames
+            if enable_motion_reveal and frames and total_duration > 0:
+                dense_times = [
+                    i * total_duration / _MOTION_REVEAL_DENSE_SAMPLES
+                    for i in range(_MOTION_REVEAL_DENSE_SAMPLES)
+                ]
+                try:
+                    dense_frames = cls._extract_frames_at_times(container, dense_times)
+                    if len(dense_frames) > len(frames):
+                        reveal_input = dense_frames
+                except Exception:
+                    logger.warning(
+                        "Failed to extract dense motion-reveal frames; using sampled frames",
+                        exc_info=True,
+                    )
+
+        motion_reveal_frames: list[bytes] = []
+        if enable_motion_reveal:
+            try:
+                motion_reveal_frames = build_motion_reveal_images(
+                    [frame.frame for frame in reveal_input]
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to build motion-reveal stills; continuing with RGB frames only",
+                    exc_info=True,
+                )
+
         for frame in frames:
             frame.frame = cls._process_frame(frame.frame, tile_size, enable_clahe)
         logger.info(f"Extracted {len(frames)} frames")
@@ -81,7 +125,10 @@ class VideoFramesExtractor:
             else None
         )
         return VideoData(
-            frames=frames, combined_bytes=combined_bytes, total_duration=total_duration
+            frames=frames,
+            combined_bytes=combined_bytes,
+            total_duration=total_duration,
+            motion_reveal_frames=motion_reveal_frames,
         )
 
     @classmethod

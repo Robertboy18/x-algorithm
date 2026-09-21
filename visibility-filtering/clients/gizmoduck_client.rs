@@ -9,7 +9,7 @@ pub struct GizmoduckLookup {
 
 fn author_hydration_lookup_context() -> LookupContext {
     LookupContext {
-        for_user_id: 0,
+        for_user_id: None,
         include_deactivated: true,
         include_failed: true,
         include_erased: true,
@@ -46,7 +46,7 @@ mod tests {
     #[test]
     fn author_lookup_context_sets_include_flags() {
         let ctx = author_hydration_lookup_context();
-        assert_eq!(ctx.for_user_id, 0);
+        assert_eq!(ctx.for_user_id, None);
         assert!(ctx.include_deactivated);
         assert!(ctx.include_failed);
         assert!(ctx.include_erased);

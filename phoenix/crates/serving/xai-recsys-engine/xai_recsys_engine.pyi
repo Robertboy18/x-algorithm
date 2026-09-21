@@ -19,9 +19,6 @@ class PyMmEmbeddingsClient:
     ) -> npt.NDArray[np.float16]: ...
     def wait_until_ready(self) -> None: ...
 
-class PySemanticIdClient:
-    def __init__(self, endpoint: str, sid_num_levels: int) -> None: ...
-
 class RankingBatchPrep:
     def __init__(
         self,
@@ -178,7 +175,6 @@ class RecsysPredictorServer:
         enqueue_timeout_ms: int = 1000,
         queue_max_staleness_ms: int = 0,
         mm_client: PyMmEmbeddingsClient | None = None,
-        sid_client: PySemanticIdClient | None = None,
         user_id_table_size: int = 100_000,
         user_hash_scales: list[int] = ...,
         user_biases: list[int] = ...,
@@ -279,7 +275,6 @@ class RecsysRetrievalPredictorServer:
         enqueue_timeout_ms: int = 1000,
         queue_max_staleness_ms: int = 0,
         mm_client: PyMmEmbeddingsClient | None = None,
-        sid_client: PySemanticIdClient | None = None,
         user_id_table_size: int = 100_000,
         user_hash_scales: list[int] = ...,
         user_biases: list[int] = ...,

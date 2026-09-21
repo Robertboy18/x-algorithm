@@ -62,6 +62,19 @@ message UserContext {
   int32 user_muters_count = 17;
 }
 
+message EngagementCountRow {
+  int32 action = 1;
+  repeated uint32 counts = 2;
+}
+
+message EngagementCounts {
+  bool present = 1;
+  repeated uint32 window_secs = 2;
+  repeated EngagementCountRow rows = 3;
+  int64 updated_at_ms = 4;
+  int64 window_end_ms = 5;
+}
+
 message ConversionHistoryContext {
   float hist_user_total_convs = 1;
   float hist_user_unique_advs = 2;
@@ -110,6 +123,47 @@ message PredictNextActionsRequest {
   optional uint64 seedTweetId = 16;
 
   repeated uint32 requestedContinuousActionIndices = 17;
+
+  repeated ConvAssetIds conv_asset_ids = 18;
+
+  PageDecodeParams pageDecode = 19;
+
+  bool returnBackboneScores = 20;
+
+  map<string, string> experiment_overrides = 21;
+
+  bool returnLogitsList = 22;
+
+  repeated PurchaseValueBaseline purchase_value_baselines = 23;
+  EngagementCounts user_ads_engagement_counts = 24;
+}
+
+message PurchaseValueBaseline {
+  int64 impression_id = 1;
+  int64 advertiser_account_id = 2;
+  double mean_value_usd_28d = 3;
+}
+
+message PageDecodeParams {
+  uint32 poolN = 1;
+
+  uint32 steps = 2;
+
+  float temperature = 3;
+}
+
+message PageDecodeResult {
+  repeated uint32 pickedIndices = 1;
+
+  repeated float pickedProbs = 2;
+
+  repeated float pickedScores = 3;
+}
+
+message ConvAssetIds {
+  repeated int64 impressed_time_ms = 1;
+  repeated int64 author_id = 2;
+  repeated int64 asset_id = 3;
 }
 
 message PredictNextActionsResponse {
@@ -192,6 +246,8 @@ message CandidateDistributionSet {
   string checkpointPath = 3;
 
   string intermediateTensorsPath = 4;
+
+  PageDecodeResult pageDecodeResult = 5;
 }
 
 message ScoredCandidates {
@@ -224,6 +280,21 @@ message NextActionDistribution {
   repeated float continuousActionsValues = 6;
 
   map<uint32, float> indexToContinuousValues = 7;
+
+  RewardOutputs rewardOutputs = 8;
+
+  SlateContext slateContext = 9;
+
+  repeated float backboneTopLogProbs = 10;
+  repeated float backboneContinuousValues = 11;
+
+  repeated float requestedActionLogits = 12;
+}
+
+message RewardOutputs {
+  repeated float values = 1;
+
+  repeated float policyLogits = 2;
 }
 
 enum ActionName {
@@ -311,7 +382,7 @@ enum ActionName {
   CLIENT_TWEET_VIDEO_MRC_VIEW = 81;
   CLIENT_TWEET_VIDEO_VIEW = 82;
   CLIENT_TWEET_VIDEO_VIEW_THRESHOLD = 83;
-  PLACE_HOLDER_84 = 84;
+  CLIENT_TWEET_VIDEO_6SEC_VIEW = 84;
   CLIENT_TWEET_VIDEO_WATCH_TIME = 85;
   CLIENT_EXTERNAL_LINK_SESSION_LESS_THAN_3_SEC = 86;
   CLIENT_EXTERNAL_LINK_SESSION_LESS_THAN_5_SEC = 87;
@@ -332,6 +403,10 @@ enum ActionName {
   BRAND_ENGAGEMENT = 102;
   CLIENT_TWEET_DETAIL_DWELL = 103;
   CLIENT_TWEET_SEARCH_QUERY_REFORMULATED = 104;
+  CLIENT_TWEET_RELEVANT_TO_SEARCH = 105;
+  CLIENT_TWEET_NOT_RELEVANT_TO_SEARCH = 106;
+  CLIENT_TWEET_LIVE_STREAM_REPLY = 107;
+  RESERVED_108 = 108;
 
   ADS_WEB_CONVERSION = 128;
   ADS_VIDEO_VIEW = 129;
@@ -366,71 +441,76 @@ enum ActionName {
   CLIENT_EXTERNAL_LINK_SESSION_MORE_THAN_15_SEC = 158;
   CLIENT_EXTERNAL_LINK_SESSION_MORE_THAN_20_SEC = 159;
   CLIENT_EXTERNAL_LINK_SESSION_MORE_THAN_25_SEC = 160;
-  CLIENT_TWEET_RELEVANT_TO_SEARCH = 161;
-  CLIENT_TWEET_NOT_RELEVANT_TO_SEARCH = 162;
+  CLIENT_TWEET_RELEVANT_TO_SEARCH_DEPRECATED = 161;
+  CLIENT_TWEET_NOT_RELEVANT_TO_SEARCH_DEPRECATED = 162;
   CLIENT_TWEET_REPLY_DOWNVOTE = 163;
   ADS_LONG_DWELL_10_SEC_AND_ATTRIBUTED_CONVERSION = 164;
   ADS_LONG_DWELL_15_SEC_AND_ATTRIBUTED_CONVERSION = 165;
   ADS_LONG_SITE_DWELL_CONVERSION = 166;
-  PLACE_HOLDER_167 = 167;
-  PLACE_HOLDER_168 = 168;
-  PLACE_HOLDER_169 = 169;
-  PLACE_HOLDER_170 = 170;
+  P_OPEN_LINK_P10 = 167;
+  P_OPEN_LINK_P25 = 168;
+  P_OPEN_LINK_P50 = 169;
+  P_OPEN_LINK_P75 = 170;
+  ADS_ATTRIBUTED_MACT_PURCHASE = 171;
+  ADS_ATTRIBUTED_MACT_ADD_TO_CART = 172;
+  ADS_ATTRIBUTED_MACT_LEVEL_ACHIEVED = 173;
+  ADS_ATTRIBUTED_MACT_TUTORIAL_COMPLETE = 174;
+  ADS_ATTRIBUTED_MACT_SIGN_UP = 175;
+  ADS_ATTRIBUTED_MACT_CUSTOM = 176;
+  ADS_ATTRIBUTED_MACT_VIEW_PURCHASE = 177;
+  ADS_ATTRIBUTED_MACT_VIEW_ADD_TO_CART = 178;
+  ADS_ATTRIBUTED_MACT_VIEW_LEVEL_ACHIEVED = 179;
+  ADS_ATTRIBUTED_MACT_VIEW_TUTORIAL_COMPLETE = 180;
+  ADS_ATTRIBUTED_MACT_VIEW_SIGN_UP = 181;
+  ADS_ATTRIBUTED_MACT_VIEW_CUSTOM = 182;
+  ADS_PURCHASE_CONVERSION_VIEW_THROUGH = 183;
+  ADS_ADD_TO_CART_CONVERSION_VIEW_THROUGH = 184;
+  ADS_CHECKOUT_INITIATED_CONVERSION_VIEW_THROUGH = 185;
+  ADS_SIGN_UP_CONVERSION_VIEW_THROUGH = 186;
+  ADS_SITE_VISIT_CONVERSION_VIEW_THROUGH = 187;
+  ADS_SESSION_CONVERSION_VIEW_THROUGH = 188;
+  ADS_LANDING_PAGE_VIEW_CONVERSION_VIEW_THROUGH = 189;
+  ADS_UPPER_FUNNEL_CONVERSION_VIEW_THROUGH = 190;
+  ADS_PIXEL_FIRE = 191;
+  ADS_LONG_DWELL_AND_PIXEL_FIRE = 192;
+  P_LONG_DWELL_AND_PIXEL_FIRE = 193;
   ADS_PURCHASE_CONVERSION = 200;
   ADS_MID_FUNNEL_CONVERSION = 201;
   ADS_ADD_TO_CART_CONVERSION = 202;
   ADS_UPPER_FUNNEL_CONVERSION = 203;
-  ADS_RAW_ENGAGEMENT_TYPE_DISPLAYED = 204;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_CONTENT_MRC_VIEW = 205;
-  ADS_RAW_ENGAGEMENT_TYPE_CAROUSEL_SWIPE_NEXT = 206;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_CONTENT_VIEW_V2 = 207;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_CONTENT_6SEC_VIEW = 208;
-  ADS_RAW_ENGAGEMENT_TYPE_CARD_URL_CLICK = 209;
-  ADS_RAW_ENGAGEMENT_TYPE_CAROUSEL_SWIPE_PREVIOUS = 210;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_CONTENT_SHORT_FORM_COMPLETE = 211;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_AD_PLAYBACK_START = 212;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_AD_MRC_VIEW = 213;
-  ADS_RAW_ENGAGEMENT_TYPE_DISMISS_WITHOUT_REASON = 214;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_AD_VIEW = 215;
-  ADS_RAW_ENGAGEMENT_TYPE_CLOSE_WEBVIEW = 216;
-  ADS_RAW_ENGAGEMENT_TYPE_CARD_APP_INSTALL_ATTEMPT = 217;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_AD_6SEC_VIEW = 218;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_AD_SHORT_FORM_COMPLETE = 219;
-  ADS_RAW_ENGAGEMENT_TYPE_DWELL_SHORT = 220;
-  ADS_RAW_ENGAGEMENT_TYPE_DWELL_MEDIUM = 221;
-  ADS_RAW_ENGAGEMENT_TYPE_DWELL_LONG = 222;
-  ADS_RAW_ENGAGEMENT_TYPE_BLOCK = 223;
-  ADS_RAW_ENGAGEMENT_TYPE_CARD_CLICK = 224;
-  ADS_RAW_ENGAGEMENT_TYPE_CARD_OPEN_APP = 225;
-  ADS_RAW_ENGAGEMENT_TYPE_DETAIL = 226;
-  ADS_RAW_ENGAGEMENT_TYPE_EMBEDDED_MEDIA = 227;
-  ADS_RAW_ENGAGEMENT_TYPE_FAV = 228;
-  ADS_RAW_ENGAGEMENT_TYPE_FOLLOW = 229;
-  ADS_RAW_ENGAGEMENT_TYPE_HASHTAG = 230;
-  ADS_RAW_ENGAGEMENT_TYPE_MUTE = 231;
-  ADS_RAW_ENGAGEMENT_TYPE_POLL_CARD_VOTE = 232;
-  ADS_RAW_ENGAGEMENT_TYPE_PROFILE_PIC = 233;
-  ADS_RAW_ENGAGEMENT_TYPE_REPLY = 234;
-  ADS_RAW_ENGAGEMENT_TYPE_REPORT = 235;
-  ADS_RAW_ENGAGEMENT_TYPE_RETWEET = 236;
-  ADS_RAW_ENGAGEMENT_TYPE_SCREEN_NAME = 237;
-  ADS_RAW_ENGAGEMENT_TYPE_SCROLL_WEBVIEW = 238;
-  ADS_RAW_ENGAGEMENT_TYPE_SEND = 239;
-  ADS_RAW_ENGAGEMENT_TYPE_SPOTLIGHT_CLICK = 240;
-  ADS_RAW_ENGAGEMENT_TYPE_SPOTLIGHT_VIEW = 241;
-  ADS_RAW_ENGAGEMENT_TYPE_UNBLOCK = 242;
-  ADS_RAW_ENGAGEMENT_TYPE_UNFAV = 243;
-  ADS_RAW_ENGAGEMENT_TYPE_UNFOLLOW = 244;
-  ADS_RAW_ENGAGEMENT_TYPE_UNIFIED_CARD = 245;
-  ADS_RAW_ENGAGEMENT_TYPE_URL = 246;
-  ADS_RAW_ENGAGEMENT_TYPE_USER_NAME = 247;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_AD_CTA_URL_CLICK = 248;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_AD_CTA_WATCH_CLICK = 249;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_CONTENT_PLAY_FROM_TAP_V2 = 250;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_CTA_URL_CLICK = 251;
-  ADS_RAW_ENGAGEMENT_TYPE_VIDEO_CTA_WATCH_CLICK = 252;
-  PLACE_HOLDER_253 = 253;
-  PLACE_HOLDER_254 = 254;
+  ADS_ATTRIBUTED_KEY_CLICK_CONVERSION_DELAYED = 204;
+  ADS_ATTRIBUTED_CLICK_CONVERSION_DELAYED = 205;
+  ADS_PURCHASE_CONVERSION_DELAYED = 206;
+  ADS_MID_FUNNEL_CONVERSION_DELAYED = 207;
+  ADS_ADD_TO_CART_CONVERSION_DELAYED = 208;
+  ADS_UPPER_FUNNEL_CONVERSION_DELAYED = 209;
+  ADS_WEB_CONVERSION_DELAYED = 210;
+  ADS_SEARCH_CONVERSION_DELAYED = 211;
+  ADS_SIGN_UP_CONVERSION_DELAYED = 212;
+  ADS_CHECKOUT_INITIATED_CONVERSION_DELAYED = 213;
+  ADS_ATTRIBUTED_KEY_CLICK_CONVERSION_DELAYED_TIER_2 = 214;
+  ADS_ATTRIBUTED_CLICK_CONVERSION_DELAYED_TIER_2 = 215;
+  ADS_PURCHASE_CONVERSION_DELAYED_TIER_2 = 216;
+  ADS_MID_FUNNEL_CONVERSION_DELAYED_TIER_2 = 217;
+  ADS_ADD_TO_CART_CONVERSION_DELAYED_TIER_2 = 218;
+  ADS_UPPER_FUNNEL_CONVERSION_DELAYED_TIER_2 = 219;
+  ADS_WEB_CONVERSION_DELAYED_TIER_2 = 220;
+  ADS_SEARCH_CONVERSION_DELAYED_TIER_2 = 221;
+  ADS_SIGN_UP_CONVERSION_DELAYED_TIER_2 = 222;
+  ADS_CHECKOUT_INITIATED_CONVERSION_DELAYED_TIER_2 = 223;
+  ADS_ATTRIBUTED_KEY_CLICK_CONVERSION_DELAYED_TIER_3 = 224;
+  ADS_ATTRIBUTED_CLICK_CONVERSION_DELAYED_TIER_3 = 225;
+  ADS_PURCHASE_CONVERSION_DELAYED_TIER_3 = 226;
+  ADS_MID_FUNNEL_CONVERSION_DELAYED_TIER_3 = 227;
+  ADS_ADD_TO_CART_CONVERSION_DELAYED_TIER_3 = 228;
+  ADS_UPPER_FUNNEL_CONVERSION_DELAYED_TIER_3 = 229;
+  ADS_WEB_CONVERSION_DELAYED_TIER_3 = 230;
+  ADS_SEARCH_CONVERSION_DELAYED_TIER_3 = 231;
+  ADS_SIGN_UP_CONVERSION_DELAYED_TIER_3 = 232;
+  ADS_CHECKOUT_INITIATED_CONVERSION_DELAYED_TIER_3 = 233;
+  reserved 234 to 252;
+  P_OPEN_LINK_P90 = 253;
+  ADS_MMP_CLICK = 254;
   PLACE_HOLDER_255 = 255;
 }
 
@@ -440,6 +520,7 @@ enum ContinuousActionName {
   CLICK_DWELL_TIME = 2;
   ACTIVE_SECS_5M_RESIDUAL_NORM = 3;
   BRIDGE_PROBABILITY = 4;
+  ADS_WEB_CT_PURCHASE_VALUE = 5;
 }
 
 enum ActionGroup {
@@ -939,6 +1020,11 @@ enum ProductSurface {
   PRODUCT_SURFACE_COMMUNITIES_TIMELINE = 13;
   PRODUCT_SURFACE_EXPLORE_PAGE = 14;
   PRODUCT_SURFACE_HOME_TIMELINE_RANKED_FOLLOWING = 15;
+  PRODUCT_SURFACE_TREND_PAGE = 16;
+  PRODUCT_SURFACE_EXPLORE_SPOTLIGHT = 17;
+  PRODUCT_SURFACE_PLACE_HOLDER_18 = 18;
+  PRODUCT_SURFACE_PLACE_HOLDER_19 = 19;
+  PRODUCT_SURFACE_PLACE_HOLDER_20 = 20;
 }
 
 enum Page {
@@ -1185,6 +1271,24 @@ message TweetInfo {
   uint64 bookmarkCount = 34;
 
   ScoreInfo scoreInfo = 35;
+  ContentFeatures contentFeatures = 36;
+  ContentFeatures quotedContentFeatures = 37;
+  SearchLexicalMatch searchLexicalMatch = 38;
+}
+
+message SearchLexicalMatch {
+  float matchedWordFraction = 1;
+  bool exactPhrase = 2;
+}
+
+message ContentFeatures {
+  bool hasVideo = 1;
+  uint32 maxVideoDurationMs = 2;
+  bool hasPhoto = 3;
+  uint32 mediaCount = 4;
+  uint32 weightedTextLen = 5;
+  uint32 newlineCount = 6;
+  bool hasUrl = 7;
 }
 
 message ScoreInfo {
@@ -1192,6 +1296,9 @@ message ScoreInfo {
   optional double weightedScore = 2;
   optional double finalScore = 3;
   SlateContext slateContext = 4;
+  optional double rewardRerankSlotProb = 5;
+  optional uint32 rerankerHeadTag = 6;
+  optional double pageDecodeSlotProb = 7;
 }
 
 message SlateContext {
@@ -1200,6 +1307,18 @@ message SlateContext {
   optional uint32 poolRankGap = 3;
   double fatigue = 4;
   double preDiversityScore = 5;
+  bool sidKnown = 6;
+  uint32 sidK1 = 7;
+  uint32 sidK2 = 8;
+  uint32 sidK3 = 9;
+  optional uint32 sidGap1 = 10;
+  optional uint32 sidGap2 = 11;
+  optional uint32 sidGap3 = 12;
+  optional uint32 reconCosMilli = 13;
+  optional uint32 reconCountAbove = 14;
+  optional uint32 reconGapAbove = 15;
+  optional uint32 exactK = 16;
+  optional uint32 exactGap = 17;
 }
 
 message ActionInfo {
@@ -1257,6 +1376,8 @@ message UserActionSequence {
   AdUserInfo adUserInfo = 7;
 
   repeated Mask masks = 8;
+
+  optional uint32 rerankerHeadTag = 9;
 }
 
 message UserActionList {
@@ -1320,6 +1441,7 @@ message DpaProductInfo {
   int32 gpc_l1_id = 5;
   int32 gpc_l2_id = 6;
   int32 gpc_l3_id = 7;
+  repeated int32 sid_codes = 8;
 }
 
 message AdInfo {
@@ -1349,6 +1471,8 @@ message AdInfo {
   repeated int64 product_keys = 21;
 
   DpaProductInfo dpa_product_info = 22;
+
+  EngagementCounts engagement_counts = 23;
 }
 
 message UserAdActionMeta {
@@ -1549,7 +1673,7 @@ enum UserActionAggregationType {
   DENSE_WITH_NOT_INTERESTED_IN = 7;
   DENSE_WITH_LIMITED_QUOTED_ACTION = 8;
   UPSAMPLED_ADS = 9 [deprecated = true];
-  DENSE_WITH_PROFILE_SHORT_DWELL = 10;
+  DENSE_WITH_PROFILE_LONG_DWELL = 10;
   NOTIFICATIONS = 11;
   DENSE_WITH_CONTEXT_FEATURES = 12;
   NOTIFICATIONS_MORE = 13;
@@ -1568,7 +1692,7 @@ enum UserActionAggregationType {
   IMMERSIVE = 26;
   ADS_CHAD_WITH_CONV_TYPES = 27;
   ADS_WITH_KV_AD_HISTORY = 28;
-  PLACEHOLDER_29 = 29;
+  IMMERSIVE_LONG_DWELL = 29;
   PLACEHOLDER_30 = 30;
   PLACEHOLDER_31 = 31;
   PLACEHOLDER_32 = 32;
@@ -1635,6 +1759,7 @@ message FetchAggregatedUserActionRequests {
   string client_id = 2;
   UaasModelType model_type = 3;
   UaasProductSurface product_surface = 4;
+  map<string, string> feature_switch_overrides = 5;
 }
 
 message ChunkMetadata {

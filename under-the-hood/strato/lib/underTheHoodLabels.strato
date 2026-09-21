@@ -11,7 +11,7 @@ val postLabels = Map(
     about =
       "Post detected by automated systems or in response to a user report as likely to contain content subject to X's Adult Content policy.",
     effect =
-      "Post shown behind content warning, hidden from recommendations to non-followers and hidden from underage users, users without a stated age, and logged out users.",
+      "Post shown behind content warning, hidden from recommendations to non-followers and hidden from underage users, users without a stated age, and logged out users. In India, this content is shown as restricted due to local law(s).",
   },
   "NSFW_TEXT" -> {
     about =
@@ -175,6 +175,160 @@ val accountLabels = Map(
   },
 )
 
+val worldwideCode = "xx"
+val worldwideCopyrightCode = "xy"
+val countriesPlaceholder = Regex.compile("\\{countries\\}")
+val takedownNamesWithCountries = Set("LegalRequest", "BystanderReport", "UnspecifiedReason")
+val takedownNamesWithoutCountries = Set("Dmca", "is_dmca")
+
+val postTakedowns = Map(
+  "BystanderReport(country)" -> {
+    about =
+      "Post withheld where the content has been found to violate local law(s) following a third-party report.",
+    effect = "Post is not shown on X in {countries} where it violates local law(s).",
+  },
+  "LegalRequest(country)" -> {
+    about = "Post has been withheld in response to a legal demand.",
+    effect = "Post is not shown on X in {countries} where it violates local law(s).",
+  },
+  "UnspecifiedReason(country)" -> {
+    about =
+      "Historically applied to posts withheld in response to a legal demand or if found to violate local law(s) following a third-party report.",
+    effect = "Post is not shown on X in {countries} where it violates local law(s).",
+  },
+  "LegalRequest(xx)" -> {
+    about = "Post has been withheld in response to a legal demand.",
+    effect = "Post is not shown on X.",
+  },
+  "UnspecifiedReason(xx)" -> {
+    about =
+      "Historically applied to posts withheld in response to a legal demand or if found to violate local law(s) following a third-party report.",
+    effect = "Post is not shown on X.",
+  },
+  "UnspecifiedReason(xy)" -> {
+    about =
+      "Applied in response to a report from a copyright holder or authorized representative to content found to violate X's Copyright policy. Applied along with the DMCA label.",
+    effect = "Post is not shown on X.",
+  },
+  "Dmca" -> {
+    about =
+      "Applied in response to a report from a copyright holder or authorized representative to content found to violate X's Copyright policy.",
+    effect = "Post is not shown on X.",
+  },
+  "is_dmca" -> {
+    about =
+      "Applied in response to a report from a copyright holder or authorized representative to content found to violate X's Copyright policy.",
+    effect =
+      "Post hidden from recommendations to non-followers. Where the post is seen, media in the post is unavailable.",
+  },
+)
+
+val accountTakedowns = Map(
+  "BystanderReport(country)" -> {
+    about =
+      "Posts from this account withheld where the account has been found to violate local law(s) following a third-party report.",
+    effect = "This account's posts are not shown on X in {countries} where it violates local law(s).",
+  },
+  "LegalRequest(country)" -> {
+    about = "Posts from this account withheld in response to a legal demand.",
+    effect = "This account's posts are not shown on X in {countries} where it violates local law(s).",
+  },
+  "UnspecifiedReason(country)" -> {
+    about =
+      "Historically applied to accounts withheld in response to a legal demand or if found to violate local law(s) following a third-party report.",
+    effect = "This account's posts are not shown on X in {countries} where it violates local law(s).",
+  },
+  "LegalRequest(xx)" -> {
+    about = "Posts from this account withheld in response to a legal demand.",
+    effect = "This account's posts are not shown on X.",
+  },
+  "UnspecifiedReason(xx)" -> {
+    about =
+      "Historically applied to accounts withheld in response to a legal demand or if found to violate local law(s) following a third-party report.",
+    effect = "This account's posts are not shown on X.",
+  },
+)
+
+def upperCodes(countryCodes: Seq[String]): String =
+  countryCodes.map { c => c.toUpperCase }.mkString(", ")
+
+def takedownCopyKey(label: String, countryCodes: Seq[String]): Option[String] =
+  if (takedownNamesWithoutCountries.contains(label)) {
+    Some(label)
+  } else if (!takedownNamesWithCountries.contains(label)) {
+    None
+  } else if (countryCodes.exists { c => c == worldwideCode }) {
+    Some(label + "(xx)")
+  } else if (countryCodes.exists { c => c == worldwideCopyrightCode }) {
+    Some(label + "(xy)")
+  } else if (countryCodes.isEmpty) {
+    None
+  } else {
+    Some(label + "(country)")
+  }
+
+def fillCountries(text: String, countryCodes: Seq[String]): String =
+  countriesPlaceholder.replaceAll(text, upperCodes(countryCodes))
+
+def takedownLabelName(label: String, countryCodes: Seq[String]): String =
+  if (takedownNamesWithCountries.contains(label) && countryCodes.nonEmpty) {
+    label + "(" + upperCodes(countryCodes) + ")"
+  } else {
+    label
+  }
+
+def postTakedownInfo(
+    label: String,
+    countryCodes: Seq[String]
+): Option[{ about: String, effect: String }] =
+  takedownCopyKey(label, countryCodes).flatMap { k => postTakedowns.get(k) }.map { info =>
+    { about = info.about, effect = fillCountries(info.effect, countryCodes) }
+  }
+
+def accountTakedownInfo(
+    label: String,
+    countryCodes: Seq[String]
+): Option[{ about: String, effect: String }] =
+  takedownCopyKey(label, countryCodes).flatMap { k => accountTakedowns.get(k) }.map { info =>
+    { about = info.about, effect = fillCountries(info.effect, countryCodes) }
+  }
+
+def isPostTakedownLabel(label: String, countryCodes: Seq[String]): Boolean =
+  postTakedownInfo(label, countryCodes) match {
+    case Some(_) => true
+    case None => false
+  }
+
+def isAccountTakedownLabel(label: String, countryCodes: Seq[String]): Boolean =
+  accountTakedownInfo(label, countryCodes) match {
+    case Some(_) => true
+    case None => false
+  }
+
+def postTakedownAbout(label: String, countryCodes: Seq[String]): String =
+  postTakedownInfo(label, countryCodes) match {
+    case Some(i) => i.about
+    case None => ""
+  }
+
+def postTakedownEffect(label: String, countryCodes: Seq[String]): String =
+  postTakedownInfo(label, countryCodes) match {
+    case Some(i) => i.effect
+    case None => ""
+  }
+
+def accountTakedownAbout(label: String, countryCodes: Seq[String]): String =
+  accountTakedownInfo(label, countryCodes) match {
+    case Some(i) => i.about
+    case None => ""
+  }
+
+def accountTakedownEffect(label: String, countryCodes: Seq[String]): String =
+  accountTakedownInfo(label, countryCodes) match {
+    case Some(i) => i.effect
+    case None => ""
+  }
+
 val underscore = Regex.compile("_")
 
 def normalizeLabel(code: String): String =
@@ -276,9 +430,18 @@ Library({
     accountLabelAbout = accountLabelAbout,
     postLabelEffect = postLabelEffect,
     accountLabelEffect = accountLabelEffect,
+    postTakedowns = postTakedowns,
+    accountTakedowns = accountTakedowns,
+    takedownLabelName = takedownLabelName,
+    isPostTakedownLabel = isPostTakedownLabel,
+    isAccountTakedownLabel = isAccountTakedownLabel,
+    postTakedownAbout = postTakedownAbout,
+    postTakedownEffect = postTakedownEffect,
+    accountTakedownAbout = accountTakedownAbout,
+    accountTakedownEffect = accountTakedownEffect,
   },
   description = PlainText(
-    "Under the Hood public label allowlists (canonical name -> about/effect) and helpers."
+    "Under the Hood public label and takedown allowlists (canonical name -> about/effect) and helpers."
   ),
   contactInfo = sharedConfig.contactInfo,
   lifecycle = Production,

@@ -216,6 +216,7 @@ class RustParquetDataset(PhoenixDataset):
                         search_query_embedding_dim=dataset.search_query_embedding_dim,
                         sid_num_levels=(dataset.sid_num_levels if dataset.use_post_sid else 0),
                         compute_post_unexplored_label=dataset.compute_post_unexplored_label,
+                        zero_stale_post_14d_candidate_counts=dataset.enable_stale_post,
                     )
 
                     if record_batch.num_rows < batch_size:

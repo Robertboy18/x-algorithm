@@ -22,6 +22,17 @@ pub(crate) struct AdSpacing {
 }
 
 pub(crate) fn has_avoid(post: &ScoredPost) -> bool {
+    matches!(
+        post.brand_safety_verdict(),
+        BrandSafetyVerdict::MediumRisk | BrandSafetyVerdict::HighRisk
+    )
+}
+
+pub(crate) fn is_high_risk(post: &ScoredPost) -> bool {
+    post.brand_safety_verdict() == BrandSafetyVerdict::HighRisk
+}
+
+pub(crate) fn is_medium_risk(post: &ScoredPost) -> bool {
     post.brand_safety_verdict() == BrandSafetyVerdict::MediumRisk
 }
 
@@ -73,6 +84,14 @@ pub(crate) fn is_bsr_low_ad(ad: &AdIndexInfo) -> bool {
         risk,
         BrandSafetyRiskLevel::BsrLow | BrandSafetyRiskLevel::BsrIas
     )
+}
+
+pub(crate) fn is_bsr_high_ad(ad: &AdIndexInfo) -> bool {
+    ad.ad_adjacency_control
+        .as_ref()
+        .map(|c| c.brand_safety_risk())
+        .unwrap_or(BrandSafetyRiskLevel::BsrUnknown)
+        == BrandSafetyRiskLevel::BsrHigh
 }
 
 pub(crate) fn should_drop_bsr_low(
@@ -128,6 +147,25 @@ pub(crate) fn should_drop_keyword(
         tokens_match_any_keyword(&tweet_tokens, &tokenized_keywords)
     };
     above.map(text_matches).unwrap_or(false) || below.map(text_matches).unwrap_or(false)
+}
+
+pub(crate) fn keyword_matches(
+    ad: &AdIndexInfo,
+    above: Option<&ScoredPost>,
+    below: Option<&ScoredPost>,
+    slot_tokens: &mut Option<[Option<TokenSequence>; 2]>,
+) -> bool {
+    let Some(keywords) = tokenize_ad_keywords(ad) else {
+        return false;
+    };
+    let tokens = slot_tokens.get_or_insert_with(|| {
+        [above, below].map(|post| post.map(|p| tokenize_tweet_text(&p.tweet_text)))
+    });
+    let matches = |t: &Option<TokenSequence>| {
+        t.as_ref()
+            .is_some_and(|t| tokens_match_any_keyword(t, &keywords))
+    };
+    matches(&tokens[0]) || matches(&tokens[1])
 }
 
 pub(crate) fn tokenize_tweet_text(text: &str) -> TokenSequence {

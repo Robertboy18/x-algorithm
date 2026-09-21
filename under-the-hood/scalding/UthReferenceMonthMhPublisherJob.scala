@@ -47,9 +47,22 @@ class UthReferenceMonthMhPublisherApp {
         .map(yyyymm)
         .toSet
 
+    def readFromFloor[T](firstDay: Option[Int], read: DateRange => TypedPipe[T]): TypedPipe[T] =
+      firstDay.fold(TypedPipe.empty: TypedPipe[T]) { day =>
+        val floor = RichDate(yyyymmddToMs(day))
+        val start = if (readStart < floor) floor else readStart
+        if (start > dateRange.end) TypedPipe.empty else read(DateRange(start, dateRange.end))
+      }
+
     val eligible = DAL.read(UthDailyEligiblePostsScalaDataset, readRange).toTypedPipe
-    val postLabels = DAL.read(UthDailyPostLabelsScalaDataset, readRange).toTypedPipe
-    val accountLabels = DAL.read(UthDailyAccountLabelsScalaDataset, readRange).toTypedPipe
+    val postLabels = DAL.read(UthDailyPostLabelsScalaDataset, readRange).toTypedPipe ++
+      readFromFloor(
+        config.postTakedownDataFirstDay,
+        DAL.read(UthDailyPostTakedownLabelsScalaDataset, _).toTypedPipe)
+    val accountLabels = DAL.read(UthDailyAccountLabelsScalaDataset, readRange).toTypedPipe ++
+      readFromFloor(
+        config.accountTakedownDataFirstDay,
+        DAL.read(UthDailyAccountTakedownLabelsScalaDataset, _).toTypedPipe)
 
     val followers =
       loadFollowers(dateRange, config.usersourceSnapshotMaxAgeDays, config.testUserIds)
@@ -248,7 +261,7 @@ object UthReferenceMonthMhPublisherApp {
           for {
             userId <- row.userId if inScope(testUserIds, userId)
             day <- row.authoredYyyymmdd if inWindow(day)
-            label <- row.label
+            label <- row.label.map(TakedownLabels.rollupLabel)
             carried <- row.carried
           } yield (((userId, monthBucket(day)), label), carried)
         },
@@ -264,13 +277,16 @@ object UthReferenceMonthMhPublisherApp {
 
     val accountLabelDays = {
       val perLabel = sumByKey(
-        accountLabels.flatMap { row =>
-          for {
-            userId <- row.userId if inScope(testUserIds, userId)
-            day <- row.dayYyyymmdd if inWindow(day)
-            label <- row.label
-          } yield (((userId, monthBucket(day)), label), 1L)
-        },
+        applyReducers(
+          accountLabels.flatMap { row =>
+            for {
+              userId <- row.userId if inScope(testUserIds, userId)
+              day <- row.dayYyyymmdd if inWindow(day)
+              label <- row.label.map(TakedownLabels.rollupLabel)
+            } yield (((userId, monthBucket(day)), label, day), 1)
+          }.group,
+          reducers
+        ).sum.keys.map { case (userMonth, label, _) => ((userMonth, label), 1L) },
         reducers
       )
       listByKey(
@@ -461,6 +477,8 @@ case class UthReferenceMhConfig(
   dailyLookbackDays: Int,
   postObservationDays: Int,
   dailyDataFirstDay: Int,
+  postTakedownDataFirstDay: Option[Int],
+  accountTakedownDataFirstDay: Option[Int],
   writeShards: Int,
   usersourceSnapshotMaxAgeDays: Int,
   outputPath: String)
@@ -475,6 +493,8 @@ object UthReferenceMhConfig {
       postObservationDays =
         UnderTheHoodCommon.preferredInt(args, "postObservationDays", "observationDays", 7),
       dailyDataFirstDay = args.int("dailyDataFirstDay", 20260701),
+      postTakedownDataFirstDay = args.optional("postTakedownDataFirstDay").map(_.toInt),
+      accountTakedownDataFirstDay = args.optional("accountTakedownDataFirstDay").map(_.toInt),
       writeShards = {
         val n = args.int("writeShards", 50)
         require(n > 0, s"--writeShards must be > 0; got $n")

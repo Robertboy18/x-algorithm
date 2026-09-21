@@ -3,7 +3,7 @@
 use crate::{
     checkpoint_proxy_metrics::*,
     r#const::ROOT_DIR,
-    emb_table::{list_entries, send_entries},
+    emb_table::{apply_copy_port_http2, list_entries, send_entries},
 };
 use log::{info, warn};
 use memmap2::MmapMut;
@@ -86,7 +86,9 @@ impl CheckpointProxy {
         }
     }
 
-    async fn resolve_and_connect(&self) -> Result<Vec<transport::Channel>, io::Error> {
+    async fn resolve_and_connect(
+        &self,
+    ) -> Result<Vec<(SocketAddr, transport::Channel)>, io::Error> {
         let (scheme, hostport) = if let Some(rest) = self.copy_url.strip_prefix("https://") {
             ("https", rest)
         } else {
@@ -131,7 +133,7 @@ impl CheckpointProxy {
             futures::future::join_all(addrs.iter().zip(endpoints).map(|(addr, endpoint)| {
                 let timeout = connect_timeout;
                 async move {
-                    let result = endpoint
+                    let result = apply_copy_port_http2(endpoint)
                         .connect_timeout(timeout)
                         .timeout(request_timeout)
                         .http2_keep_alive_interval(Duration::from_secs(30))
@@ -180,6 +182,50 @@ impl CheckpointProxy {
         )
     }
 
+    async fn extra_trainer_channels(&self, addr: SocketAddr, n: usize) -> Vec<transport::Channel> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let scheme = if self.copy_url.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        };
+        let tls = match crate::tls::ClientTlsOptions::from_env() {
+            Ok(tls) => tls,
+            Err(e) => {
+                warn!("extra trainer channels: tls config: {e}");
+                return Vec::new();
+            }
+        };
+        let connect_timeout = Duration::from_secs(
+            std::env::var("COPY_PORT_CONNECT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+        );
+        let request_timeout = self.request_timeout;
+        let url = format!("{scheme}://{addr}");
+        let results = futures::future::join_all((0..n).map(|_| {
+            let tls = tls.as_ref();
+            let url = url.clone();
+            async move {
+                let endpoint = crate::tls::endpoint_for(&url, tls).ok()?;
+                apply_copy_port_http2(endpoint)
+                    .connect_timeout(connect_timeout)
+                    .timeout(request_timeout)
+                    .http2_keep_alive_interval(Duration::from_secs(30))
+                    .keep_alive_timeout(Duration::from_secs(10))
+                    .keep_alive_while_idle(true)
+                    .connect()
+                    .await
+                    .ok()
+            }
+        }))
+        .await;
+        results.into_iter().flatten().collect()
+    }
+
     pub async fn poll_and_download(
         &self,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -197,8 +243,9 @@ impl CheckpointProxy {
             self.downloading.store(false, Ordering::SeqCst);
         });
 
-        let channels = self.resolve_and_connect().await?;
-        TRAINER_URL_COUNT.set(channels.len() as f64);
+        let assigned = self.resolve_and_connect().await?;
+        TRAINER_URL_COUNT.set(assigned.len() as f64);
+        let channels: Vec<transport::Channel> = assigned.iter().map(|(_, ch)| ch.clone()).collect();
 
         let entries = list_entries(&channels, "").await?;
 
@@ -230,7 +277,7 @@ impl CheckpointProxy {
         }
 
         match self
-            .download_checkpoint(&paths, &channels, &checkpoint_entries)
+            .download_checkpoint(&paths, &assigned, &checkpoint_entries)
             .await
         {
             Ok(()) => {}
@@ -277,10 +324,10 @@ impl CheckpointProxy {
     async fn download_checkpoint(
         &self,
         paths: &CheckpointPaths,
-        channels: &[transport::Channel],
+        trainers: &[(SocketAddr, transport::Channel)],
         entries: &[Vec<(String, usize)>],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let concurrency = self.download_concurrency;
+        let concurrency = self.download_concurrency.max(1);
 
         let mut seen_files = std::collections::HashSet::new();
         let mut deduped_entries: Vec<Vec<(String, usize)>> =
@@ -316,16 +363,34 @@ impl CheckpointProxy {
             );
         }
 
-        let mut handles = Vec::with_capacity(channels.len());
+        let mut handles = Vec::with_capacity(trainers.len());
 
-        for (ch_idx, (channel, ch_entries)) in
-            channels.iter().zip(deduped_entries.into_iter()).enumerate()
+        for (ch_idx, ((addr, channel), ch_entries)) in
+            trainers.iter().zip(deduped_entries).enumerate()
         {
             if ch_entries.is_empty() {
                 continue;
             }
 
-            let channel = channel.clone();
+            let extras = concurrency.saturating_sub(1);
+            let mut pool = vec![channel.clone()];
+            if extras > 0 {
+                let extra = self.extra_trainer_channels(*addr, extras).await;
+                if extra.len() < extras {
+                    warn!(
+                        "trainer {addr}: opened {}/{} extra connections; downloading on {}",
+                        extra.len(),
+                        extras,
+                        extra.len() + 1
+                    );
+                }
+                pool.extend(extra);
+            }
+            info!(
+                "trainer {addr}: downloading on {} HTTP/2 connection(s) (concurrency={concurrency})",
+                pool.len(),
+            );
+
             let staging_dir = paths.staging_dir.clone();
             let grpc_prefix = paths.grpc_prefix.clone();
             let verify = self.verify_checksums;
@@ -334,11 +399,10 @@ impl CheckpointProxy {
                 download_channel_files(
                     &staging_dir,
                     &grpc_prefix,
-                    channel,
+                    pool,
                     &ch_entries,
                     ch_idx,
                     verify,
-                    concurrency,
                 )
                 .await
             });
@@ -483,11 +547,10 @@ impl CheckpointProxy {
 async fn download_channel_files(
     staging_dir: &Path,
     grpc_prefix: &str,
-    channel: transport::Channel,
+    channels: Vec<transport::Channel>,
     entries: &[(String, usize)],
     ch_idx: usize,
     _verify_checksums: bool,
-    concurrency: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let t0 = Instant::now();
     let mut total_bytes: usize = 0;
@@ -503,8 +566,10 @@ async fn download_channel_files(
         }
     }
 
-    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let n_conns = channels.len().max(1);
+    let sem = Arc::new(tokio::sync::Semaphore::new(n_conns));
     let mut handles = Vec::new();
+    let mut chunk_idx = 0usize;
 
     for (name, size) in entries {
         if *size == 0 {
@@ -548,7 +613,8 @@ async fn download_channel_files(
         let mut offset = 0usize;
         while offset < *size {
             let this_chunk = cmp::min(chunk_size, *size - offset);
-            let channel = channel.clone();
+            let channel = channels[chunk_idx % n_conns].clone();
+            chunk_idx += 1;
             let name = name.clone();
             let sem = sem.clone();
             let mmap = mmap.clone();
@@ -580,7 +646,7 @@ async fn download_channel_files(
         CHANNEL_DOWNLOAD_RATE_BYTES_PER_SEC.observe(total_bytes as f64 / elapsed.as_secs_f64());
     }
     info!(
-        "channel {}: downloaded {} files, {:.2} GB in {:.1}s ({:.2} GB/s) [concurrency={}]",
+        "channel {}: downloaded {} files, {:.2} GB in {:.1}s ({:.2} GB/s) [connections={}]",
         ch_idx,
         entries.len(),
         total_bytes as f64 * 1e-9,
@@ -590,7 +656,7 @@ async fn download_channel_files(
         } else {
             0.0
         },
-        concurrency,
+        n_conns,
     );
 
     Ok(())
@@ -614,6 +680,7 @@ async fn download_chunk(
         vec![offset],
         vec![size],
         buf_ref,
+        String::new(),
         #[cfg(target_os = "linux")]
         (Vec::new(), Arc::new(Vec::new()), Arc::new(Vec::new())),
     )
@@ -647,7 +714,7 @@ fn assign_trainer_channels(
     num_trainers: Option<usize>,
     server_index: usize,
     num_servers: usize,
-) -> Result<Vec<transport::Channel>, io::Error> {
+) -> Result<Vec<(SocketAddr, transport::Channel)>, io::Error> {
     let total_trainers = if let Some(expected) = num_trainers {
         if connected.len() < expected {
             return Err(io::Error::new(
@@ -685,7 +752,6 @@ fn assign_trainer_channels(
         .collect();
 
     let my_ips: Vec<_> = my_slice.iter().map(|(addr, _)| addr.to_string()).collect();
-    let my_channels: Vec<transport::Channel> = my_slice.into_iter().map(|(_, ch)| ch).collect();
 
     info!(
         "{} trainers reachable (sorted by IP), this server (index {}) mirrors {}-{}: {:?}",
@@ -696,7 +762,7 @@ fn assign_trainer_channels(
         my_ips,
     );
 
-    Ok(my_channels)
+    Ok(my_slice)
 }
 
 fn free_bytes(path: &str) -> io::Result<u64> {

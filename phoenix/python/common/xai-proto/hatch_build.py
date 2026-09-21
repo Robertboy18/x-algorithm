@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
+import os
 import pathlib
 import subprocess
 import sys
@@ -31,11 +32,18 @@ class CustomBuildHook(BuildHookInterface):
 
 
 def run_protoc(out_dir: Path) -> None:
+    skip_missing = os.environ.get("XAI_PROTO_SKIP_MISSING", "") == "1"
     xai_root = pathlib.Path(__file__).parent / PARENT_DIR
     includes = []
     protos = []
     for proto in PROTOS:
         p = xai_root / proto
+        if skip_missing and not p.exists():
+            print(
+                f"xai-proto hatch_build: SKIPPING {proto} (absent; XAI_PROTO_SKIP_MISSING=1)",
+                file=sys.stderr,
+            )
+            continue
         includes.append(f"-I{p.parent}")
         protos.append(str(p))
 

@@ -28,7 +28,7 @@ impl PostKind {
 pub struct InventoryHoldoutFilter;
 
 impl InventoryHoldoutFilter {
-    fn holdout_bucket(post_id: u64, viewer_id: u64) -> u64 {
+    pub(crate) fn holdout_bucket(post_id: u64, viewer_id: u64) -> u64 {
         let mut z = post_id
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .wrapping_add(
@@ -43,7 +43,7 @@ impl InventoryHoldoutFilter {
         z % 100
     }
 
-    fn is_held_out(post_id: u64, viewer_id: u64, percent: u32) -> bool {
+    pub(crate) fn is_held_out(post_id: u64, viewer_id: u64, percent: u32) -> bool {
         Self::holdout_bucket(post_id, viewer_id) < percent as u64
     }
 }
