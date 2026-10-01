@@ -99,13 +99,17 @@ where
     fn result_size(&self) -> usize;
     fn finalize(&self, _query: &Q, _candidates: &mut Vec<C>) {}
 
-    #[xai_stats_macro::receive_stats(latency=Bucket500To2500)]
     async fn execute(&self, query: Q) -> PipelineResult<Q, C> {
         xai_stats_receiver::with_scoped_metric_labels(
             vec![("pipeline".to_string(), self.name().to_string())],
-            pipeline_summary::scope(self.execute_stages(query)),
+            pipeline_summary::scope(self.execute_instrumented(query)),
         )
         .await
+    }
+
+    #[xai_stats_macro::receive_stats(name = "execute", latency = Bucket500To2500)]
+    async fn execute_instrumented(&self, query: Q) -> PipelineResult<Q, C> {
+        self.execute_stages(query).await
     }
 
     async fn execute_stages(&self, query: Q) -> PipelineResult<Q, C> {

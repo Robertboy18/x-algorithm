@@ -10,6 +10,7 @@ import re
 import time
 import typing
 import zlib
+from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 import jax
@@ -35,13 +36,18 @@ POST_TABLE_KEY = "post_embeddings.embeddings"
 POST_DATASET_TYPES_KEY = "post_embeddings.dataset_types"
 POST_IDS_KEY = "post_embeddings.post_ids"
 AUTHOR_IDS_KEY = "post_embeddings.author_ids"
+POST_SCALES_KEY = "post_embeddings.scales"
+DATASET_RANGES_KEY = "post_embeddings.dataset_ranges"
 
 _RETRIEVAL_RUNNER_ATTRS = (
     "large_k",
     "retrieval_dataset_types",
     "enable_async_topk",
     "enable_radix_select_topk",
+    "enable_int8_post_table",
     "enable_dataset_slice_topk",
+    "enable_bloom_filter",
+    "enable_topic_filter",
 )
 
 REQUEST_BATCH_KEYS: frozenset[str] = frozenset(
@@ -147,6 +153,11 @@ class RetrievalExport:
     post_table_dtype: str
     dataset_types_shape: tuple[int, ...]
     dataset_types_dtype: str
+    int8_post_table: bool = False
+    dataset_capacities: tuple[int, ...] | None = None
+    rows_from: tuple[tuple[int, ...], ...] | None = None
+    max_age_seconds: tuple[float | None, ...] | None = None
+    optional_targets: tuple[bool, ...] | None = None
 
     @property
     def output_names(self) -> list[str]:
@@ -156,11 +167,39 @@ class RetrievalExport:
             names.append(f"scores_{name}")
         return names
 
+    @property
+    def program_inputs(self) -> list[tuple[str, str, Any, str]]:
+        rows = self.post_table_shape[0]
+        table_dtype = np.dtype(np.int8 if self.int8_post_table else self.post_table_dtype)
+        inputs = [
+            (
+                "post_table",
+                POST_TABLE_KEY,
+                jax.ShapeDtypeStruct(self.post_table_shape, table_dtype),
+                "rows",
+            ),
+            (
+                "dataset_types",
+                POST_DATASET_TYPES_KEY,
+                jax.ShapeDtypeStruct(self.dataset_types_shape, np.dtype(self.dataset_types_dtype)),
+                "replicated",
+            ),
+        ]
+        if self.int8_post_table:
+            inputs.append(
+                ("post_scales", POST_SCALES_KEY, jax.ShapeDtypeStruct((rows,), np.float32), "rows")
+            )
+        if self.dataset_capacities is not None:
+            ranges = jax.ShapeDtypeStruct((len(self.target_dataset_types), 2), np.int32)
+            inputs.append(("dataset_ranges", DATASET_RANGES_KEY, ranges, "replicated"))
+        return inputs
+
     def manifest_block(self) -> dict[str, Any]:
-        return {
+        block: dict[str, Any] = {
             "large_k": self.large_k,
             "target_dataset_types": [
-                {"name": name, "value": value} for name, value in self.target_dataset_types
+                _target_manifest_entry(self, i, name, value)
+                for i, (name, value) in enumerate(self.target_dataset_types)
             ],
             "post_table": {
                 "key": POST_TABLE_KEY,
@@ -173,6 +212,26 @@ class RetrievalExport:
             "author_ids_key": AUTHOR_IDS_KEY,
             "topk_unordered": self.use_radix_select_topk,
         }
+        if self.int8_post_table:
+            block["post_scales_key"] = POST_SCALES_KEY
+        if self.dataset_capacities is not None:
+            block["dataset_ranges_key"] = DATASET_RANGES_KEY
+            block["dataset_capacities"] = list(self.dataset_capacities)
+        return block
+
+
+def _target_manifest_entry(
+    spec: RetrievalExport, index: int, name: str, value: int
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"name": name, "value": value}
+    rows = spec.rows_from[index] if spec.rows_from is not None else (value,)
+    if rows != (value,):
+        entry["rows_from"] = list(rows)
+    if spec.max_age_seconds is not None and spec.max_age_seconds[index] is not None:
+        entry["max_age_seconds"] = int(spec.max_age_seconds[index])
+    if spec.optional_targets is not None and spec.optional_targets[index]:
+        entry["optional"] = True
+    return entry
 
 
 _parameter_serialization_registered = False
@@ -553,14 +612,20 @@ def _make_retrieval_forward_fn(
 
     model_config = export_cfg.model_config
     target_values = tuple(value for _, value in retrieval.target_dataset_types)
+    derived_kinds = [kind for kind, _, _, _ in retrieval.program_inputs[2:]]
 
     @hk.transform
     def forward_fn(
-        batch: Any, merged_embeddings: jax.Array, post_table: jax.Array, dataset_types: jax.Array
+        batch: Any,
+        merged_embeddings: jax.Array,
+        post_table: jax.Array,
+        dataset_types: jax.Array,
+        *derived: jax.Array,
     ):
         recsys_embeddings = _recsys_embeddings_from_merged(
             merged_embeddings, embedding_slices, packed_geometry
         )
+        by_kind = dict(zip(derived_kinds, derived, strict=True))
         model = model_config.make(sharding_context=make_legacy_sharding_context(mesh))
         results = model.forward(
             batch,
@@ -569,10 +634,14 @@ def _make_retrieval_forward_fn(
             dataset_types,
             retrieval.large_k,
             target_values,
-            dataset_ranges=None,
+            None,
+            topic_bitmaps=None,
+            topic_user_bitmasks=None,
+            dataset_ranges=by_kind.get("dataset_ranges"),
             use_async_topk=retrieval.use_async_topk,
             use_radix_select_topk=retrieval.use_radix_select_topk,
-            post_scales=None,
+            post_scales=by_kind.get("post_scales"),
+            dataset_capacities=retrieval.dataset_capacities,
         )
         flat: list[jax.Array] = []
         for indices, scores in results:
@@ -612,7 +681,7 @@ def _retrieval_shardings(
     bs: int,
     params_avals: Any,
     batch_avals: Any,
-    num_outputs: int,
+    retrieval: RetrievalExport,
 ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
     from jax.sharding import NamedSharding, PartitionSpec
 
@@ -634,10 +703,9 @@ def _retrieval_shardings(
         replicated,
         batch_shardings,
         rows,
-        rows,
-        replicated,
+        *(rows if layout == "rows" else replicated for _, _, _, layout in retrieval.program_inputs),
     )
-    return in_shardings, (replicated,) * num_outputs
+    return in_shardings, (replicated,) * len(retrieval.output_names)
 
 
 def _sharding_entry(hlo_sharding: Any, ndim: int, num_devices: int, what: str) -> dict[str, Any]:
@@ -682,7 +750,7 @@ def _input_spec(
     batch_avals: Any,
     merged_aval: Any,
     batch_template: Any,
-    retrieval_avals: tuple[Any, Any] | None = None,
+    retrieval_inputs: list[tuple[str, str, Any, str]] | None = None,
 ) -> list[dict[str, Any]]:
     from xai_checkpointing.tree_util import keystr
 
@@ -728,20 +796,14 @@ def _input_spec(
     spec.append(
         {"kind": "merged_embeddings", "key": "merged_embeddings", **_aval_entry(merged_aval)}
     )
-    if retrieval_avals is not None:
-        post_table_aval, dataset_types_aval = retrieval_avals
-        spec.append({"kind": "post_table", "key": POST_TABLE_KEY, **_aval_entry(post_table_aval)})
-        spec.append(
-            {
-                "kind": "dataset_types",
-                "key": POST_DATASET_TYPES_KEY,
-                **_aval_entry(dataset_types_aval),
-            }
-        )
+    for kind, key, aval, _ in retrieval_inputs or ():
+        spec.append({"kind": kind, "key": key, **_aval_entry(aval)})
     return spec
 
 
-def _retrieval_export(runner: Any) -> RetrievalExport:
+def _retrieval_export(
+    runner: Any, dataset_capacities: Mapping[str, int] | None = None
+) -> RetrievalExport:
     missing = [name for name in _RETRIEVAL_RUNNER_ATTRS if not hasattr(runner, name)]
     if missing:
         raise NotImplementedError(
@@ -749,21 +811,19 @@ def _retrieval_export(runner: Any) -> RetrievalExport:
             f"export_native_bundle); trainer lacks {missing}"
         )
     unsupported = [
-        flag
-        for flag in ("enable_int8_post_table", "enable_bloom_filter", "enable_topic_filter")
-        if getattr(runner, flag, False)
+        flag for flag in ("enable_bloom_filter", "enable_topic_filter") if getattr(runner, flag)
     ]
     if unsupported:
         raise NotImplementedError(
             f"two-tower StableHLO export does not support {unsupported}; the native runtime "
-            "feeds the bf16 post table and applies no per-post filters"
+            "applies no per-post filters"
         )
-    if runner.enable_dataset_slice_topk:
+    if runner.enable_dataset_slice_topk and dataset_capacities is None:
         logger.warning(
-            "enable_dataset_slice_topk=True is ignored by the StableHLO export: the slice path "
-            "compiles the checkpoint's per-dataset post-table ranges into the program; the "
-            "exported program masks by dataset type instead (same results, top-k over the "
-            "whole table)"
+            "enable_dataset_slice_topk=True without dataset capacities: the slice path compiles "
+            "the checkpoint's per-dataset post-table ranges into the program, so the exported "
+            "program masks by dataset type instead (same results, top-k over the whole table); "
+            "pass --dataset_capacities for the windowed top-k"
         )
     if os.environ.get("DEBUG_ALLOW_RANDOM_INIT") == "1":
         raise ValueError(
@@ -773,13 +833,41 @@ def _retrieval_export(runner: Any) -> RetrievalExport:
     large_k = int(runner.large_k)
     if large_k < 1:
         raise ValueError(f"invalid large_k for the two-tower export: {large_k}")
-    datasets = tuple(runner.retrieval_dataset_types)
+    datasets = list(runner.retrieval_dataset_types)
     if not datasets:
         raise ValueError("two-tower export needs at least one retrieval dataset type")
+    split_home = bool(getattr(runner, "split_home_checkpoint", False)) or bool(
+        getattr(getattr(runner, "model_config", None), "split_home_checkpoint", False)
+    )
+    if split_home and any(ds.name == "HOME" for ds in datasets):
+        if dataset_capacities is None:
+            raise ValueError(
+                "split_home_checkpoint requires --dataset_capacities so HOME is the "
+                "cold|hot window, not a mask for stored type 1"
+            )
+        if "HOME_COLD" in dataset_capacities and not any(ds.name == "HOME_COLD" for ds in datasets):
+            from xrex.data.retrieval_dataset import RetrievalDataset
+
+            datasets.append(RetrievalDataset.HOME_COLD)
     post_embeddings = runner.state_shape.post_embeddings
     table = post_embeddings.embeddings.x
     if len(table.shape) != 2:
         raise ValueError(f"post table must be [rows, width], got {tuple(table.shape)}")
+    capacities = None
+    if dataset_capacities is not None:
+        names = [ds.name for ds in datasets]
+        if sorted(dataset_capacities) != sorted(names):
+            raise ValueError(
+                f"dataset_capacities must name exactly the target datasets {names}, got "
+                f"{sorted(dataset_capacities)}"
+            )
+        capacities = tuple(int(dataset_capacities[name]) for name in names)
+        for name, capacity in zip(names, capacities, strict=True):
+            if not large_k <= capacity <= int(table.shape[0]):
+                raise ValueError(
+                    f"dataset capacity {name}={capacity} must lie in [large_k={large_k}, "
+                    f"post table rows={int(table.shape[0])}]"
+                )
     dataset_types_rows = int(post_embeddings.dataset_types.shape[0])
     if int(table.shape[0]) != dataset_types_rows:
         raise ValueError(
@@ -797,10 +885,46 @@ def _retrieval_export(runner: Any) -> RetrievalExport:
         post_table_dtype=_dtype_name(table.dtype),
         dataset_types_shape=tuple(int(d) for d in post_embeddings.dataset_types.shape),
         dataset_types_dtype=_dtype_name(post_embeddings.dataset_types.dtype),
+        int8_post_table=bool(runner.enable_int8_post_table),
+        dataset_capacities=capacities,
+        rows_from=_split_rows_from(runner, datasets) if split_home else None,
+        max_age_seconds=_split_max_age(runner, datasets) if split_home else None,
+        optional_targets=_split_optional(runner, datasets) if split_home else None,
     )
 
 
-def build_bundle(trainer: RecsysTrainer, *, mesh_devices: int = 1) -> list[BundleFile]:
+def _split_rows_from(runner: Any, datasets: list[Any]) -> tuple[tuple[int, ...], ...] | None:
+    if not any(ds.name == "HOME" for ds in datasets):
+        return None
+    from xrex.data.retrieval_dataset import RetrievalDataset
+
+    home_rows = (
+        RetrievalDataset.HOME_COLD.value,
+        RetrievalDataset.HOME_HOT.value,
+        RetrievalDataset.HOME.value,
+    )
+    return tuple(home_rows if ds.name == "HOME" else (int(ds.value),) for ds in datasets)
+
+
+def _split_max_age(runner: Any, datasets: list[Any]) -> tuple[float | None, ...] | None:
+    age = float(getattr(runner, "cold_start_max_age_seconds", 0.0) or 0.0)
+    if age <= 0:
+        return None
+    return tuple(age if ds.name == "HOME_COLD" else None for ds in datasets)
+
+
+def _split_optional(runner: Any, datasets: list[Any]) -> tuple[bool, ...] | None:
+    launched = {ds.name for ds in runner.retrieval_dataset_types}
+    flags = tuple(ds.name == "HOME_COLD" and ds.name not in launched for ds in datasets)
+    return flags if any(flags) else None
+
+
+def build_bundle(
+    trainer: RecsysTrainer,
+    *,
+    mesh_devices: int = 1,
+    dataset_capacities: Mapping[str, int] | None = None,
+) -> list[BundleFile]:
     import flatbuffers
     from jax import export as jax_export
 
@@ -818,7 +942,7 @@ def build_bundle(trainer: RecsysTrainer, *, mesh_devices: int = 1) -> list[Bundl
             "StableHLO bundle export supports ranking (RecsysAggregatedModelConfig) and "
             f"retrieval (RecsysTwoTowerModelConfig) only, got {type(model_config).__name__}"
         )
-    retrieval = _retrieval_export(trainer) if two_tower else None
+    retrieval = _retrieval_export(trainer, dataset_capacities) if two_tower else None
     if mesh_devices < 1:
         raise ValueError(f"mesh_devices must be >= 1, got {mesh_devices}")
     if not two_tower and mesh_devices != 1:
@@ -909,14 +1033,7 @@ def build_bundle(trainer: RecsysTrainer, *, mesh_devices: int = 1) -> list[Bundl
     )
     rng_aval = jax.ShapeDtypeStruct((2,), np.uint32)
 
-    retrieval_avals: tuple[Any, Any] | None = None
-    if retrieval is not None:
-        retrieval_avals = (
-            jax.ShapeDtypeStruct(retrieval.post_table_shape, np.dtype(retrieval.post_table_dtype)),
-            jax.ShapeDtypeStruct(
-                retrieval.dataset_types_shape, np.dtype(retrieval.dataset_types_dtype)
-            ),
-        )
+    retrieval_inputs = retrieval.program_inputs if retrieval is not None else None
     output_names = (
         ("log_probs", "cont_preds", "has_nan") if retrieval is None else retrieval.output_names
     )
@@ -950,13 +1067,20 @@ def build_bundle(trainer: RecsysTrainer, *, mesh_devices: int = 1) -> list[Bundl
             forward_fn = _make_retrieval_forward_fn(
                 export_cfg, embedding_slices, mesh, retrieval, packed_geometry
             )
-            assert retrieval_avals is not None
-            args = (params_avals, rng_aval, batch_avals, merged_aval, *retrieval_avals)
+            assert retrieval_inputs is not None
+            args = (
+                params_avals,
+                rng_aval,
+                batch_avals,
+                merged_aval,
+                *(aval for _, _, aval, _ in retrieval_inputs),
+            )
 
         with mesh:
             if mesh_export:
+                assert retrieval is not None
                 in_shardings, out_shardings = _retrieval_shardings(
-                    mesh, data_axis, bs, params_avals, batch_avals, len(output_names)
+                    mesh, data_axis, bs, params_avals, batch_avals, retrieval
                 )
                 jitted = jax.jit(
                     forward_fn.apply, in_shardings=in_shardings, out_shardings=out_shardings
@@ -985,7 +1109,7 @@ def build_bundle(trainer: RecsysTrainer, *, mesh_devices: int = 1) -> list[Bundl
                 )
 
         spec = _input_spec(
-            params_avals, rng_aval, batch_avals, merged_aval, batch_template, retrieval_avals
+            params_avals, rng_aval, batch_avals, merged_aval, batch_template, retrieval_inputs
         )
         if len(spec) != len(exported.in_avals):
             raise AssertionError(
@@ -1019,7 +1143,7 @@ def build_bundle(trainer: RecsysTrainer, *, mesh_devices: int = 1) -> list[Bundl
                 )
                 expected = (
                     SHARDING_REPLICATED
-                    if entry["kind"] in ("weight", "rng", "dataset_types")
+                    if entry["kind"] in ("weight", "rng", "dataset_types", "dataset_ranges")
                     else {"kind": "tiled", "dim": 0}
                 )
                 if mesh_devices > 1 and entry["sharding"] != expected:

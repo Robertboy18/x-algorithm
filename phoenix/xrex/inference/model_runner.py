@@ -3,6 +3,7 @@
 import concurrent.futures
 import json
 import logging
+import math
 import mmap
 import multiprocessing
 import os
@@ -44,9 +45,9 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
 )
 from xrex.data.recsys import recsys_batch
-from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
-from xrex.data.recsys.sequence_packing import pack_batch
-from xrex.data.retrieval_dataset import RetrievalDataset
+from xrex.data.recsys.recsys_batch import TWITTER_EPOCH_MS, RecsysFeaturesBatch
+from xrex.data.recsys.sequence_packing import compact_candidate_layout, pack_batch
+from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE, RetrievalDataset
 from xrex.inference import debug_logger, service_registry
 from xrex.inference.h2d import (
     EmbeddingSlices,
@@ -60,12 +61,21 @@ from xrex.inference.h2d import (
     parallel_copyto,
     prefault_memmap,
 )
+from xrex.inference.int8_post_table import (
+    quantize_post_table as _quantize_post_table,
+)
 from xrex.inference.metrics import MetricsPublisher, get_metrics_publisher
 from xrex.inference.status_server import StatusServer, StatusServerConfig
 from xrex.models.model_utils import Parameter, unwrap_tree
 from xrex.models.recsys_embedding import RecsysEmbeddings
 from xrex.models.recsys_model import RecsysAggregatedModelConfig
 from xrex.models.sharding_context import make_legacy_sharding_context
+from xrex.models.topic_categories import (
+    NUM_TOPIC_INT32S,
+    TOPIC_ID_TO_BITS,
+    bitmaps_to_int32_array,
+    topic_ids_to_bitmap,
+)
 from xrex.train.embedding_loader import load_embedding_table
 from xrex.train.misc import PostEmbeddings, RecsysInferenceState
 from xrex.train.trainer import Trainer
@@ -82,6 +92,16 @@ from xrex.utils.profiler import start_trace, stop_trace
 from xrex.utils.utils import get_peak_bytes_in_use
 
 logger = logging.getLogger(__name__)
+
+_TOPIC_PARQUET_DIR = str(PHOENIX_INDEX_BASE / "post_creation_snapshots_topic")
+_TOPIC_PARQUET_PATHS: dict[int, str] = {
+    0: f"{_TOPIC_PARQUET_DIR}/1fav_topic_1day.parquet",
+    1: f"{_TOPIC_PARQUET_DIR}/1fav_topic_option_1_1day.parquet",
+    2: f"{_TOPIC_PARQUET_DIR}/1fav_topic_option_2_1day.parquet",
+    3: f"{_TOPIC_PARQUET_DIR}/1fav_topic_option_3_1day.parquet",
+    4: f"{_TOPIC_PARQUET_DIR}/1fav_topic_option_4_1day.parquet",
+    5: f"{_TOPIC_PARQUET_DIR}/1fav_topic_option_5_1day.parquet",
+}
 
 
 def get_model_checkpoint_timestamp(ctx):
@@ -489,6 +509,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
 
     inference_batch_size_buckets: tuple[int, ...] = ()
 
+    seqpack_packed_len_fractions: list[float] = field(default_factory=list)
+
     history_seq_len: int = 1000
     candidate_seq_len: int = 1400
 
@@ -516,6 +538,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     embedding_gather_threads: int = 16
     use_pinned_d2h: bool = True
     pinned_d2h_num_buffers: int = 3
+
+    enable_bloom_filter: bool = False
 
     log_rotate: bool = False
     log_rotate_max_bytes: int = 3 * 1024 * 1024 * 1024
@@ -579,6 +603,39 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         if not self.inference_batch_size_buckets:
             return (self.inference_batch_size,)
         return tuple(sorted(set(self.inference_batch_size_buckets)))
+
+    @property
+    def compact_candidate_slots(self) -> bool:
+        if not (self.using_seqpack and self.seqpack_packed_len_fractions):
+            return False
+        return not self.using_fa4
+
+    def full_packed_seq_len(self, bs: int) -> int:
+        mc = self.model_config
+        bs_per_device = bs // self.parallel_config.num_devices_per_process
+        return bs_per_device * (
+            mc.num_user_prefix_tokens + self.history_seq_len + self.candidate_seq_len
+        )
+
+    def packed_seq_lens(self, bs: int) -> tuple[int, ...]:
+        full = self.full_packed_seq_len(bs)
+        if not self.compact_candidate_slots or bs != max(self.sorted_buckets):
+            return (full,)
+        block = self._seqpack_block_size
+        lens = {full}
+        for frac in self.seqpack_packed_len_fractions:
+            n = int(math.ceil(full * float(frac) / block)) * block
+            if 0 < n < full:
+                lens.add(n)
+        return tuple(sorted(lens))
+
+    def select_packed_seq_len(self, bs: int, used: int) -> int:
+        for n in self.packed_seq_lens(bs):
+            if used <= n:
+                return n
+        raise ValueError(
+            f"packed row uses {used} tokens > full length {self.full_packed_seq_len(bs)}"
+        )
 
     def select_bucket(self, orig_batch_size: int) -> int:
         buckets = self.sorted_buckets
@@ -1165,10 +1222,6 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             self._live_pe_meta_plan = []
             self._gpu_pe_slots = [None, None]
 
-    @property
-    def _live_swap_blocked_by_candidate_filters(self) -> bool:
-        return False
-
     def _live_swap_two_tower_supported(self) -> bool:
         assert isinstance(self.state, RecsysInferenceState)
         if self.state.post_embeddings is None or self._pending_post_embeddings is None:
@@ -1179,10 +1232,11 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         if self._pe_staging_size <= 0:
             logger.info("[hotswap-live] no post_embeddings staging buffer -> drained finalize path")
             return False
-        if self._live_swap_blocked_by_candidate_filters:
-            logger.info(
-                "[hotswap-live] serving-time candidate filters enabled -> drained finalize path"
-            )
+        if getattr(self, "enable_topic_filter", False):
+            logger.info("[hotswap-live] topic filter enabled -> drained finalize path")
+            return False
+        if getattr(self, "enable_bloom_filter", False):
+            logger.info("[hotswap-live] bloom filter enabled -> drained finalize path")
             return False
         return True
 
@@ -2570,19 +2624,35 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             self.debug_log_path = path
         return path
 
-    def example_data(self, bs: int) -> RecsysFeaturesBatch:
+    def example_data(self, bs: int, packed_seq_len: int | None = None) -> RecsysFeaturesBatch:
         batch = self.dataset.example_data(bs)
         if self.using_seqpack:
-            batch = pack_batch(
-                batch=batch,
-                num_devices_per_process=self.parallel_config.num_devices_per_process,
-                num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
-                dist=None,
-                rng=None,
-                block_size=self._seqpack_block_size,
-            )
-            if self.using_fa4:
-                batch = self.add_block_sparse_layout(batch)
+            batch = self._pack_inference_batch(batch, packed_seq_len=packed_seq_len)
+        return batch
+
+    def _pack_inference_batch(
+        self, batch: RecsysFeaturesBatch, *, packed_seq_len: int | None = None
+    ) -> RecsysFeaturesBatch:
+        batch = pack_batch(
+            batch=batch,
+            num_devices_per_process=self.parallel_config.num_devices_per_process,
+            num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
+            dist=None,
+            rng=None,
+            block_size=self._seqpack_block_size,
+        )
+        if packed_seq_len is not None:
+            layout = batch.get("packing_layout")
+            assert layout is not None
+            if packed_seq_len != int(layout.segment_ids.shape[1]):
+                batch["packing_layout"] = compact_candidate_layout(
+                    batch,
+                    num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
+                    block_size=self._seqpack_block_size,
+                    packed_seq_len=packed_seq_len,
+                )
+        if self.using_fa4:
+            batch = self.add_block_sparse_layout(batch)
         return batch
 
     def _get_persistent_buffer(
@@ -2874,6 +2944,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         request: RequestBatch | None = None,
         eligible_mask: jax.Array | None = None,
         bucket_size: int | None = None,
+        packed_seq_len: int | None = None,
     ) -> Union[jax.Array, np.ndarray, tuple[jax.Array, jax.Array, jax.Array]]:
         raise NotImplementedError
 
@@ -3444,25 +3515,24 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     def _warmup_buckets(self, rng: jax.Array) -> None:
         assert isinstance(self.state, RecsysInferenceState)
         for bs in self.sorted_buckets:
-            batch = self._get_persistent_buffer(0, bs)
-            if self.using_seqpack:
-                batch = pack_batch(
-                    batch=batch,
-                    num_devices_per_process=self.parallel_config.num_devices_per_process,
-                    num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
-                    dist=None,
-                    rng=None,
-                    block_size=self._seqpack_block_size,
+            lens: tuple[int | None, ...] = (
+                self.packed_seq_lens(bs) if self.compact_candidate_slots else (None,)
+            )
+            for n in lens:
+                batch = self._get_persistent_buffer(0, bs)
+                if self.using_seqpack:
+                    batch = self._pack_inference_batch(batch, packed_seq_len=n)
+                out = self.gather_embeddings_and_forward(
+                    self.state, batch, rng, 0, -1, bucket_size=bs, packed_seq_len=n
                 )
-                if self.using_fa4:
-                    batch = self.add_block_sparse_layout(batch)
-            out = self.gather_embeddings_and_forward(self.state, batch, rng, 0, -1, bucket_size=bs)
-            if isinstance(out, jax.Array):
-                out = out.block_until_ready()
-                logger.info(f"Warmup bucket={bs} output shape: {out.shape}")
-            elif isinstance(out, tuple):
-                out = jax.tree.map(lambda x: x.block_until_ready(), out)
-                logger.info(f"Warmup bucket={bs} output shapes: {[x.shape for x in out]}")
+                if isinstance(out, jax.Array):
+                    out = out.block_until_ready()
+                    logger.info(f"Warmup bucket={bs} len={n} output shape: {out.shape}")
+                elif isinstance(out, tuple):
+                    out = jax.tree.map(lambda x: x.block_until_ready(), out)
+                    logger.info(
+                        f"Warmup bucket={bs} len={n} output shapes: {[x.shape for x in out]}"
+                    )
 
     SUPPORTED_MODEL_CONFIGS = (
         RecsysAggregatedModelConfig,
@@ -3877,11 +3947,19 @@ class RankingModelRunner(
     ]
 ):
     forward_jit_by_bs: dict[int, JittedOrCompiled] = field(default_factory=dict, init=False)
+    forward_jit_by_bs_len: dict[tuple[int, int | None], JittedOrCompiled] = field(
+        default_factory=dict, init=False
+    )
 
-    def _rng_and_init_data(self, seq_len: int | None = None, bs: int | None = None):
+    def _rng_and_init_data(
+        self,
+        seq_len: int | None = None,
+        bs: int | None = None,
+        packed_seq_len: int | None = None,
+    ):
         bs = bs or self.inference_batch_size
         if self.using_seqpack:
-            init_data = self.example_data(bs)
+            init_data = self.example_data(bs, packed_seq_len=packed_seq_len)
             rng = jax.ShapeDtypeStruct((2,), jnp.uint32)
         else:
             rng, init_data = super()._rng_and_init_data(seq_len=seq_len)
@@ -4008,6 +4086,7 @@ class RankingModelRunner(
         request: xai_recsys_engine.PredictRequestBatch | None = None,
         eligible_mask: jax.Array | None = None,
         bucket_size: int | None = None,
+        packed_seq_len: int | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         assert isinstance(self.model_config, RecsysAggregatedModelConfig)
 
@@ -4041,7 +4120,11 @@ class RankingModelRunner(
             batch["candidate_seq"]["embedding"] = candidate_multimodal_embeddings
 
         bs = bucket_size if bucket_size is not None else self.inference_batch_size
-        forward_jit = self.forward_jit_by_bs[bs]
+        forward_jit = (
+            self.forward_jit_by_bs[bs]
+            if packed_seq_len is None
+            else self.forward_jit_by_bs_len[(bs, packed_seq_len)]
+        )
         params = self.state.params if self._live_swap_enabled else state.params
         with jax_profiler.TraceAnnotation(
             "forward_jit/ranking",
@@ -4144,17 +4227,46 @@ class RankingModelRunner(
         self.create_embedding_init_data()
 
         self.forward_jit_by_bs = {}
+        self.forward_jit_by_bs_len = {}
         for bs in self.sorted_buckets:
-            self.forward_jit_by_bs[bs] = self._build_and_register_forward_jit(bs, compiler_options)
+            lens: tuple[int | None, ...] = (
+                self.packed_seq_lens(bs) if self.compact_candidate_slots else (None,)
+            )
+            for n in lens:
+                jit_fn = self._build_and_register_forward_jit(
+                    bs, compiler_options, packed_seq_len=n
+                )
+                self.forward_jit_by_bs_len[(bs, n)] = jit_fn
+            self.forward_jit_by_bs[bs] = jit_fn
         self.forward_jit = self.forward_jit_by_bs[max(self.sorted_buckets)]
+        if (
+            self.seqpack_packed_len_fractions
+            and self.using_seqpack
+            and not self.compact_candidate_slots
+        ):
+            logger.warning(
+                "seqpack_packed_len_fractions=%s ignored: compact candidate slots need a "
+                "kernel that takes per-user lengths from cu_seqlens alone "
+                "(pallas_ranker_varlen_attn); the FA4 packed kernel schedules a fixed "
+                "candidate block per user. Running the fixed layout.",
+                self.seqpack_packed_len_fractions,
+            )
+        if self.compact_candidate_slots:
+            logger.info(
+                "compact candidate slots: compiled packed lengths per bucket %s",
+                {bs: self.packed_seq_lens(bs) for bs in self.sorted_buckets},
+            )
 
     def _build_and_register_forward_jit(
-        self, bs: int, compiler_options: dict[str, Any] | None
+        self,
+        bs: int,
+        compiler_options: dict[str, Any] | None,
+        packed_seq_len: int | None = None,
     ) -> JittedOrCompiled:
         assert isinstance(self.model_config, RecsysAggregatedModelConfig)
 
         if self.using_seqpack:
-            trace_batch = self.example_data(bs)
+            trace_batch = self.example_data(bs, packed_seq_len=packed_seq_len)
             _hist_post_seq = int(np.prod(trace_batch["history_seq"]["post_hashes"].shape[1:]))
             _hist_auth_seq = int(np.prod(trace_batch["history_seq"]["auth_hashes"].shape[1:]))
             _cand_post_seq = int(np.prod(trace_batch["candidate_seq"]["post_hashes"].shape[1:]))
@@ -4294,10 +4406,11 @@ class RankingModelRunner(
                 ),
                 out_shardings=(self.data_sharding, self.data_sharding, nan_sharding),
             ),
-            name=f"forward_fn_bs{bs}",
+            name=f"forward_fn_bs{bs}"
+            + (f"_len{packed_seq_len}" if packed_seq_len is not None else ""),
         )
 
-        rng, init_data = self._rng_and_init_data(bs=bs)
+        rng, init_data = self._rng_and_init_data(bs=bs, packed_seq_len=packed_seq_len)
 
         merged_embeddings_init = jnp.zeros(
             (
@@ -4340,9 +4453,22 @@ class RetrievalModelRunner(
     all_post_ids: npt.NDArray[np.int64] | None = None
     all_author_ids: npt.NDArray[np.int64] | None = None
     all_dataset_types: npt.NDArray[np.int32] | None = None
+    enable_topic_filter: bool = False
     enable_dataset_slice_topk: bool = False
     enable_async_topk: bool = False
+    cold_start_max_age_seconds: float = 0.0
     enable_radix_select_topk: bool = False
+    enable_int8_post_table: bool = False
+    _int8_post_table_cache: tuple | None = field(default=None, init=False)
+    _all_topic_bitmaps: dict[int, jax.Array] = field(default_factory=dict)
+
+    _mask_pinned_by_bs: dict[int, jax.Array] = field(default_factory=dict)
+    _mask_shard_views_by_bs: dict[int, tuple[npt.NDArray[np.uint8], ...]] = field(
+        default_factory=dict
+    )
+    _all_post_ids_np: npt.NDArray[np.int64] | None = None
+    _all_dataset_types_np: npt.NDArray[np.int32] | None = None
+    _mask_missing_warned: set[int] = field(default_factory=set, init=False)
 
     _dataset_ranges_by_type: dict[int, tuple[int, int]] | None = field(default=None, init=False)
 
@@ -4387,11 +4513,97 @@ class RetrievalModelRunner(
             ranges[val] = (int(s), int(e))
         return ranges
 
+    def _trim_ranges_by_post_age(
+        self,
+        ranges: dict[int, tuple[int, int]] | None,
+        post_ids: npt.NDArray[np.int64] | None,
+    ) -> dict[int, tuple[int, int]] | None:
+        max_age_s = float(self.cold_start_max_age_seconds or 0.0)
+        if max_age_s <= 0 or not ranges or post_ids is None:
+            return ranges
+
+        cutoff_ms = int(time.time() * 1000.0 - max_age_s * 1000.0) - TWITTER_EPOCH_MS
+        if cutoff_ms <= 0:
+            return ranges
+        cutoff_id = cutoff_ms << 22
+
+        ids = np.asarray(post_ids).reshape(-1)
+        out: dict[int, tuple[int, int]] = {}
+        for ds_value, (start, end) in ranges.items():
+            out[ds_value] = (start, end)
+            if ds_value != RetrievalDataset.HOME_COLD.value or end - start <= 0:
+                continue
+            window = ids[start:end]
+            if window.size > 1 and not bool(np.all(window[:-1] <= window[1:])):
+                logger.error(
+                    "cold_start_max_age_seconds: HOME_COLD rows [%d:%d) are not "
+                    "sorted by post_id; skipping age trim",
+                    start,
+                    end,
+                )
+                continue
+            offset = int(np.searchsorted(window, cutoff_id, side="left"))
+            new_start = start + offset
+            floor_start = max(start, end - int(self.large_k))
+            clamped = min(new_start, floor_start)
+            if clamped != new_start:
+                logger.warning(
+                    "cold_start_max_age_seconds=%.0fs would leave %d HOME_COLD rows "
+                    "(< large_k=%d); keeping the %d newest instead",
+                    max_age_s,
+                    end - new_start,
+                    self.large_k,
+                    end - clamped,
+                )
+            out[ds_value] = (clamped, end)
+            logger.info(
+                "Age trim (dataset %d, max_age=%.0fs): [%d:%d) -> [%d:%d) (%d of %d rows kept)",
+                ds_value,
+                max_age_s,
+                start,
+                end,
+                clamped,
+                end,
+                end - clamped,
+                end - start,
+            )
+        return out
+
+    def _finalize_serving_ranges(
+        self,
+        raw: dict[int, tuple[int, int]] | None,
+        post_ids: npt.NDArray[np.int64] | None,
+    ) -> dict[int, tuple[int, int]] | None:
+        if not raw:
+            return raw
+        union = RetrievalDataset.home_union_range(raw)
+        trimmed = self._trim_ranges_by_post_age(raw, post_ids)
+        if trimmed is None:
+            return None
+        if union is not None:
+            trimmed = dict(trimmed)
+            trimmed[RetrievalDataset.HOME.value] = union
+        return trimmed
+
+    def _serving_target_dataset_types(
+        self, ranges: dict[int, tuple[int, int]] | None = None
+    ) -> tuple[int, ...]:
+        launch = tuple(ds.value for ds in self.retrieval_dataset_types)
+        table = ranges if ranges is not None else self._dataset_ranges_by_type
+        if not table or getattr(self, "enable_topic_filter", False):
+            return launch
+        home = RetrievalDataset.HOME.value
+        cold = RetrievalDataset.HOME_COLD.value
+        if home in launch and cold in table and cold not in launch:
+            return launch + (cold,)
+        return launch
+
     def _compute_dataset_ranges(self) -> None:
         if self.all_dataset_types is None:
             self._dataset_ranges_by_type = None
             return
         ranges = self._dataset_ranges_from_types(np.asarray(self.all_dataset_types))
+        ranges = self._finalize_serving_ranges(ranges, self.all_post_ids)
         self._dataset_ranges_by_type = ranges
         if ranges is None:
             return
@@ -4408,6 +4620,8 @@ class RetrievalModelRunner(
         ranges_override: dict[int, tuple[int, int]] | None = None,
     ) -> tuple[tuple[int, int], ...] | None:
         if not self.enable_dataset_slice_topk:
+            return None
+        if self.enable_bloom_filter or self.enable_topic_filter:
             return None
         ranges = ranges_override if ranges_override is not None else self._dataset_ranges_by_type
         if not ranges:
@@ -4438,7 +4652,64 @@ class RetrievalModelRunner(
                 self.state.post_embeddings.dataset_types, dtype=np.int32
             )
             self._compute_dataset_ranges()
+            if self.enable_topic_filter:
+                self._reload_topic_bitmaps()
+            if self.enable_bloom_filter and self.all_post_ids is not None:
+                self._init_bloom_filter_pinned_buffer()
         return new_ckpt_loaded, elapsed_samples, _
+
+    def _reload_topic_bitmaps(self) -> None:
+        new_bitmaps: dict[int, jax.Array] = {}
+        for option, path in _TOPIC_PARQUET_PATHS.items():
+            bitmap = self._load_topic_bitmaps_from_parquet(path)
+            if bitmap is not None:
+                new_bitmaps[option] = bitmap
+                logger.info(f"Loaded topic bitmaps for option {option}: shape={bitmap.shape}")
+        if not new_bitmaps:
+            logger.warning(
+                "No topic bitmaps loaded from any parquet file; "
+                "topic filtering will silently pass through all candidates."
+            )
+        self._all_topic_bitmaps = new_bitmaps
+
+    def _load_topic_bitmaps_from_parquet(self, parquet_path: str) -> jax.Array | None:
+        if self.all_post_ids is None:
+            return None
+
+        if not os.path.exists(parquet_path):
+            logger.warning(f"Topic parquet file not found: {parquet_path}")
+            return None
+
+        logger.info(f"Loading topic bitmaps from parquet: {parquet_path}")
+
+        try:
+            table = pq.read_table(parquet_path, columns=["post_id", "topic_entity_ids"])
+            parquet_post_ids = table.column("post_id").to_numpy()
+            topic_ids_list = table.column("topic_entity_ids").to_pylist()
+
+            raw_bitmaps = [topic_ids_to_bitmap(tids) for tids in topic_ids_list]
+            parquet_bitmaps = bitmaps_to_int32_array(raw_bitmaps)
+
+            sort_idx = np.argsort(parquet_post_ids)
+            sorted_ids = parquet_post_ids[sort_idx]
+            sorted_bitmaps = parquet_bitmaps[sort_idx]
+
+            indices = np.searchsorted(sorted_ids, self.all_post_ids)
+            clamped_indices = np.minimum(indices, len(sorted_ids) - 1)
+            valid = (indices < len(sorted_ids)) & (sorted_ids[clamped_indices] == self.all_post_ids)
+
+            bitmaps = np.zeros((len(self.all_post_ids), NUM_TOPIC_INT32S), dtype=np.int32)
+            bitmaps[valid] = sorted_bitmaps[clamped_indices[valid]]
+
+            matched_count = np.sum(valid)
+            logger.info(
+                f"Loaded topic bitmaps: {matched_count}/{len(self.all_post_ids)} posts matched"
+            )
+            return jnp.array(bitmaps, dtype=jnp.int32)
+
+        except Exception as e:
+            logger.error(f"Failed to load topic bitmaps from parquet: {e}")
+            return None
 
     def _on_post_hotswap(self) -> None:
         assert isinstance(self.state, RecsysInferenceState)
@@ -4452,7 +4723,11 @@ class RetrievalModelRunner(
                 self.state.post_embeddings.dataset_types, dtype=np.int32
             )
             self._compute_dataset_ranges()
-            logger.info("[hotswap] Rebuilt retrieval metadata (post_ids, author_ids)")
+            if self.enable_bloom_filter:
+                self._init_bloom_filter_pinned_buffer()
+            if self.enable_topic_filter:
+                self._reload_topic_bitmaps()
+            logger.info("[hotswap] Rebuilt retrieval metadata (post_ids, author_ids, bloom filter)")
 
     def _prepare_live_swap_derived_state(self, staged_meta: dict[str, np.ndarray]) -> None:
         self._staged_live_retrieval_meta = None
@@ -4460,6 +4735,7 @@ class RetrievalModelRunner(
         author_ids64 = self.two_int32_to_int64(staged_meta["post_embeddings.author_ids"])
         dataset_types = np.asarray(staged_meta["post_embeddings.dataset_types"], dtype=np.int32)
         ranges = self._dataset_ranges_from_types(dataset_types)
+        ranges = self._finalize_serving_ranges(ranges, post_ids64)
         self._precompile_live_two_tower_variants(ranges)
         self._staged_live_retrieval_meta = (post_ids64, author_ids64, dataset_types, ranges)
 
@@ -4498,7 +4774,7 @@ class RetrievalModelRunner(
         self, staged_ranges: dict[int, tuple[int, int]] | None
     ) -> None:
         self._staged_live_forward_compiled = None
-        target_dataset_types = tuple(ds.value for ds in self.retrieval_dataset_types)
+        target_dataset_types = self._serving_target_dataset_types(staged_ranges or None)
         ranges_tuple = self._get_dataset_ranges(
             target_dataset_types, ranges_override=staged_ranges or {}
         )
@@ -4524,6 +4800,9 @@ class RetrievalModelRunner(
                     emb_sds,
                     pe_sds,
                     dtypes_sds,
+                    eligible_sds,
+                    topic_sds,
+                    topic_user_sds,
                 ) = sds
                 with self.mesh:
                     lowered = self._forward_jit_for_bucket(bs).lower(
@@ -4535,6 +4814,9 @@ class RetrievalModelRunner(
                         dtypes_sds,
                         self.large_k,
                         target_dataset_types,
+                        eligible_sds,
+                        topic_sds,
+                        topic_user_sds,
                         ranges_tuple,
                     )
                     compiled = JittedOrCompiled(
@@ -4554,6 +4836,51 @@ class RetrievalModelRunner(
                     e,
                 )
         self._staged_live_forward_compiled = staged or None
+
+    def _init_bloom_filter_pinned_buffer(self) -> None:
+        from xai_checkpointing.common import (
+            _unsafe_jax2np,
+        )
+
+        M = len(self.all_post_ids)
+
+        self._mask_pinned_by_bs = {}
+        self._mask_shard_views_by_bs = {}
+        for bs in self.sorted_buckets:
+            with self.mesh:
+                pinned = jnp.empty(
+                    (bs, M),
+                    dtype=jnp.bool_,
+                    device=self.data_sharding.with_memory_kind("pinned_host"),
+                )
+
+            views = tuple(
+                np.ndarray(
+                    shape=(shard.data.size,),
+                    dtype=np.uint8,
+                    buffer=_unsafe_jax2np(shard.data),
+                )
+                for shard in pinned.addressable_shards
+            )
+            assert bs % len(views) == 0, (
+                f"bloom bucket {bs} must divide evenly across {len(views)} mask shards"
+            )
+            for view in views:
+                view[:] = 1
+            self._mask_pinned_by_bs[bs] = pinned
+            self._mask_shard_views_by_bs[bs] = views
+
+        self._all_post_ids_np = np.ascontiguousarray(self.all_post_ids, dtype=np.int64)
+        self._all_dataset_types_np = np.ascontiguousarray(
+            np.asarray(self.all_dataset_types).reshape(-1), dtype=np.int32
+        )
+
+        total_mb = sum(bs * M for bs in self.sorted_buckets) / 1e6
+        logger.info(
+            f"Allocated pinned bloom filter masks: buckets={self.sorted_buckets}, "
+            f"M={M}, total={total_mb:.1f} MB, "
+            f"num_shards={len(next(iter(self._mask_shard_views_by_bs.values())))}"
+        )
 
     def _get_persistent_buffer(
         self, request_in_flight_id: int, bucket_size: int | None = None
@@ -4603,6 +4930,75 @@ class RetrievalModelRunner(
             history_post_sids=persistent_buffer["history_seq"].get("post_sids"),
         )
 
+    def _build_eligible_mask(
+        self,
+        request: xai_recsys_engine.RetrieveRequestBatch | None,
+        batch_id: int,
+        bucket_size: int | None = None,
+    ) -> jax.Array | None:
+        if not self.enable_bloom_filter:
+            return None
+
+        bs = bucket_size if bucket_size is not None else self.inference_batch_size
+        pinned = self._mask_pinned_by_bs.get(bs)
+        shard_views = self._mask_shard_views_by_bs.get(bs)
+        if pinned is None or shard_views is None:
+            if request is not None and bs not in self._mask_missing_warned:
+                self._mask_missing_warned.add(bs)
+                logger.warning(
+                    "[BloomFilter] no pinned mask buffer for bucket %d "
+                    "(initialized buckets: %s); serving UNFILTERED",
+                    bs,
+                    sorted(self._mask_pinned_by_bs),
+                )
+            return None
+
+        import time
+
+        t0 = time.monotonic()
+
+        if request is None or self.all_post_ids is None:
+            for view in shard_views:
+                view[:] = 1
+        else:
+            post_ids = (
+                self._all_post_ids_np
+                if self._all_post_ids_np is not None
+                else (np.ascontiguousarray(self.all_post_ids, dtype=np.int64))
+            )
+            ds_types = getattr(self, "_all_dataset_types_np", None)
+            if ds_types is None:
+                ds_types = np.ascontiguousarray(
+                    np.asarray(self.all_dataset_types).reshape(-1), dtype=np.int32
+                )
+            request.build_eligible_mask_into_shards(
+                post_ids,
+                ds_types,
+                bs,
+                list(shard_views),
+            )
+
+        t1 = time.monotonic()
+
+        result = jax.device_put(pinned, self.data_sharding)
+
+        t2 = time.monotonic()
+        rust_ms = (t1 - t0) * 1000
+        h2d_ms = (t2 - t1) * 1000
+        logger.info(
+            f"[BloomFilter] batch_id={batch_id} bucket={bs} | "
+            f"rust_build={rust_ms:.1f}ms, h2d={h2d_ms:.1f}ms, total={rust_ms + h2d_ms:.1f}ms"
+        )
+        return result
+
+    def _build_eligible_mask_pipelined(
+        self,
+        request: xai_recsys_engine.RetrieveRequestBatch | None,
+        batch_id: int,
+        bucket_size: int | None = None,
+    ) -> jax.Array | None:
+        return self._build_eligible_mask(request, batch_id, bucket_size)
+
     def _forward_jit_for_bucket(self, bucket_size: int | None) -> JittedOrCompiled:
         bs = bucket_size if bucket_size is not None else self.inference_batch_size
         return self.two_tower_forward_jit_by_bs[bs]
@@ -4617,10 +5013,12 @@ class RetrievalModelRunner(
         request: xai_recsys_engine.RetrieveRequestBatch | None = None,
         eligible_mask: jax.Array | None = None,
         bucket_size: int | None = None,
+        packed_seq_len: int | None = None,
     ) -> dict[int, tuple[jax.Array, jax.Array, jax.Array]]:
         if self._live_swap_enabled:
             state = self.state
         forward_jit = self._forward_jit_for_bucket(bucket_size)
+        bs = bucket_size if bucket_size is not None else self.inference_batch_size
         assert state.post_embeddings is not None
         h2d_state = self._get_h2d_state(request_in_flight_id, bucket_size)
         with jax_profiler.TraceAnnotation(
@@ -4642,11 +5040,57 @@ class RetrievalModelRunner(
                 self.metrics_publisher.model_latency.labels("embedding_lookup").observe(
                     emb_lookup_time
                 )
-        target_dataset_types = tuple(ds.value for ds in self.retrieval_dataset_types)
+        target_dataset_types = self._serving_target_dataset_types()
 
         dataset_ranges = self._get_dataset_ranges(target_dataset_types)
 
-        bs = bucket_size if bucket_size is not None else self.inference_batch_size
+        if eligible_mask is None:
+            eligible_mask = self._build_eligible_mask(request, batch_id, bucket_size)
+        if eligible_mask is not None:
+            assert eligible_mask.shape[0] == bs, (
+                f"eligible_mask rows {eligible_mask.shape[0]} != bucket {bs}; "
+                "per-bucket mask build must match the bucket forward"
+            )
+
+        topic_bitmaps = None
+        topic_user_bitmasks = None
+        if self.enable_topic_filter:
+            topic_filter_mode = 0
+            if request is not None:
+                topic_filter_mode = request.get_topic_filter_mode()
+
+            topic_bitmaps = self._all_topic_bitmaps.get(topic_filter_mode)
+            if topic_bitmaps is None:
+                if topic_filter_mode != 0:
+                    logger.warning(
+                        "topic_filter_mode=%d not loaded in _all_topic_bitmaps; "
+                        "falling back to mode 0",
+                        topic_filter_mode,
+                    )
+                topic_bitmaps = self._all_topic_bitmaps.get(0)
+
+            if topic_bitmaps is None and state.post_embeddings is not None:
+                N = state.post_embeddings.embeddings.x.shape[0]
+                topic_bitmaps = jnp.zeros((N, NUM_TOPIC_INT32S), dtype=jnp.int32)
+
+            batch_size = batch["user_hashes"].shape[0]
+            if request is not None and self._all_topic_bitmaps:
+                topic_entity_id_list = request.get_topic_entity_ids()
+                raw_bitmasks = [0] * batch_size
+                for i, tids in enumerate(topic_entity_id_list):
+                    if i >= batch_size:
+                        break
+                    mask = 0
+                    for tid in tids:
+                        if tid != 0 and tid in TOPIC_ID_TO_BITS:
+                            for bit in TOPIC_ID_TO_BITS[tid]:
+                                mask |= 1 << bit
+                    raw_bitmasks[i] = mask
+                topic_user_bitmasks = jnp.array(
+                    bitmaps_to_int32_array(raw_bitmasks), dtype=jnp.int32
+                )
+            else:
+                topic_user_bitmasks = jnp.zeros((batch_size, NUM_TOPIC_INT32S), dtype=jnp.int32)
 
         if self.enable_hotswap and bs not in self._live_forward_sds:
 
@@ -4660,8 +5104,11 @@ class RetrievalModelRunner(
                 _sds(rng),
                 _sds(batch),
                 _sds(recsys_embeddings),
-                _sds(state.post_embeddings.embeddings.x),
+                _sds(self._post_table_forward_arg(state)),
                 _sds(state.post_embeddings.dataset_types),
+                _sds(eligible_mask),
+                _sds(topic_bitmaps),
+                _sds(topic_user_bitmasks),
             )
 
         live_compiled = (
@@ -4680,8 +5127,11 @@ class RetrievalModelRunner(
                         rng,
                         batch,
                         recsys_embeddings,
-                        state.post_embeddings.embeddings.x,
+                        self._post_table_forward_arg(state),
                         state.post_embeddings.dataset_types,
+                        eligible_mask,
+                        topic_bitmaps,
+                        topic_user_bitmasks,
                     )
                 except Exception:
                     logger.exception(
@@ -4697,16 +5147,36 @@ class RetrievalModelRunner(
                     rng,
                     batch,
                     recsys_embeddings,
-                    state.post_embeddings.embeddings.x,
+                    self._post_table_forward_arg(state),
                     state.post_embeddings.dataset_types,
                     self.large_k,
                     target_dataset_types,
+                    eligible_mask,
+                    topic_bitmaps,
+                    topic_user_bitmasks,
                     dataset_ranges,
                 )
         results_dict = {
             ds_type: result for ds_type, result in zip(target_dataset_types, results_tuple)
         }
         return results_dict
+
+    def _post_table_forward_arg(self, state: RecsysInferenceState):
+        x = state.post_embeddings.embeddings.x
+        if not self.enable_int8_post_table:
+            return x
+        cache = self._int8_post_table_cache
+        if cache is None or cache[0] is not x:
+            t0 = time.time()
+            q8, scales = jax.block_until_ready(_quantize_post_table(x))
+            logger.info(
+                "enable_int8_post_table: quantized post table %s bf16 -> int8 in %.0fms",
+                x.shape,
+                (time.time() - t0) * 1e3,
+            )
+            cache = (x, q8, scales)
+            self._int8_post_table_cache = cache
+        return (cache[1], cache[2])
 
     def reply_request(
         self,
@@ -4901,13 +5371,19 @@ class RetrievalModelRunner(
         def two_tower_forward_fn(
             batch: RecsysFeaturesBatch,
             merged_embeddings: jax.Array,
-            post_embeddings: jax.Array,
+            post_embeddings: jax.Array | tuple[jax.Array, jax.Array],
             dataset_types: jax.Array,
             large_k: int,
             target_dataset_types: tuple[int, ...],
+            eligible_mask: jax.Array | None = None,
+            topic_bitmaps: jax.Array | None = None,
+            topic_user_bitmasks: jax.Array | None = None,
             dataset_ranges: tuple[tuple[int, int], ...] | None = None,
         ):
             assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
+            post_scales = None
+            if isinstance(post_embeddings, tuple):
+                post_embeddings, post_scales = post_embeddings
             sl = embedding_slices
 
             if self.using_seqpack:
@@ -4939,11 +5415,23 @@ class RetrievalModelRunner(
                 dataset_types,
                 large_k,
                 target_dataset_types,
+                eligible_mask,
+                topic_bitmaps=topic_bitmaps,
+                topic_user_bitmasks=topic_user_bitmasks,
                 dataset_ranges=dataset_ranges,
                 use_async_topk=self.enable_async_topk,
                 use_radix_select_topk=self.enable_radix_select_topk,
+                post_scales=post_scales,
                 return_validity=True,
             )
+
+        if self.enable_int8_post_table:
+            post_table_in_sharding = (
+                self.data_sharding,
+                jax.sharding.NamedSharding(self.data_sharding.mesh, P(self.data_sharding.spec[0])),
+            )
+        else:
+            post_table_in_sharding = self.data_sharding
 
         return JittedOrCompiled(
             jax.jit(
@@ -4953,11 +5441,18 @@ class RetrievalModelRunner(
                     None,
                     self.data_sharding,
                     self.data_sharding,
-                    self.data_sharding,
+                    post_table_in_sharding,
+                    None,
+                    self.data_sharding if self.enable_bloom_filter else None,
+                    None,
                     None,
                 ),
                 out_shardings=None,
-                static_argnums=[6, 7, 8],
+                static_argnums=[
+                    6,
+                    7,
+                    11,
+                ],
             ),
             name=f"two_tower_forward_fn_bs{bs}",
         )

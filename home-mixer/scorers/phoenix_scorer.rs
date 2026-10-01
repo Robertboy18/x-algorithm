@@ -21,7 +21,7 @@ pub struct PhoenixScorer {
 }
 
 impl PhoenixScorer {
-    fn resolve_cluster(query: &ScoredPostsQuery) -> PhoenixCluster {
+    pub(crate) fn resolve_cluster(query: &ScoredPostsQuery) -> PhoenixCluster {
         let configured_cluster =
             PhoenixCluster::parse(&query.params.get(PhoenixInferenceClusterId));
 

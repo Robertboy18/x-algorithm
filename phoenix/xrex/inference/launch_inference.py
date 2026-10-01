@@ -366,9 +366,8 @@ def run(
     runner.use_pinned_d2h = args.use_pinned_d2h
     runner.pinned_d2h_num_buffers = args.pinned_d2h_num_buffers
     runner.embedding_gather_threads = args.embedding_gather_threads
-    if hasattr(runner, "enable_bloom_filter"):
-        runner.enable_bloom_filter = args.enable_bloom_filter
-        runner.enable_topic_filter = args.enable_topic_filter
+    runner.enable_bloom_filter = args.enable_bloom_filter
+    runner.enable_topic_filter = args.enable_topic_filter
     runner.fake_mm_embeddings = args.fake_mm_embeddings
     runner.enable_async_response_compression = args.enable_async_response_compression
     runner.enable_hotswap = args.enable_hotswap

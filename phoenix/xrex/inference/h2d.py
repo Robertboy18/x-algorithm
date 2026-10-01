@@ -16,6 +16,7 @@ import numpy.typing as npt
 import xai_recsys_engine
 from xai_checkpointing.common import _unsafe_jax2np
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
+from xrex.inference.worker_shm import ShmTensorView
 
 logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
@@ -44,7 +45,7 @@ class EmbeddingSlices(NamedTuple):
 class H2DState(NamedTuple):
     emb_table: npt.NDArray[np.uint16]
 
-    embeddings_buffer: jax.Array
+    embeddings_buffer: jax.Array | ShmTensorView
 
     embedding_slices: EmbeddingSlices
 
@@ -236,22 +237,37 @@ def create_h2d_state(
         f"{candidate_multimodal_embeddings_shape=} {user_ip_embeddings_shape=}"
     )
 
-    pinned_sharding = data_sharding.with_memory_kind("pinned_host")
-    np_buf = np.zeros(combined_shape, dtype=dtype)
-    embeddings_buffer = jax.device_put(np_buf, pinned_sharding)
-    del np_buf
-    logger.info(
-        f"Created combined pinned embeddings buffer: shape={combined_shape}, "
-        f"size={embeddings_buffer.nbytes / 1e6:.1f} MB, "
-        f"num_shards={len(embeddings_buffer.addressable_shards)}"
-    )
+    from xrex.inference import worker_shm as worker_shm_mod
+
+    shm = worker_shm_mod.get_active()
+    if shm is not None:
+        shape_tag = "x".join(str(int(s)) for s in combined_shape)
+        embeddings_buffer = shm.alloc(
+            f"emb_h2d.{shape_tag}.slot0",
+            worker_shm_mod.TensorSpec(combined_shape, np.dtype(dtype)),
+            pinned=True,
+            unique=True,
+        )
+        logger.info(
+            f"Created shm pinned embeddings buffer: shape={combined_shape}, "
+            f"size={embeddings_buffer.nbytes / 1e6:.1f} MB, path={embeddings_buffer.path}"
+        )
+    else:
+        np_buf = np.zeros(combined_shape, dtype=dtype)
+        embeddings_buffer = jax.device_put(np_buf, data_sharding.with_memory_kind("pinned_host"))
+        del np_buf
+        logger.info(
+            f"Created combined pinned embeddings buffer: shape={combined_shape}, "
+            f"size={embeddings_buffer.nbytes / 1e6:.1f} MB, "
+            f"num_shards={len(embeddings_buffer.addressable_shards)}"
+        )
 
     multimodal_embeddings = None
-    if candidate_multimodal_embeddings_shape is not None:
+    if shm is None and candidate_multimodal_embeddings_shape is not None:
         mm_batch, candidate_seq_len, mm_embedding_dim = candidate_multimodal_embeddings_shape
         flat_shape = (mm_batch, candidate_seq_len * mm_embedding_dim)
         mm_np = np.zeros(flat_shape, dtype=np.float16)
-        jax_buffer = jax.device_put(mm_np, pinned_sharding)
+        jax_buffer = jax.device_put(mm_np, data_sharding.with_memory_kind("pinned_host"))
         del mm_np
         cached_numpy_views = _create_mm_embedding_buffer_views(jax_buffer)
         multimodal_embeddings = MultimodalEmbeddingBuffer(
@@ -297,8 +313,10 @@ def lookup_h2d_embeddings(
     num_threads: int = 16,
 ) -> tuple[jax.Array, jax.Array | None]:
     emb_table = emb_table_override if emb_table_override is not None else h2d_state.emb_table
-    num_shards = len(h2d_state.embeddings_buffer.addressable_shards)
-    total_batch = h2d_state.embeddings_buffer.shape[0]
+    emb_buf = h2d_state.embeddings_buffer
+    is_shm = isinstance(emb_buf, ShmTensorView)
+    num_shards = 1 if is_shm else len(emb_buf.addressable_shards)
+    total_batch = emb_buf.shape[0]
 
     hist_post_src = batch["history_seq"]["post_hashes"]
     hist_auth_src = batch["history_seq"]["auth_hashes"]
@@ -329,14 +347,17 @@ def lookup_h2d_embeddings(
 
     row_size = emb_table.shape[1] * emb_table.itemsize
 
-    shard_rows = tuple(
-        np.ndarray(
-            shape=shard.data.size * shard.data.itemsize,
-            dtype=np.uint8,
-            buffer=_unsafe_jax2np(shard.data),
+    if is_shm:
+        shard_rows = (emb_buf.array.view(np.uint8).reshape(-1),)
+    else:
+        shard_rows = tuple(
+            np.ndarray(
+                shape=shard.data.size * shard.data.itemsize,
+                dtype=np.uint8,
+                buffer=_unsafe_jax2np(shard.data),
+            )
+            for shard in emb_buf.addressable_shards
         )
-        for shard in h2d_state.embeddings_buffer.addressable_shards
-    )
 
     logger.info(
         f"[batch={batch_id}] Step 2 (embedding_gather): "
@@ -359,8 +380,8 @@ def lookup_h2d_embeddings(
             num_threads=num_threads,
         )
 
-    merged_device = jax.device_put(h2d_state.embeddings_buffer, data_sharding)
-    if h2d_state.embeddings_buffer.dtype == np.uint16:
+    merged_device = jax.device_put(emb_buf.array if is_shm else emb_buf, data_sharding)
+    if emb_buf.dtype == np.uint16:
         merged_device = merged_device.view(jax.numpy.bfloat16)
 
     candidate_multimodal_embeddings_gpu = None

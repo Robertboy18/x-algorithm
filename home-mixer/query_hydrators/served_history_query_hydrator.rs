@@ -2,7 +2,7 @@ use crate::clients::served_history_client::{ServedHistoryClient, TimelineType};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
     EnableUrtMigrationComponents, ExcludeServedTweetIdsDuration, ExcludeServedTweetIdsNumber,
-    FeedSurveyFatigueHours, WhoToFollowFatigueHours,
+    FeedSurveyFatigueMinutes, WhoToFollowFatigueHours,
 };
 use std::sync::Arc;
 use tonic::async_trait;
@@ -38,14 +38,14 @@ impl QueryHydrator<ScoredPostsQuery> for ServedHistoryQueryHydrator {
         let who_to_follow_eligible = is_module_eligible(
             &entries,
             EntityIdType::WHO_TO_FOLLOW,
-            query.params.get(WhoToFollowFatigueHours),
+            query.params.get(WhoToFollowFatigueHours) as i64 * 3_600_000,
             query.request_time_ms,
         );
 
         let feed_survey_eligible = is_module_eligible(
             &entries,
             EntityIdType::ANNOTATION,
-            query.params.get(FeedSurveyFatigueHours),
+            query.params.get(FeedSurveyFatigueMinutes) as i64 * 60_000,
             query.request_time_ms,
         );
 
@@ -101,11 +101,9 @@ fn recently_served_ids(
 fn is_module_eligible(
     history: &[ServedHistory],
     entity_type: EntityIdType,
-    fatigue_hours: u32,
+    fatigue_interval_ms: i64,
     now_ms: i64,
 ) -> bool {
-    let min_interval_ms = fatigue_hours as i64 * 3_600_000;
-
     let last_served_ms = history
         .iter()
         .filter(|sh| sh.entries.iter().any(|e| e.entity_type == entity_type))
@@ -113,7 +111,7 @@ fn is_module_eligible(
         .max();
 
     match last_served_ms {
-        Some(ts) => (now_ms - ts) >= min_interval_ms,
+        Some(ts) => (now_ms - ts) >= fatigue_interval_ms,
         None => true,
     }
 }

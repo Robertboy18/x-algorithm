@@ -198,19 +198,21 @@ class CutedslRankerAttention(CustomAttention):
     def sharded_custom_op_with_extra_args(self):
         assert isinstance(self.config, RecsysAttentionConfig)
         assert not self.config.causal, "CuTeDSL FA4 does not support causal attention"
-        assert self.config.attn_logit_cap <= 0, (
-            f"CuTeDSL FA4 does not support softcap (got attn_logit_cap={self.config.attn_logit_cap}). "
-            f"Use qk_norm=True instead."
-        )
-        assert self.config.qk_norm, "CuTeDSL FA4 requires qk_norm=True for stable training"
+        has_cap = self.config.attn_logit_cap > 0 and self.config.attn_logit_cap_method != "none"
         from xrex.utils.gpu import GpuArch, gpu_arch
 
         arch = gpu_arch()
         assert arch in (GpuArch.A100, GpuArch.H100, GpuArch.GB200, GpuArch.GB300), (
             f"CuTeDSL ranker attention requires A100, H100, GB200 or GB300 (got {arch})"
         )
+        assert not (has_cap and arch == GpuArch.A100), (
+            "CuTeDSL FA4 attn_logit_cap is SM90/SM100 only (SM80 rejects score_mod with block "
+            "sparsity); use qk_norm=True with attn_logit_cap=-1 on A100"
+        )
         config = self.config
         sm_scale = self.scale_config.attn_output_scale(self.config.key_size)
+        cap = config.attn_logit_cap if has_cap else -1.0
+        cap_method = config.attn_logit_cap_method
 
         from xrex.cutedsl.ranker_attention_fa4 import (
             build_dense_block_sparse_layout,
@@ -234,6 +236,8 @@ class CutedslRankerAttention(CustomAttention):
                     (fwd_bs, bwd_bs),
                     valid_block_upper=valid_upper,
                     valid_block_lower=valid_lower,
+                    cap=cap,
+                    cap_method=cap_method,
                 ),
                 None,
             )
@@ -246,8 +250,9 @@ class CutedslRankerVarlenAttention(CustomAttention):
         assert isinstance(self.config, RecsysAttentionConfig)
         assert not self.config.causal, "CuTeDSL FA4 does not support causal attention"
         assert self.config.attn_logit_cap <= 0, (
-            f"CuTeDSL FA4 does not support softcap (got attn_logit_cap={self.config.attn_logit_cap}). "
-            f"Use qk_norm=True instead."
+            "The packed CuTeDSL FA4 wrapper does not wire the attn_logit_cap score_mod "
+            f"(got attn_logit_cap={self.config.attn_logit_cap}); use qk_norm=True, or "
+            "cutedsl_ranker_attn for a capped model"
         )
         assert self.config.qk_norm, "CuTeDSL FA4 requires qk_norm=True for stable training"
         from xrex.utils.gpu import GpuArch, gpu_arch

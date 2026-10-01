@@ -202,7 +202,7 @@ mod tests {
             make_bytes(1, 10, None, 50, Some(3)),
             make_bytes(2, 20, Some("metadata"), 999, None),
             make_bytes(3, 30, Some("metadata"), 1000, None),
-            make_bytes(4, 40, Some("mm_emb_metadata"), 10, Some(5)),
+            make_bytes(4, 40, Some("other"), 10, Some(5)),
             make_bytes(5, 50, Some("metadata"), 5_000_000, Some(10)),
         ];
         let out = process_in_blocking(move || proc.process_batch(&batch)).await;

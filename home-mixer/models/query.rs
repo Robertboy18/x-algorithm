@@ -1,5 +1,6 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::engagement_signals::EngagementSignalsByType;
+use crate::models::fs_recipient::FsRecipientInputs;
 use crate::models::in_network_reply::{serialize_in_network_replies, InNetworkReplies};
 use crate::models::user_features::UserFeatures;
 use serde::Serialize;
@@ -94,6 +95,8 @@ pub struct ScoredPostsQuery {
     pub ip_location: Option<xai_geo_ip::LocationInfo>,
     pub user_age_in_years: Option<i32>,
     pub resurrection_time_ms: Option<i64>,
+    #[serde(skip)]
+    pub fs_recipient_inputs: Option<FsRecipientInputs>,
     #[serde(serialize_with = "serialize_debug")]
     pub user_inferred_gender: Option<InferredGenderLabel>,
     pub user_inferred_gender_score: Option<f32>,
@@ -207,6 +210,7 @@ impl ScoredPostsQuery {
             ip_location: None,
             user_age_in_years: age_in_years,
             resurrection_time_ms: None,
+            fs_recipient_inputs: None,
             user_inferred_gender: None,
             user_inferred_gender_score: None,
             followed_grok_topics: None,

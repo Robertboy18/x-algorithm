@@ -10,6 +10,7 @@ pub mod redis_post_candidate_cache_side_effect;
 pub mod reranking_kafka_side_effect;
 pub mod response_diversity_stats_side_effect;
 pub mod response_stats_side_effect;
+pub mod retrieval_candidates_kafka_side_effect;
 pub mod scored_stats_side_effect;
 pub mod served_ad_history_cache_side_effect;
 pub mod served_candidates_kafka_side_effect;

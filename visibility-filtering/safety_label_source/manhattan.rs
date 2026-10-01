@@ -28,7 +28,7 @@ impl ManhattanLookup for ManhattanSource {
         }
 
         let start = Instant::now();
-        let i64_ids: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
+        let i64_ids: Vec<i64> = ids.iter().map(|&id| id.cast_signed()).collect();
         let mut successes = 0usize;
         let mut failures = 0usize;
 
@@ -214,22 +214,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_returns_labels() {
-        let results = get_with_fetcher(
-            FakeLabelFetcher::new().with_label(100, SafetyLabelType::SPAM, Some(0.9)),
-            &[100],
-        )
-        .await;
-
-        match results.get(&100).unwrap() {
-            ManhattanOutcome::Resolved(label_map) => assert!(label_map
-                .labels
-                .contains_key(&i32::from(SafetyLabelType::SPAM))),
-            _ => panic!("expected hit"),
-        }
-    }
-
-    #[tokio::test]
     async fn get_empty_label_list_returns_empty_label_map() {
         let results = get_with_fetcher(FakeLabelFetcher::new(), &[100]).await;
 
@@ -251,7 +235,8 @@ mod tests {
 
         assert!(matches!(
             results.get(&1).unwrap(),
-            ManhattanOutcome::Resolved(_)
+            ManhattanOutcome::Resolved(label_map)
+                if label_map.labels.contains_key(&i32::from(SafetyLabelType::SPAM))
         ));
         assert!(matches!(
             results.get(&2).unwrap(),
@@ -276,26 +261,6 @@ mod tests {
                     if failure.kind == FailureKind::ManhattanFetch
                         && failure.message.contains("test error")
             ));
-        }
-    }
-
-    #[tokio::test]
-    async fn get_corrupt_mval_defaults_label_for_that_id() {
-        let mut fetcher = FakeLabelFetcher::new();
-        fetcher
-            .items
-            .entry(100)
-            .or_default()
-            .push(raw_label(SafetyLabelType::SPAM, vec![0xDE, 0xAD]));
-
-        let results = get_with_fetcher(fetcher, &[100]).await;
-
-        match results.get(&100).unwrap() {
-            ManhattanOutcome::Resolved(label_map) => assert_eq!(
-                label_map.labels[&i32::from(SafetyLabelType::SPAM)],
-                xai_visibility_filtering_proto::SafetyLabel::default()
-            ),
-            _ => panic!("expected resolved"),
         }
     }
 

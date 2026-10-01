@@ -1,4 +1,4 @@
-use crate::models::candidate::PostCandidate;
+use crate::models::candidate::{PostCandidate, RetrievalSource};
 use crate::models::query::ScoredPostsQuery;
 use std::sync::Arc;
 use tonic::async_trait;
@@ -92,6 +92,9 @@ impl Source<ScoredPostsQuery, PostCandidate> for PopularTopicsSource {
                     .map(|id| PostCandidate {
                         tweet_id: id as u64,
                         served_type: Some(pb::ServedType::ForYouPopularTopics),
+                        retrieval_sources: vec![RetrievalSource::from_served_type(
+                            pb::ServedType::ForYouPopularTopics,
+                        )],
                         ..Default::default()
                     })
             })

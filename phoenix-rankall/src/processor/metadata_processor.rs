@@ -163,7 +163,7 @@ mod tests {
         let mut proc = MetadataProcessor::new("metadata");
         let raw = vec![
             make_metadata_bytes(100, 10, "metadata", false, 10),
-            make_metadata_bytes(200, 20, "mm_emb_metadata", false, 20),
+            make_metadata_bytes(200, 20, "other", false, 20),
         ];
 
         let results = proc.process_batch(&raw);

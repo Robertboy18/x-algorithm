@@ -1,16 +1,20 @@
-use crate::hydration::{HydrationOutput, HydrationPipeline, HydrationRequest};
-use crate::models::{RawCandidate, TweetId};
-use crate::rules::metrics as ft_metrics;
-use crate::rules::{RuleEngine, SafetyLevel, Verdict};
+use crate::hydration::sources::Sources;
+use crate::hydration::{HydratedTweet, Hydration, HydrationRequest, Hydrators};
+use crate::models::{ClientCapability, HydratedTweetCandidate, RawCandidate, TweetId, Verdict};
+use crate::rules::metrics::{self as ft_metrics, RetweetSources, Rpc};
+use crate::rules::{RuleEngine, SafetyLevel};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use xai_visibility_filtering_proto as vf_pb;
 
 pub struct FilterRequest {
     pub viewer_id: Option<u64>,
     pub country_code: Option<String>,
+    pub client_capability: ClientCapability,
     pub safety_level: SafetyLevel,
     pub candidates: Vec<RawCandidate>,
+    pub rpc: Rpc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,9 +24,12 @@ pub enum EvaluationStatus {
     Failed,
 }
 
+#[derive(Clone)]
 pub struct FilterOutcome {
     pub tweet_id: TweetId,
+    pub source_tweet_id: Option<TweetId>,
     pub verdict: Verdict,
+    pub rested_on: Hydrators,
     pub status: EvaluationStatus,
     pub safety_labels: Option<vf_pb::SafetyLabelMap>,
 }
@@ -32,276 +39,206 @@ pub struct FilterResponse {
 }
 
 pub struct FilterTweets {
-    hydration_pipeline: HydrationPipeline,
+    sources: Arc<dyn Sources>,
     rule_engine: RuleEngine,
+    #[cfg(test)]
+    pub(crate) client_capabilities: std::sync::Mutex<Vec<ClientCapability>>,
 }
 
 impl FilterTweets {
-    pub(crate) fn new(hydration_pipeline: HydrationPipeline, rule_engine: RuleEngine) -> Self {
+    pub(crate) fn new(sources: Arc<dyn Sources>, rule_engine: RuleEngine) -> Self {
         Self {
-            hydration_pipeline,
+            sources,
             rule_engine,
+            #[cfg(test)]
+            client_capabilities: std::sync::Mutex::default(),
         }
     }
 
     pub async fn run(&self, request: FilterRequest) -> FilterResponse {
+        let hydrated = self.hydrate(request).await;
+        FilterResponse {
+            outcomes: self.evaluate_in_request_order(&hydrated),
+        }
+    }
+
+    pub(crate) async fn hydrate(&self, request: FilterRequest) -> HydratedRequest {
+        self.hydrate_request(request, false).await
+    }
+
+    pub(crate) async fn hydrate_with_retweet_sources(
+        &self,
+        request: FilterRequest,
+    ) -> HydratedRequest {
+        self.hydrate_request(request, true).await
+    }
+
+    async fn hydrate_request(
+        &self,
+        request: FilterRequest,
+        is_expanding_retweet_sources: bool,
+    ) -> HydratedRequest {
+        #[cfg(test)]
+        self.client_capabilities
+            .lock()
+            .unwrap()
+            .push(request.client_capability);
         let started = Instant::now();
         let hydration = self
-            .hydration_pipeline
-            .hydrate(HydrationRequest::new(
-                request.viewer_id,
-                request.country_code,
-                &request.candidates,
-                request.safety_level,
-            ))
+            .rule_engine
+            .plan(request.safety_level)
+            .hydrate(
+                &*self.sources,
+                HydrationRequest::new(
+                    request.viewer_id,
+                    request.country_code,
+                    request.client_capability,
+                    &request.candidates,
+                )
+                .with_retweet_sources(is_expanding_retweet_sources),
+            )
             .await;
         let hydrated_at = Instant::now();
-        ft_metrics::record_phase("hydration", hydrated_at - started);
-        let HydrationOutput {
-            viewer_features,
-            candidates: hydrated_candidates,
-            safety_labels,
-            failed_ids,
-        } = hydration;
-        let evaluated: HashMap<TweetId, Verdict> = hydrated_candidates
-            .iter()
-            .map(|candidate| {
-                (
-                    TweetId(candidate.tweet_id),
-                    self.rule_engine
-                        .evaluate(request.safety_level, &viewer_features, candidate),
-                )
-            })
-            .collect();
-
-        let outcomes: Vec<FilterOutcome> = request
-            .candidates
-            .iter()
-            .map(|candidate| {
-                let (verdict, status) = match evaluated.get(&candidate.tweet_id) {
-                    None => (
-                        Verdict::unresolved_author(),
-                        EvaluationStatus::UnresolvedAuthor,
-                    ),
-                    Some(verdict) if failed_ids.contains(&candidate.tweet_id) => {
-                        (verdict.clone(), EvaluationStatus::Failed)
-                    }
-                    Some(verdict) => (verdict.clone(), EvaluationStatus::Evaluated),
-                };
-                FilterOutcome {
-                    tweet_id: candidate.tweet_id,
-                    verdict,
-                    status,
-                    safety_labels: safety_labels
-                        .get(&candidate.tweet_id)
-                        .map(|labels| vf_pb::SafetyLabelMap::clone(labels)),
-                }
-            })
-            .collect();
-
-        ft_metrics::record_verdicts(
-            request.safety_level,
-            outcomes.iter().map(|outcome| &outcome.verdict),
+        let retweet_sources = if !is_expanding_retweet_sources {
+            RetweetSources::NoSource
+        } else if hydration.has_fetched_sources() {
+            RetweetSources::Fetched
+        } else if request.candidates.iter().any(|candidate| {
+            hydration
+                .tweet(candidate.tweet_id)
+                .is_some_and(|tweet| tweet.is_evaluable() && tweet.source_tweet_id().is_some())
+        }) {
+            RetweetSources::InBatch
+        } else {
+            RetweetSources::NoSource
+        };
+        ft_metrics::record_phase(
+            request.rpc,
+            "hydration",
+            retweet_sources,
+            hydrated_at - started,
         );
-        ft_metrics::record_phase("post_hydration", hydrated_at.elapsed());
+        HydratedRequest {
+            safety_level: request.safety_level,
+            rpc: request.rpc,
+            retweet_sources,
+            candidates: request.candidates,
+            hydration,
+        }
+    }
 
-        FilterResponse { outcomes }
+    pub(crate) fn evaluate_in_request_order(
+        &self,
+        hydrated: &HydratedRequest,
+    ) -> Vec<FilterOutcome> {
+        let evaluating = Instant::now();
+        let outcomes = hydrated
+            .requested_ids()
+            .map(|tweet_id| self.outcome(hydrated, tweet_id, None))
+            .collect();
+        ft_metrics::record_phase(
+            hydrated.rpc,
+            "post_hydration",
+            hydrated.retweet_sources,
+            evaluating.elapsed(),
+        );
+        outcomes
+    }
+
+    pub(crate) fn evaluate(
+        &self,
+        hydrated: &HydratedRequest,
+        ids: impl IntoIterator<Item = TweetId>,
+        copied_retweets: &HashMap<TweetId, HydratedTweetCandidate>,
+    ) -> HashMap<TweetId, FilterOutcome> {
+        let evaluating = Instant::now();
+        let mut outcomes = HashMap::new();
+        for tweet_id in ids {
+            outcomes.entry(tweet_id).or_insert_with(|| {
+                self.outcome(hydrated, tweet_id, copied_retweets.get(&tweet_id))
+            });
+        }
+        ft_metrics::record_phase(
+            hydrated.rpc,
+            "post_hydration",
+            hydrated.retweet_sources,
+            evaluating.elapsed(),
+        );
+        outcomes
+    }
+
+    fn outcome(
+        &self,
+        hydrated: &HydratedRequest,
+        tweet_id: TweetId,
+        copied_retweet: Option<&HydratedTweetCandidate>,
+    ) -> FilterOutcome {
+        let tweet = hydrated.hydration.tweet(tweet_id);
+        let (verdict, rested_on, status) = match copied_retweet.or_else(|| tweet?.candidate()) {
+            None => (
+                Verdict::unresolved_author(),
+                Hydrators::empty(),
+                EvaluationStatus::UnresolvedAuthor,
+            ),
+            Some(candidate) => {
+                let evaluation = self.rule_engine.evaluate(
+                    hydrated.safety_level,
+                    hydrated.hydration.viewer(),
+                    candidate,
+                );
+                let status = if tweet.is_some_and(HydratedTweet::has_failed_node) {
+                    EvaluationStatus::Failed
+                } else {
+                    EvaluationStatus::Evaluated
+                };
+                (evaluation.verdict, evaluation.rested_on, status)
+            }
+        };
+        FilterOutcome {
+            tweet_id,
+            source_tweet_id: tweet.and_then(HydratedTweet::source_tweet_id),
+            verdict,
+            rested_on,
+            status,
+            safety_labels: tweet
+                .and_then(HydratedTweet::safety_labels)
+                .map(|labels| vf_pb::SafetyLabelMap::clone(labels)),
+        }
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-    use crate::clients::socialgraph_client::FakeSocialgraphClient;
-    use crate::hydration::tes_composite::MockTweetForVisibilitySource;
-    use crate::safety_label_source::lookup::{ManhattanLookup, RemoteSource, TwemcacheLookup};
-    use crate::safety_label_source::types::{ManhattanOutcome, TwemcacheOutcome};
-    use crate::safety_label_source::SafetyLabelSource;
-    use std::sync::Arc;
-    use tonic::async_trait;
-    use xai_core_entities::gizmoduck_client::{GizmoduckClient, MockGizmoduckClient};
-    use xai_core_entities::tweet_entity_service_client::{MockTESClient, TESClient};
+pub(crate) struct HydratedRequest {
+    safety_level: SafetyLevel,
+    rpc: Rpc,
+    retweet_sources: RetweetSources,
+    candidates: Vec<RawCandidate>,
+    hydration: Hydration,
+}
 
-    fn full_label_map() -> vf_pb::SafetyLabelMap {
-        vf_pb::SafetyLabelMap {
-            labels: HashMap::from([(999_999, vf_pb::SafetyLabel::default())]),
-        }
+impl HydratedRequest {
+    pub(crate) fn hydration(&self) -> &Hydration {
+        &self.hydration
     }
 
-    struct FakeTwemcache;
-
-    #[async_trait]
-    impl TwemcacheLookup for FakeTwemcache {
-        async fn get(&self, ids: &[u64]) -> HashMap<u64, TwemcacheOutcome> {
-            ids.iter()
-                .copied()
-                .map(|id| {
-                    let outcome = if id == 2 {
-                        TwemcacheOutcome::Hit(full_label_map())
-                    } else {
-                        TwemcacheOutcome::Miss
-                    };
-                    (id, outcome)
-                })
-                .collect()
-        }
+    #[cfg(test)]
+    pub(crate) fn retweet_sources(&self) -> RetweetSources {
+        self.retweet_sources
     }
 
-    struct FakeManhattan;
-
-    #[async_trait]
-    impl ManhattanLookup for FakeManhattan {
-        async fn get(&self, ids: &[u64]) -> HashMap<u64, ManhattanOutcome> {
-            ids.iter()
-                .copied()
-                .map(|id| (id, ManhattanOutcome::Resolved(full_label_map())))
-                .collect()
-        }
-    }
-
-    pub(crate) fn filter_tweets() -> FilterTweets {
-        filter_tweets_with_gizmoduck(Arc::new(MockGizmoduckClient::default()))
-    }
-
-    pub(crate) fn filter_tweets_with_gizmoduck(
-        gizmoduck: Arc<dyn GizmoduckClient + Send + Sync>,
-    ) -> FilterTweets {
-        filter_tweets_with_clients(Arc::new(MockTESClient::default()), gizmoduck)
-    }
-
-    pub(crate) fn safety_labels() -> Arc<SafetyLabelSource> {
-        Arc::new(SafetyLabelSource::new(Arc::new(RemoteSource::new(
-            Arc::new(FakeTwemcache),
-            Arc::new(FakeManhattan),
-        ))))
-    }
-
-    pub(crate) fn filter_tweets_with_clients(
-        tes: Arc<dyn TESClient + Send + Sync>,
-        gizmoduck: Arc<dyn GizmoduckClient + Send + Sync>,
-    ) -> FilterTweets {
-        let socialgraph = Arc::new(FakeSocialgraphClient);
-        FilterTweets::new(
-            HydrationPipeline::new(
-                tes,
-                Arc::new(MockTweetForVisibilitySource::default()),
-                gizmoduck,
-                socialgraph,
-                safety_labels(),
-                None,
-                None,
-            ),
-            RuleEngine::for_tests(),
-        )
+    pub(crate) fn requested_ids(&self) -> impl ExactSizeIterator<Item = TweetId> + '_ {
+        self.candidates.iter().map(|candidate| candidate.tweet_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::socialgraph_client::SocialgraphClient;
-    use crate::filter::test_support::filter_tweets;
-    use crate::hydration::tes_composite::{
-        MockTweetForVisibilitySource, TweetForVisibility, TweetForVisibilitySource,
-    };
-    use crate::models::{
-        CoreFeature, ExclusiveContentFeatures, TweetFeatures, VfAction, ViewerAuthorRelationship,
-    };
-    use std::sync::{Arc, Mutex};
-    use tonic::async_trait;
-    use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety};
-    use xai_core_entities::gizmoduck_client::MockGizmoduckClient;
-    use xai_core_entities::tweet_entity_service_client::MockTESClient;
-
-    #[derive(Default)]
-    struct RecordingSocialgraph {
-        relationships: Mutex<Vec<Vec<u64>>>,
-        super_follows: Mutex<Vec<Vec<u64>>>,
-    }
-
-    #[async_trait]
-    impl SocialgraphClient for RecordingSocialgraph {
-        async fn batch_check_relationships(
-            &self,
-            _: u64,
-            authors: &[u64],
-        ) -> HashMap<u64, ViewerAuthorRelationship> {
-            self.relationships.lock().unwrap().push(authors.to_vec());
-            authors
-                .iter()
-                .map(|&id| {
-                    (
-                        id,
-                        ViewerAuthorRelationship {
-                            viewer_follows_author: true,
-                            ..Default::default()
-                        },
-                    )
-                })
-                .collect()
-        }
-
-        async fn batch_check_super_follows(
-            &self,
-            _: u64,
-            authors: &[u64],
-        ) -> Option<HashMap<u64, bool>> {
-            self.super_follows.lock().unwrap().push(authors.to_vec());
-            Some(authors.iter().map(|&id| (id, true)).collect())
-        }
-    }
-
-    struct PendingComposite;
-
-    #[async_trait]
-    impl TweetForVisibilitySource for PendingComposite {
-        async fn get_tweets_for_visibility(
-            &self,
-            _: &[u64],
-        ) -> HashMap<u64, anyhow::Result<Option<TweetForVisibility>>> {
-            std::future::pending().await
-        }
-    }
-
-    fn core_client() -> Arc<MockTESClient> {
-        Arc::new(MockTESClient {
-            core_data: HashMap::from([
-                (
-                    1,
-                    Some(PureCoreData {
-                        author_id: 10,
-                        text: "pure core text".into(),
-                        source_tweet_id: Some(999),
-                        ..Default::default()
-                    }),
-                ),
-                (
-                    2,
-                    Some(PureCoreData {
-                        author_id: 20,
-                        ..Default::default()
-                    }),
-                ),
-            ]),
-            ..Default::default()
-        })
-    }
-
-    fn exclusive_tweet() -> TweetForVisibility {
-        TweetForVisibility {
-            author_id: 900,
-            source_tweet_id: None,
-            is_nullcast: false,
-            nsfw_user: false,
-            nsfw_admin: false,
-            has_takedown: false,
-            takedown_reasons: vec![],
-            media: Default::default(),
-            is_community_tweet: false,
-            edit_control: None,
-            exclusive_conversation_author_id: Some(30),
-        }
-    }
+    use crate::clients::socialgraph_client::{EdgeQuery, Graph};
+    use crate::hydration::plan::Source;
+    use crate::hydration::sources::{Fault, InMemorySources};
+    use crate::models::LimitedEngagementReason;
+    use crate::rules::fixtures::{allow, limited};
+    use xai_core_entities::entities::PureCoreData;
 
     fn candidate(tweet_id: u64, author_id: Option<u64>) -> RawCandidate {
         RawCandidate {
@@ -310,176 +247,132 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn run_uses_only_core_and_composite_tes_calls() {
-        let tes = core_client();
-        let composite = Arc::new(MockTweetForVisibilitySource {
-            tweets: HashMap::from([(1, Some(exclusive_tweet()))]),
-            ..Default::default()
-        });
-        let sg = Arc::new(RecordingSocialgraph::default());
-        let service = FilterTweets::new(
-            HydrationPipeline::new(
-                tes.clone(),
-                composite.clone(),
-                Arc::new(MockGizmoduckClient::default()),
-                sg.clone(),
-                test_support::safety_labels(),
-                None,
-                None,
-            ),
-            RuleEngine::for_tests(),
-        );
-        let result = service
-            .run(FilterRequest {
-                viewer_id: Some(50),
-                country_code: None,
-                safety_level: SafetyLevel::TimelineHome,
-                candidates: vec![candidate(1, None), candidate(1, None)],
-            })
-            .await;
-        assert_eq!(tes.call_count(), 1);
-        assert_eq!(*composite.requests.lock().unwrap(), vec![vec![1]]);
-        assert_eq!(*sg.relationships.lock().unwrap(), vec![vec![10]]);
-        assert_eq!(*sg.super_follows.lock().unwrap(), vec![vec![30]]);
-        assert_eq!(result.outcomes.len(), 2);
-        assert!(result
-            .outcomes
-            .iter()
-            .all(|outcome| matches!(outcome.verdict.action, VfAction::Allow)));
+    fn service(sources: &Arc<InMemorySources>) -> FilterTweets {
+        FilterTweets::new(sources.clone(), RuleEngine::for_tests())
     }
 
     #[tokio::test(start_paused = true)]
-    async fn composite_timeout_preserves_pure_core_author_and_relationship_features() {
-        let tes = core_client();
-        let gizmoduck = Arc::new(MockGizmoduckClient {
-            users: HashMap::from([(
-                10,
-                Some(GizmoduckUserResult {
-                    user: Some(GizmoduckUser {
-                        safety: Safety {
-                            suspended: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-            )]),
-            ..Default::default()
-        });
-        let sg = Arc::new(RecordingSocialgraph::default());
-        let pipeline = HydrationPipeline::new(
-            tes.clone(),
-            Arc::new(PendingComposite),
-            gizmoduck,
-            sg.clone(),
-            test_support::safety_labels(),
-            None,
-            None,
-        );
-        let raw = [candidate(1, None)];
+    async fn pure_core_timeout_fails_every_candidate_at_hydration_timeout() {
+        let sources = Arc::new(InMemorySources::default().fault(Source::TesPureCore, Fault::Hangs));
         let started = tokio::time::Instant::now();
-        let hydration = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            pipeline.hydrate(HydrationRequest::new(
-                Some(50),
-                None,
-                &raw,
-                SafetyLevel::TimelineHome,
-            )),
-        );
-        tokio::pin!(hydration);
-        assert!(futures::poll!(&mut hydration).is_pending());
-        assert_eq!(*sg.relationships.lock().unwrap(), vec![vec![10]]);
-        let result = hydration.await.unwrap();
+        let response = tokio::time::timeout(
+            crate::hydration::HYDRATION_TIMEOUT * 2,
+            service(&sources).run(FilterRequest {
+                viewer_id: Some(50),
+                country_code: None,
+                client_capability: ClientCapability::default(),
+                safety_level: SafetyLevel::TimelineHome,
+                candidates: vec![candidate(1, None), candidate(2, Some(20))],
+                rpc: Rpc::FilterTweets,
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(started.elapsed(), crate::hydration::HYDRATION_TIMEOUT);
-        let tweet = &result.candidates[0];
-        assert_eq!(tweet.author_id, 10);
         assert_eq!(
-            tweet.tweet_features,
-            TweetFeatures {
-                core: CoreFeature {
-                    text: "pure core text".into(),
-                    source_tweet_id: None
-                },
-                ..Default::default()
-            }
+            response
+                .outcomes
+                .iter()
+                .map(|outcome| (outcome.verdict.clone(), outcome.status))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Verdict::unresolved_author(),
+                    EvaluationStatus::UnresolvedAuthor
+                ),
+                (allow(), EvaluationStatus::Failed),
+            ]
         );
-        assert!(tweet.author_features.is_suspended);
-        assert!(tweet.relationship.viewer_follows_author);
-        assert_eq!(tweet.exclusive_content, None);
-        assert_eq!(tes.call_count(), 1);
-        assert!(sg.super_follows.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn exclusive_content_deduplicates_tweets_and_conversation_authors() {
-        let composite = Arc::new(MockTweetForVisibilitySource {
-            tweets: [1, 2]
-                .into_iter()
-                .map(|id| (id, Some(exclusive_tweet())))
-                .collect(),
+    async fn home_hydration_limits_posts_whose_author_or_direct_reply_root_blocks_the_viewer() {
+        let reply = |author_id, in_reply_to_tweet_id, in_reply_to_user_id| PureCoreData {
+            author_id,
+            conversation_id: Some(100),
+            in_reply_to_tweet_id: Some(in_reply_to_tweet_id),
+            in_reply_to_user_id: Some(in_reply_to_user_id),
             ..Default::default()
-        });
-        for viewer_id in [Some(50), None] {
-            let sg = Arc::new(RecordingSocialgraph::default());
-            let pipeline = HydrationPipeline::new(
-                core_client(),
-                composite.clone(),
-                Arc::new(MockGizmoduckClient::default()),
-                sg.clone(),
-                test_support::safety_labels(),
-                None,
-                None,
-            );
-            let raw = [
-                candidate(1, None),
-                candidate(2, None),
-                candidate(1, None),
-                candidate(3, Some(40)),
-            ];
-            let result = pipeline
-                .hydrate(HydrationRequest::new(
+        };
+        let sources = Arc::new(
+            InMemorySources::default()
+                .pure_core(1, reply(10, 100, 30))
+                .pure_core(2, reply(20, 101, 40))
+                .tweet(3, 10)
+                .edge(Graph::Blocks, 20, 50)
+                .edge(Graph::Blocks, 30, 50),
+        );
+        let service = &service(&sources);
+        let verdicts = |viewer_id| async move {
+            service
+                .run(FilterRequest {
                     viewer_id,
-                    None,
-                    &raw,
-                    SafetyLevel::TimelineHome,
-                ))
-                .await;
-            let expected = Some(ExclusiveContentFeatures {
-                conversation_author_id: 30,
-                viewer_super_follows_author: viewer_id.is_some(),
-            });
-            assert_eq!(
-                result
-                    .candidates
-                    .iter()
-                    .map(|c| c.exclusive_content.clone())
-                    .collect::<Vec<_>>(),
-                vec![expected.clone(), expected.clone(), expected, None]
-            );
-            let expected_calls = if viewer_id.is_some() {
-                vec![vec![30]]
-            } else {
-                vec![]
-            };
-            assert_eq!(*sg.super_follows.lock().unwrap(), expected_calls);
-        }
+                    country_code: None,
+                    client_capability: ClientCapability::default(),
+                    safety_level: SafetyLevel::TimelineHomeHydration,
+                    candidates: vec![candidate(1, None), candidate(2, None), candidate(3, None)],
+                    rpc: Rpc::FilterTweets,
+                })
+                .await
+                .outcomes
+                .into_iter()
+                .map(|outcome| (outcome.status, outcome.verdict))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            verdicts(Some(50)).await,
+            vec![
+                (
+                    EvaluationStatus::Evaluated,
+                    limited(
+                        LimitedEngagementReason::RootAuthorBlockedViewer,
+                        "blocked_viewer/limited_engagement/root_author_blocked_viewer",
+                    ),
+                ),
+                (
+                    EvaluationStatus::Evaluated,
+                    limited(
+                        LimitedEngagementReason::BlockedViewer,
+                        "blocked_viewer/limited_engagement",
+                    ),
+                ),
+                (EvaluationStatus::Evaluated, allow()),
+            ]
+        );
+        assert_eq!(
+            verdicts(None).await,
+            vec![(EvaluationStatus::Evaluated, allow()); 3]
+        );
+        assert_eq!(
+            sources.selects(),
+            [vec![
+                EdgeQuery::forward(Graph::Follows, vec![10, 20]),
+                EdgeQuery::reverse(Graph::Blocks, vec![10, 20, 30]),
+            ]]
+        );
     }
-
     #[tokio::test]
     async fn run_preserves_order_duplicates_unresolved_authors_and_labels() {
-        let response = filter_tweets()
+        let labels = vf_pb::SafetyLabelMap {
+            labels: HashMap::from([(999_999, vf_pb::SafetyLabel::default())]),
+        };
+        let sources = Arc::new(
+            InMemorySources::default()
+                .labels(1, Default::default())
+                .labels(2, labels),
+        );
+        let response = service(&sources)
             .run(FilterRequest {
                 viewer_id: None,
                 country_code: None,
+                client_capability: ClientCapability::default(),
                 safety_level: SafetyLevel::TimelineHome,
                 candidates: vec![
                     candidate(2, Some(20)),
                     candidate(1, None),
                     candidate(2, Some(20)),
                 ],
+                rpc: Rpc::FilterTweets,
             })
             .await;
 
@@ -491,18 +384,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![TweetId(2), TweetId(1), TweetId(2)]
         );
-        assert!(matches!(
-            response.outcomes[0].verdict.action,
-            VfAction::Allow
-        ));
-        assert!(matches!(
-            response.outcomes[1].verdict.action,
-            VfAction::Drop(_)
-        ));
-        assert_eq!(
-            response.outcomes[1].verdict.decided_by,
-            Some("unresolved_author_id")
-        );
+        assert_eq!(response.outcomes[0].verdict, allow());
+        assert_eq!(response.outcomes[1].verdict, Verdict::unresolved_author());
         assert_eq!(
             response
                 .outcomes
@@ -510,15 +393,12 @@ mod tests {
                 .map(|outcome| outcome.status)
                 .collect::<Vec<_>>(),
             vec![
-                EvaluationStatus::Failed,
+                EvaluationStatus::Evaluated,
                 EvaluationStatus::UnresolvedAuthor,
-                EvaluationStatus::Failed
+                EvaluationStatus::Evaluated
             ]
         );
-        assert!(matches!(
-            response.outcomes[2].verdict.action,
-            VfAction::Allow
-        ));
+        assert_eq!(response.outcomes[2].verdict, allow());
         assert!(response
             .outcomes
             .iter()
@@ -532,50 +412,6 @@ mod tests {
         assert_eq!(
             response.outcomes[0].safety_labels,
             response.outcomes[2].safety_labels
-        );
-    }
-
-    #[tokio::test]
-    async fn run_labels_both_occurrences_of_a_cold_id() {
-        let response = filter_tweets()
-            .run(FilterRequest {
-                viewer_id: None,
-                country_code: None,
-                safety_level: SafetyLevel::TimelineHome,
-                candidates: vec![candidate(3, Some(30)), candidate(3, Some(30))],
-            })
-            .await;
-
-        let labels = response
-            .outcomes
-            .iter()
-            .map(|outcome| outcome.safety_labels.as_ref().unwrap())
-            .collect::<Vec<_>>();
-        assert!(!labels[0].labels.is_empty());
-        assert_eq!(labels[0], labels[1]);
-    }
-
-    #[tokio::test]
-    async fn run_selects_policy_from_safety_level() {
-        let service = filter_tweets();
-        let request = |safety_level| FilterRequest {
-            viewer_id: None,
-            country_code: None,
-            safety_level,
-            candidates: vec![candidate(1, Some(10))],
-        };
-
-        let home = service.run(request(SafetyLevel::TimelineHome)).await;
-        let filter_all = service.run(request(SafetyLevel::FilterAll)).await;
-
-        assert!(matches!(home.outcomes[0].verdict.action, VfAction::Allow));
-        assert!(matches!(
-            filter_all.outcomes[0].verdict.action,
-            VfAction::Drop(_)
-        ));
-        assert_eq!(
-            filter_all.outcomes[0].verdict.decided_by,
-            Some("FilterAllRule")
         );
     }
 }

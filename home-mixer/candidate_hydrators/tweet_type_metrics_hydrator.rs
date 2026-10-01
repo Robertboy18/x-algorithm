@@ -1,12 +1,11 @@
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
-use crate::util::composition::Composition;
 use crate::util::tweet_type_metrics::*;
 use crate::util::viewer_history;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use tonic::async_trait;
-use xai_candidate_pipeline::component_library::utils::duration_since_creation_opt;
+use xai_candidate_pipeline::component_library::utils::{Composition, duration_since_creation_opt};
 use xai_candidate_pipeline::hydrator::Hydrator;
 
 const THIRTY_MINUTES_MS: u64 = 30 * 60 * 1000;

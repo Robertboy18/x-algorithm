@@ -1079,6 +1079,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
             sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
             compute_post_unexplored_label=self.compute_post_unexplored_label,
             zero_stale_post_14d_candidate_counts=self.enable_stale_post,
+            ads_head_masking=self.ads_head_masking,
         )
 
         elapsed = time.time() - t

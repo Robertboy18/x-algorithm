@@ -770,7 +770,7 @@ def pad_batch(batch_unpadded: RecsysFeaturesBatch, batch_size: int) -> RecsysFea
         padded = _pad_post_seq_fields(post_seq)
         if (_tcm := post_seq.get("trained_candidate_mask")) is not None:
             padded["trained_candidate_mask"] = np.pad(
-                _tcm, ((0, batch_size - num_rows), (0, 0)), constant_values=True
+                _tcm, ((0, batch_size - num_rows), (0, 0), (0, 0)), constant_values=True
             )
         if (value_valid := post_seq.get("value_label_valid")) is not None:
             padded["value_label_valid"] = pad_array(value_valid)
@@ -884,6 +884,8 @@ class PhoenixDataset(Dataset):
 
     compute_post_unexplored_label: bool = False
     enable_stale_post: bool = False
+
+    ads_head_masking: bool = False
 
     multimodal_embedding_type: EmbeddingType | None = None
 
@@ -1170,6 +1172,7 @@ class PhoenixDataset(Dataset):
                         sid_num_levels=self.sid_num_levels if self.use_post_sid else 0,
                         compute_post_unexplored_label=self.compute_post_unexplored_label,
                         zero_stale_post_14d_candidate_counts=self.enable_stale_post,
+                        ads_head_masking=self.ads_head_masking,
                     )
 
                     if self.use_conversion_labels and self.emit_conversion_label_keys:
@@ -1365,7 +1368,9 @@ class PhoenixDataset(Dataset):
                 ),
                 product_surface=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
                 client_app_id=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
-                trained_candidate_mask=np.ones((batch_size, candidate_seq_len), dtype=np.bool_),
+                trained_candidate_mask=np.ones(
+                    (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
+                ),
                 value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
                 value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
                 post_ids=np.zeros((batch_size, candidate_seq_len), dtype=np.int64)
@@ -1498,7 +1503,9 @@ class PhoenixToyDataset(PhoenixDataset):
                 auth_hashes=self.hash_table.get_author_hash(candidate_author_ids),
                 product_surface=candidate_product_surface,
                 client_app_id=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
-                trained_candidate_mask=np.ones((batch_size, candidate_seq_len), dtype=np.bool_),
+                trained_candidate_mask=np.ones(
+                    (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
+                ),
                 value_label_valid=np.zeros((batch_size, candidate_seq_len), dtype=np.bool_),
                 value_baseline_mean_usd=np.zeros((batch_size, candidate_seq_len), dtype=np.float32),
                 post_ids=candidate_tweet_ids.astype(np.int64)

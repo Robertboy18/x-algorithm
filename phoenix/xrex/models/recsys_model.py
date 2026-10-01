@@ -19,12 +19,19 @@ from numpy import typing as npt
 from xai_configlib import Config as Config
 from xai_configlib import configclass as configclass
 from xai_proto import recsys_pb2
+from xrex.data.recsys.ads_head_masking import (
+    ADS_FAMILY_SLICE_HEADS,
+    FRESH_STREAM_ID,
+)
+from xrex.data.recsys.ads_late_window import ADS_LATE_WINDOW_TWIN_HEAD_INDICES
 from xrex.data.recsys.constants import (
     CLICK_ACTION_INDEX,
     MACT_IN_APP_LOSS_ACTION_INDICES,
+    MMP_CLICK_ACTION_INDEX,
     NEGATIVE_FEEDBACK_HEAD_INDICES,
     PURCHASE_VALUE_ACTION_INDEX,
     SEARCH_RELEVANCE_ACTION_INDICES,
+    LineItemObjective,
     action_type_map,
     engagement_to_ids,
 )
@@ -33,17 +40,12 @@ from xrex.data.recsys.feature_config import (
     ENGAGEMENT_COUNT_BUCKET_MAP,
     BoolFeature,
     CategoricalFeature,
+    FloatFeature,
     Int64Feature,
 )
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG, EmbeddingType, RecsysFeaturesBatch
 from xrex.data.recsys.safety_filter import apply_safety_filter, safety_filter_stats
 from xrex.data.recsys.sequence_packing import SequencePackedLayout
-from xrex.models.ads_head_masking import (
-    EARLY_RELABEL_STREAM_ID,
-    FRESH_STREAM_ID,
-    ads_head_masking_factor,
-    ads_late_window_no_early_slice,
-)
 from xrex.models.layers import Linear, get_parameter
 from xrex.models.loss_recsys import (
     binary_threshold_loss_compute,
@@ -168,6 +170,16 @@ def compute_engagement_count_bucket(
     bucket = jnp.clip(bucket, 0, max_bucket)
     bucket = jnp.where(raw_counts <= 0, 0, bucket)
     return bucket
+
+
+MATCHED_WORD_FRACTION_NUM_BUCKETS = 6
+
+
+def compute_matched_word_fraction_bucket(fraction: jax.Array, is_set: jax.Array) -> jax.Array:
+    f = fraction.astype(jnp.float32)
+    bucket = jnp.where(f <= 0.0, 1, jnp.where(f < 0.5, 2, jnp.where(f == 0.5, 3, 4)))
+    bucket = jnp.where(f >= 1.0, MATCHED_WORD_FRACTION_NUM_BUCKETS - 1, bucket)
+    return jnp.where(is_set, bucket, 0)
 
 
 def right_anchored_rope_positions(
@@ -330,6 +342,8 @@ class ContextFeaturesConfig(Config):
     enable_author_nsfw: bool = False
 
     enable_day_of_week: bool = True
+
+    enable_search_lexical_match: bool = False
 
 
 def metric_num_tokens(y: jnp.ndarray, valid_mask: jnp.ndarray) -> jnp.ndarray:
@@ -541,6 +555,7 @@ class RecsysAggregatedModelConfig(Config):
     emb_table_width: int
 
     continuous_metrics_mae_mean: bool = False
+    per_layer_l2_weight: float = 0.0
     act_l2_weight: float = 0.0
 
     num_continuous_actions: int = 8
@@ -592,6 +607,13 @@ class RecsysAggregatedModelConfig(Config):
         ):
             raise ValueError("purchase_value_smoothing_windows must be positive sample counts")
 
+    def validate_ads_head_masking(self) -> None:
+        if self.ads_head_masking and self.use_seqpack:
+            raise ValueError(
+                "ads_head_masking is not supported with use_seqpack: the per-candidate, "
+                "per-head trained_candidate_mask has no packed-layout equivalent"
+            )
+
     continuous_action_hidden_dim: int = 64
 
     final_logit_cap: float = -1.0
@@ -605,6 +627,8 @@ class RecsysAggregatedModelConfig(Config):
     candidate_seq_len: int = 128
 
     right_anchored_rope: bool = False
+
+    attend_padded_history: bool = False
 
     use_seqpack: bool = False
 
@@ -688,6 +712,7 @@ class RecsysAggregatedModelConfig(Config):
 
     def make(self, sharding_context: ShardingContext) -> RecsysAggregatedModel:
         self.validate_purchase_value()
+        self.validate_ads_head_masking()
 
         if self.feature_prep_enabled:
             fp = self.feature_prep
@@ -714,11 +739,6 @@ class RecsysAggregatedModelConfig(Config):
                 )
 
         if self.sid_embedding_mode == "recon":
-            assert not self.feature_prep_enabled, (
-                "sid_embedding_mode='recon' is only implemented on the legacy build_inputs "
-                "path; the feature_prep path embeds SIDs via its own learned tables "
-                "(FeaturePrepConfig.enable_post_sid) and would silently ignore recon."
-            )
             assert not self.sid_hash_level and not self.sid_cross_attn, (
                 "sid_embedding_mode='recon' replaces the learned SID tables outright; "
                 "sid_hash_level / sid_cross_attn only apply to mode='learned'."
@@ -1377,6 +1397,20 @@ def cast_jax(arr: npt.NDArray) -> jax.Array:
     return typing.cast(jax.Array, arr)
 
 
+def attention_segment_ids(
+    padding_mask: jax.Array, candidate_start_offset: int, attend_padded_history: bool
+) -> jax.Array:
+    idx = jnp.arange(padding_mask.shape[1], dtype=jnp.int32)[None, :]
+    is_candidate = idx >= candidate_start_offset
+    valid = padding_mask
+    if attend_padded_history:
+        valid = jnp.logical_or(padding_mask, jnp.logical_not(is_candidate))
+    return jnp.broadcast_to(
+        jnp.where(valid, jnp.where(is_candidate, -1, 1), 0),
+        padding_mask.shape,
+    ).astype(jnp.int32)
+
+
 def build_metric_masks(
     mask: jax.Array,
     raw_targets: jax.Array,
@@ -1389,6 +1423,7 @@ def build_metric_masks(
     no_history_mask: jax.Array | None = None,
     dpa_product_key: jax.Array | None = None,
     sample_source: jax.Array | None = None,
+    trained_candidate_mask: jax.Array | None = None,
     *,
     ads_head_masking: bool = False,
     condition_search_relevance_on_prompt: bool = False,
@@ -1458,7 +1493,7 @@ def build_metric_masks(
         product_surface == recsys_pb2.ProductSurface.PRODUCT_SURFACE_HOME_TIMELINE_RANKING
     )
     website_clicks_objective = (
-        (line_item_objective == 5).astype(mask.dtype)
+        (line_item_objective == LineItemObjective.WEBSITE_CLICKS).astype(mask.dtype)
         if line_item_objective is not None
         else jnp.zeros_like(mask)
     )
@@ -1478,21 +1513,23 @@ def build_metric_masks(
     masks["non_negative_dpa"] = non_negative_mask * dpa_mask
 
     if ads_head_masking:
-        click_mask = raw_targets[:, :, CLICK_ACTION_INDEX].astype(mask.dtype)
-        masks["clicked"] = mask * click_mask
-        masks["non_negative_clicked"] = mask * (1 - negative_sample_mask) * click_mask
+        web_click_mask = raw_targets[:, :, CLICK_ACTION_INDEX].astype(mask.dtype)
+        app_click_mask = raw_targets[:, :, MMP_CLICK_ACTION_INDEX].astype(mask.dtype)
+        masks["website_clicked"] = mask * web_click_mask
+        masks["non_negative_website_clicked"] = non_negative_mask * web_click_mask
+        masks["app_clicked"] = mask * app_click_mask
+        masks["non_negative_app_clicked"] = non_negative_mask * app_click_mask
+        assert trained_candidate_mask is not None, "ads_head_masking needs trained_candidate_mask"
         if sample_source is None:
             fresh = jnp.ones_like(mask)
-            early = jnp.zeros_like(mask)
         else:
             fresh = (sample_source == FRESH_STREAM_ID).astype(mask.dtype)
-            early = (sample_source == EARLY_RELABEL_STREAM_ID).astype(mask.dtype)
-        click_mask = raw_targets[:, :, CLICK_ACTION_INDEX].astype(mask.dtype)
         masks["fresh"] = mask * fresh
-        masks["delayed_clicked"] = mask * early * click_mask
-        masks["delayed_non_clicked"] = mask * early * (1 - click_mask)
-        masks["late_split_no_early"] = ads_late_window_no_early_slice(
-            mask, raw_targets, click_mask, sample_source
+        trained = trained_candidate_mask.astype(mask.dtype)
+        for slice_name, head in ADS_FAMILY_SLICE_HEADS.items():
+            masks[slice_name] = mask * trained[:, :, head]
+        masks["late_split_no_early"] = mask * jnp.prod(
+            trained[:, :, jnp.array(ADS_LATE_WINDOW_TWIN_HEAD_INDICES)], axis=-1
         )
         masks["fresh_home_website_clicks"] = (
             masks["fresh"] * home_timeline_mask * website_clicks_objective
@@ -1709,6 +1746,7 @@ class RecsysAggregatedModel(hk.Module):
         no_history_mask: jax.Array | None = None,
         dpa_product_key: jax.Array | None = None,
         sample_source: jax.Array | None = None,
+        trained_candidate_mask: jax.Array | None = None,
     ) -> dict[str, jax.Array]:
         return build_metric_masks(
             mask,
@@ -1722,6 +1760,7 @@ class RecsysAggregatedModel(hk.Module):
             no_history_mask,
             dpa_product_key,
             sample_source,
+            trained_candidate_mask,
             ads_head_masking=self.config.ads_head_masking,
             condition_search_relevance_on_prompt=self.config.condition_search_relevance_on_prompt,
             enable_platform_metrics=self.config.enable_platform_metrics,
@@ -1742,6 +1781,7 @@ class RecsysAggregatedModel(hk.Module):
         no_history_mask: jax.Array | None = None,
         dpa_product_key: jax.Array | None = None,
         sample_source: jax.Array | None = None,
+        trained_candidate_mask: jax.Array | None = None,
         stats: dict | None = None,
         rce_ema: dict[str, jax.Array] | None = None,
         rce_alpha: jax.Array | None = None,
@@ -1764,6 +1804,7 @@ class RecsysAggregatedModel(hk.Module):
             no_history_mask,
             dpa_product_key,
             sample_source,
+            trained_candidate_mask,
         )
 
         return self._compute_metrics_after_masks(
@@ -1944,6 +1985,46 @@ class RecsysAggregatedModel(hk.Module):
 
         return stats
 
+    def compute_search_lexical_match_metrics(
+        self,
+        batch: RecsysFeaturesBatch,
+        stats: dict | None = None,
+    ) -> dict:
+        if stats is None:
+            stats = {}
+        if not self.config.context_features.enable_search_lexical_match:
+            return stats
+
+        seq = batch["candidate_seq"]
+        cat = seq.get("categorical_features")
+        floats = seq.get("float_features")
+        hashes = seq.get("post_hashes")
+        exact_idx = CategoricalFeature.exactPhraseSeq.value
+        frac_idx = FloatFeature.matchedWordFractionSeq.value
+        if cat is None or floats is None or hashes is None:
+            return stats
+        if exact_idx >= cat.shape[-1] or frac_idx >= floats.shape[-1]:
+            return stats
+
+        exact_phrase = cast_jax(cat)[:, :, exact_idx]
+        fraction = cast_jax(floats)[:, :, frac_idx].astype(jnp.float32)
+        non_pad = (cast_jax(hashes)[..., 0] != 0).astype(jnp.float32)
+        is_set = (exact_phrase != 0).astype(jnp.float32) * non_pad
+        total = jnp.sum(non_pad)
+        n_set = jnp.sum(is_set)
+        stats["search_lexical_match/frac_set_candidate"] = jnp.where(total > 0, n_set / total, 0.0)
+        stats["search_lexical_match/frac_exact_phrase_candidate"] = jnp.where(
+            n_set > 0, jnp.sum((exact_phrase == 2).astype(jnp.float32) * is_set) / n_set, 0.0
+        )
+        stats["search_lexical_match/mean_matched_word_fraction_candidate"] = jnp.where(
+            n_set > 0, jnp.sum(fraction * is_set) / n_set, 0.0
+        )
+        buckets = compute_matched_word_fraction_bucket(fraction, exact_phrase != 0)
+        stats["search_lexical_match/mean_bucket_candidate"] = jnp.where(
+            n_set > 0, jnp.sum(buckets.astype(jnp.float32) * is_set) / n_set, 0.0
+        )
+        return stats
+
     def compute_author_nsfw_metrics(
         self,
         batch: RecsysFeaturesBatch,
@@ -2094,6 +2175,9 @@ class RecsysAggregatedModel(hk.Module):
             if cat_feat.feature_name == "local_day_of_week":
                 if not ctx_config.enable_day_of_week:
                     continue
+            if cat_feat.feature_name in ("exact_phrase", "matched_word_fraction_bucket"):
+                if not (ctx_config.enable_search_lexical_match and is_candidate):
+                    continue
             if cat_feat.embedding_dim <= 0 or cat_feat.index >= cat_features.shape[-1]:
                 continue
             feat_values = cat_features[:, :, cat_feat.index]
@@ -2116,6 +2200,25 @@ class RecsysAggregatedModel(hk.Module):
             result = result[:, 0, :]
 
         return result
+
+    @staticmethod
+    def set_matched_word_fraction_bucket(
+        cat_features: jax.Array, float_features: jax.Array | None
+    ) -> jax.Array:
+        bucket_idx = CategoricalFeature.matchedWordFractionBucketSeq.value
+        exact_idx = CategoricalFeature.exactPhraseSeq.value
+        frac_idx = FloatFeature.matchedWordFractionSeq.value
+        if (
+            float_features is None
+            or bucket_idx >= cat_features.shape[-1]
+            or exact_idx >= cat_features.shape[-1]
+            or frac_idx >= float_features.shape[-1]
+        ):
+            return cat_features
+        buckets = compute_matched_word_fraction_bucket(
+            float_features[:, :, frac_idx], cat_features[:, :, exact_idx] != 0
+        )
+        return cat_features.at[:, :, bucket_idx].set(buckets.astype(cat_features.dtype))
 
     @hk.transparent
     def build_unified_context_embedding(
@@ -2588,6 +2691,13 @@ class RecsysAggregatedModel(hk.Module):
             name="unified_ctx_history",
         )
 
+        if ctx_config.enable_search_lexical_match and candidate_cat_features is not None:
+            raw_cand_float = recsys_features_batch["candidate_seq"].get("float_features")
+            candidate_cat_features = self.set_matched_word_fraction_bucket(
+                candidate_cat_features,
+                None if raw_cand_float is None else cast_jax(raw_cand_float),
+            )
+
         candidate_unified_context = self.build_unified_context_embedding(
             product_surface=cast_jax(recsys_features_batch["candidate_seq"]["product_surface"]),
             dwell_time_values=None,
@@ -3055,6 +3165,7 @@ class RecsysAggregatedModel(hk.Module):
                 raw_weights = jnp.broadcast_to(sample_weights, targets.shape[:2])
 
         source_id: jax.Array | None = None
+        trained_heads: jax.Array | None = None
         sample_source = batch.get("sample_source")
         if sample_source is not None:
             source_id = cast_jax(sample_source).astype(jnp.float32)
@@ -3167,11 +3278,9 @@ class RecsysAggregatedModel(hk.Module):
                 dpa_product_key,
             )
 
-            idx = jnp.arange(padding_mask.shape[1], dtype=jnp.int32)[None, :]
-            segment_ids = jnp.broadcast_to(
-                jnp.where(padding_mask, jnp.where(idx >= candidate_start_offset, -1, 1), 0),
-                padding_mask.shape,
-            ).astype(jnp.int32)
+            segment_ids = attention_segment_ids(
+                padding_mask, candidate_start_offset, self.config.attend_padded_history
+            )
 
             if self.config.right_anchored_rope:
                 positions = right_anchored_rope_positions(
@@ -3214,7 +3323,8 @@ class RecsysAggregatedModel(hk.Module):
             if trained_candidate_mask is not None:
                 keep = cast_jax(trained_candidate_mask)
                 pad_len = target_padding_mask.shape[1] - keep.shape[1]
-                target_padding_mask = target_padding_mask & jnp.pad(keep, ((0, 0), (0, pad_len)))
+                trained_heads = jnp.pad(keep, ((0, 0), (0, pad_len), (0, 0)), constant_values=True)
+                target_padding_mask = target_padding_mask & trained_heads.any(-1)
 
             history_padding = padding_mask[
                 :,
@@ -3272,9 +3382,8 @@ class RecsysAggregatedModel(hk.Module):
             zero_mask = negative_sample_mask[:, :, None] * neg_head_mask
             loss_mask = loss_mask * (1 - zero_mask)
 
-        if self.config.ads_head_masking:
-            assert source_id is not None
-            loss_mask = loss_mask * ads_head_masking_factor(targets, source_id, num_actions)
+        if trained_heads is not None:
+            loss_mask = loss_mask * trained_heads.astype(loss_mask.dtype)
 
         if self.config.mact_in_app_loss_weight != 1.0:
             mact_w = (
@@ -3342,6 +3451,7 @@ class RecsysAggregatedModel(hk.Module):
             no_history_mask=no_history_mask,
             dpa_product_key=dpa_product_key[..., 0] if dpa_product_key is not None else None,
             sample_source=source_id,
+            trained_candidate_mask=trained_heads,
             stats=stats,
             rce_ema=rce_ema,
             rce_alpha=rce_alpha,
@@ -3353,6 +3463,7 @@ class RecsysAggregatedModel(hk.Module):
         stats = self.compute_sid_metrics(batch=batch, stats=stats)
         stats = self.compute_engagement_count_metrics(batch=batch, stats=stats)
         stats = self.compute_author_nsfw_metrics(batch=batch, stats=stats)
+        stats = self.compute_search_lexical_match_metrics(batch=batch, stats=stats)
 
         if self.config.use_seqpack and batch.get("packing_layout") is not None:
             stats = self.compute_length_bucketed_metrics(
@@ -3378,6 +3489,7 @@ class RecsysAggregatedModel(hk.Module):
                 no_history_mask=no_history_mask,
                 dpa_product_key=dpa_product_key[..., 0] if dpa_product_key is not None else None,
                 sample_source=source_id,
+                trained_candidate_mask=trained_heads,
             )
 
             continuous_base_mask = target_padding_mask
@@ -3518,10 +3630,9 @@ class RecsysAggregatedModel(hk.Module):
                 pad_len = target_padding_mask.shape[1] - value.shape[1]
                 return jnp.pad(value, ((0, 0), (0, pad_len)))
 
-            keeper = batch["candidate_seq"].get("trained_candidate_mask")
             keeper_mask = (
-                value_operand("trained_candidate_mask", jnp.bool_)
-                if keeper is not None
+                trained_heads.any(-1)
+                if trained_heads is not None
                 else jnp.ones_like(target_padding_mask, dtype=jnp.bool_)
             )
             value_mask = purchase_value_valid_mask(
@@ -3552,9 +3663,11 @@ class RecsysAggregatedModel(hk.Module):
             continuous_action_loss_total += self.config.purchase_value_loss_weight * value_loss
             value_sums = value_stats.pop("_purchase-value-sums")
             stats.update(value_stats)
-            slice_count = stats.get("delayed_clicked_num_tokens", jnp.zeros((), jnp.float32))
-            stats["purchase-value_delayed_clicked-ratio-valid"] = value_stats[
-                "purchase-value_delayed_clicked-valid-count"
+            slice_count = stats.get(
+                "delayed_website_clicked_num_tokens", jnp.zeros((), jnp.float32)
+            )
+            stats["purchase-value_delayed_website_clicked-ratio-valid"] = value_stats[
+                "purchase-value_delayed_website_clicked-valid-count"
             ] / jnp.maximum(slice_count, 1)
             if rce_ema is not None and rce_alpha is not None and smoothing_windows is not None:
                 smoothed_stats, value_ema = purchase_value_smoothed_stats(
@@ -3631,7 +3744,10 @@ class RecsysAggregatedModel(hk.Module):
                 )
 
         regularization_loss = (
-            loss + self.config.act_l2_weight * stats["act-l2-loss"] + continuous_action_loss_total
+            loss
+            + self.config.act_l2_weight * stats["act-l2-loss"]
+            + self.config.per_layer_l2_weight * (stats["ffn-loss"] + stats["attn-loss"])
+            + continuous_action_loss_total
         )
         return (
             regularization_loss,
@@ -3694,11 +3810,9 @@ class RecsysAggregatedModel(hk.Module):
                 None,
                 None,
             )
-            idx = jnp.arange(padding_mask.shape[1], dtype=jnp.int32)[None, :]
-            segment_ids = jnp.broadcast_to(
-                jnp.where(padding_mask, jnp.where(idx >= candidate_start_offset, -1, 1), 0),
-                padding_mask.shape,
-            ).astype(jnp.int32)
+            segment_ids = attention_segment_ids(
+                padding_mask, candidate_start_offset, self.config.attend_padded_history
+            )
 
             if self.config.right_anchored_rope:
                 positions = right_anchored_rope_positions(

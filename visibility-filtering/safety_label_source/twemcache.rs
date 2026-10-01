@@ -236,36 +236,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_cache_miss_returns_miss() {
-        let results = get_with_cache(FakeTwemcache::empty()).await;
+    async fn cache_transport_results_select_lookup_outcome() {
+        let cases: Vec<(Arc<dyn CacheRead>, TwemcacheOutcome)> = vec![
+            (FakeTwemcache::empty(), TwemcacheOutcome::Miss),
+            (
+                FakeTwemcache::with_per_key_error(KVCacheError::Io("conn refused".into())),
+                TwemcacheOutcome::FallThrough(FallbackReason::Other),
+            ),
+            (
+                FakeTwemcache::with_per_key_error(KVCacheError::Timeout("get".into())),
+                TwemcacheOutcome::FallThrough(FallbackReason::Timeout),
+            ),
+            (
+                FakeTwemcache::with_per_key_error(KVCacheError::Backpressure),
+                TwemcacheOutcome::FallThrough(FallbackReason::Backpressure),
+            ),
+            (
+                FakeTwemcache::with_missing_response(),
+                TwemcacheOutcome::FallThrough(FallbackReason::MissingResponse),
+            ),
+        ];
 
-        assert!(matches!(results.get(&42), Some(TwemcacheOutcome::Miss)));
-    }
-
-    #[tokio::test]
-    async fn get_per_key_error_returns_other_fallback() {
-        let results = get_with_cache(FakeTwemcache::with_per_key_error(KVCacheError::Io(
-            "conn refused".into(),
-        )))
-        .await;
-
-        assert!(matches!(
-            results.get(&42),
-            Some(TwemcacheOutcome::FallThrough(FallbackReason::Other))
-        ));
-    }
-
-    #[tokio::test]
-    async fn get_per_key_timeout_returns_timeout_fallback() {
-        let results = get_with_cache(FakeTwemcache::with_per_key_error(KVCacheError::Timeout(
-            "get".into(),
-        )))
-        .await;
-
-        assert!(matches!(
-            results.get(&42),
-            Some(TwemcacheOutcome::FallThrough(FallbackReason::Timeout))
-        ));
+        for (cache, expected) in cases {
+            let results = get_with_cache(cache).await;
+            assert_eq!(results.get(&42), Some(&expected));
+        }
     }
 
     #[tokio::test]
@@ -275,18 +270,6 @@ mod tests {
         assert!(matches!(
             results.get(&42),
             Some(TwemcacheOutcome::FallThrough(FallbackReason::Decode))
-        ));
-    }
-
-    #[tokio::test]
-    async fn get_missing_response_returns_fallback() {
-        let results = get_with_cache(FakeTwemcache::with_missing_response()).await;
-
-        assert!(matches!(
-            results.get(&42),
-            Some(TwemcacheOutcome::FallThrough(
-                FallbackReason::MissingResponse
-            ))
         ));
     }
 }

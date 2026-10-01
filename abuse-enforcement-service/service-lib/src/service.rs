@@ -110,6 +110,8 @@ pub struct AppState {
     pub growthbook_environment: String,
         pub kafka_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
                 pub kafka_producers: crate::KafkaProducers,
+                pub hold_gate: std::sync::Arc<crate::overturn_hold::HoldGate>,
+                pub boot_config: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -1412,11 +1414,11 @@ pub async fn handle_rules_get(State(state): State<Arc<AppState>>) -> impl IntoRe
     let cache = &state.rules_cache;
     let user = cache.status(
         EntityType::User,
-        dc.enforcement_rules_yaml(EntityType::User).as_deref(),
+        dc.enforcement_rules_yaml(EntityType::User).as_ref(),
     );
     let post = cache.status(
         EntityType::Post,
-        dc.enforcement_rules_yaml(EntityType::Post).as_deref(),
+        dc.enforcement_rules_yaml(EntityType::Post).as_ref(),
     );
     (StatusCode::OK, Json(json!({ "user": user, "post": post })))
 }

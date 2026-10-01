@@ -1,0 +1,547 @@
+use crate::models::{MediaFeature, NsfwFeature, TweetFeatures};
+use anyhow::{anyhow, Result};
+use std::collections::HashMap;
+use std::sync::Arc;
+use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
+use xai_core_entities::entities::{
+    EditControl, ExclusiveTweetControl, MediaEntities, MediaEntity, Share, TakedownReason,
+};
+use xai_strato::strato_thrift::{strato_decode, StratoResult};
+use xai_strato::{encode, MValCodec, StratoGrpc};
+
+const COLUMN: &str = "tweetypie/federated/tweetForVisibility.Tweet";
+const OPERATION: &str = "fetch";
+
+pub(crate) struct TweetSource {
+    pub(crate) grpc_client: Arc<StratoGrpc>,
+}
+
+impl TweetSource {
+    pub(crate) async fn get_tweets(
+        &self,
+        tweet_ids: &[u64],
+    ) -> HashMap<u64, Result<Option<TweetFeatures>>> {
+        let calls = tweet_ids
+            .iter()
+            .map(|tweet_id| {
+                (
+                    COLUMN.to_string(),
+                    OPERATION.to_string(),
+                    vec![encode(&(*tweet_id, ()))],
+                )
+            })
+            .collect();
+
+        let result_batch = self.grpc_client.batch_call(calls, None).await;
+        tweet_ids
+            .iter()
+            .zip(result_batch)
+            .map(|(tweet_id, bytes_result)| {
+                let item = bytes_result.and_then(|bytes| decode_tweet(&bytes));
+                (*tweet_id, item)
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn decode_tweet(bytes: &[u8]) -> Result<Option<TweetFeatures>> {
+    match std::panic::catch_unwind(|| strato_decode::<Tweet>(bytes))
+        .map_err(|_| anyhow!("MVal decoder panicked"))?
+    {
+        Ok(StratoResult::Ok { value, .. }) => Ok(value.and_then(Tweet::project)),
+        Ok(StratoResult::Err { code, message }) => {
+            Err(anyhow!("Strato error code {code}: {message}"))
+        }
+        Err(e) => Err(anyhow!("MVal decode error: {e}")),
+    }
+}
+
+#[derive(Default)]
+struct Tweet {
+    core_data: Option<CoreData>,
+    media: Vec<MediaEntity>,
+    takedown_reasons: Vec<TakedownReason>,
+    has_communities: bool,
+    exclusive_tweet_control: Option<ExclusiveTweetControl>,
+    edit_control: Option<EditControl>,
+    has_media_refs: bool,
+    has_media_keys: bool,
+    has_card_reference: bool,
+}
+
+#[derive(Default)]
+struct CoreData {
+    share: Option<Share>,
+    nsfw_user: bool,
+    nsfw_admin: bool,
+    nullcast: bool,
+}
+
+impl Tweet {
+    fn project(self) -> Option<TweetFeatures> {
+        let core_data = self.core_data?;
+        Some(TweetFeatures {
+            source_tweet_id: core_data.share.map(|share| share.source_tweet_id),
+            is_nullcast: core_data.nullcast,
+            nsfw: NsfwFeature {
+                user: core_data.nsfw_user,
+                admin: core_data.nsfw_admin,
+            },
+            takedown_reasons: self.takedown_reasons,
+            media: MediaFeature {
+                has_media: self.has_media_refs || self.has_card_reference,
+                has_uploaded_media: self.has_media_keys,
+                ..media_feature(self.media)
+            },
+            is_community_tweet: self.has_communities,
+            edit_control: self.edit_control,
+            exclusive_conversation_author_id: self
+                .exclusive_tweet_control
+                .map(|control| control.conversation_author_id),
+        })
+    }
+}
+
+fn media_feature(entities: MediaEntities) -> MediaFeature {
+    let mut feature = MediaFeature {
+        has_media: !entities.is_empty(),
+        ..Default::default()
+    };
+
+    for restrictions in entities
+        .iter()
+        .filter(|e| e.media_key.is_some())
+        .filter_map(|e| e.additional_metadata.as_ref())
+        .filter_map(|metadata| metadata.restrictions.as_ref())
+    {
+        feature.has_dmca_media |= restrictions.is_dmca == Some(true);
+        if let Some(geo) = &restrictions.geo_restrictions {
+            feature
+                .geo_allow_list
+                .extend(geo.whitelisted_country_codes.iter().flatten().cloned());
+            feature
+                .geo_deny_list
+                .extend(geo.blacklisted_country_codes.iter().flatten().cloned());
+        }
+    }
+
+    feature
+}
+
+impl TSerializable for Tweet {
+    fn read_from_in_protocol(proto: &mut dyn TInputProtocol) -> thrift::Result<Self> {
+        proto.read_struct_begin()?;
+        let mut tweet = Tweet::default();
+        loop {
+            let field = proto.read_field_begin()?;
+            if field.field_type == TType::Stop {
+                break;
+            }
+            match field.id {
+                Some(2) => tweet.core_data = Some(read_core_data(proto)?),
+                Some(7) => {
+                    let list = proto.read_list_begin()?;
+                    let mut media = Vec::with_capacity(usize::try_from(list.size).unwrap_or(0));
+                    for _ in 0..list.size {
+                        media.push(MediaEntity::read_from_in_protocol(proto)?);
+                    }
+                    proto.read_list_end()?;
+                    tweet.media = media;
+                }
+                Some(30) => tweet.takedown_reasons = Vec::<TakedownReason>::from_thrift(proto),
+                Some(118) => {
+                    proto.skip(field.field_type)?;
+                    tweet.has_card_reference = true;
+                }
+                Some(125) => tweet.has_communities = read_communities_non_empty(proto)?,
+                Some(155) => {
+                    tweet.exclusive_tweet_control = Some(ExclusiveTweetControl::from_thrift(proto));
+                }
+                Some(157) => tweet.edit_control = Some(EditControl::from_thrift(proto)),
+                Some(162) => tweet.has_media_refs = skip_list_non_empty(proto)?,
+                Some(32766) => tweet.has_media_keys = skip_list_non_empty(proto)?,
+                _ => proto.skip(field.field_type)?,
+            }
+            proto.read_field_end()?;
+        }
+        proto.read_struct_end()?;
+        Ok(tweet)
+    }
+
+    fn write_to_out_protocol(&self, _proto: &mut dyn TOutputProtocol) -> thrift::Result<()> {
+        Err(thrift::new_protocol_error(
+            thrift::ProtocolErrorKind::NotImplemented,
+            "Tweet is decode-only",
+        ))
+    }
+}
+
+fn read_core_data(proto: &mut dyn TInputProtocol) -> thrift::Result<CoreData> {
+    proto.read_struct_begin()?;
+    let mut core_data = CoreData::default();
+    loop {
+        let field = proto.read_field_begin()?;
+        if field.field_type == TType::Stop {
+            break;
+        }
+        match field.id {
+            Some(7) => core_data.share = Some(Share::from_thrift(proto)),
+            Some(9) => core_data.nsfw_user = proto.read_bool()?,
+            Some(10) => core_data.nsfw_admin = proto.read_bool()?,
+            Some(11) => core_data.nullcast = proto.read_bool()?,
+            _ => proto.skip(field.field_type)?,
+        }
+        proto.read_field_end()?;
+    }
+    proto.read_struct_end()?;
+    Ok(core_data)
+}
+
+fn skip_list_non_empty(proto: &mut dyn TInputProtocol) -> thrift::Result<bool> {
+    let list = proto.read_list_begin()?;
+    for _ in 0..list.size {
+        proto.skip(list.element_type)?;
+    }
+    proto.read_list_end()?;
+    Ok(list.size > 0)
+}
+
+fn read_communities_non_empty(proto: &mut dyn TInputProtocol) -> thrift::Result<bool> {
+    proto.read_struct_begin()?;
+    let mut non_empty = false;
+    loop {
+        let field = proto.read_field_begin()?;
+        if field.field_type == TType::Stop {
+            break;
+        }
+        match field.id {
+            Some(1) => non_empty = skip_list_non_empty(proto)?,
+            _ => proto.skip(field.field_type)?,
+        }
+        proto.read_field_end()?;
+    }
+    proto.read_struct_end()?;
+    Ok(non_empty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thrift::protocol::{
+        TBinaryOutputProtocol, TFieldIdentifier, TListIdentifier, TStructIdentifier,
+    };
+    use xai_core_entities::entities::EditControlInitial;
+    use xai_x_thrift::media_common::MediaKey;
+    use xai_x_thrift::media_information::{AdditionalMetadata, GeoRestrictions, Restrictions};
+
+    type Proto<'a> = TBinaryOutputProtocol<&'a mut Vec<u8>>;
+    type Fields<'a> = &'a mut dyn FnMut(&mut Proto<'_>);
+
+    const TWEET_ID: i64 = 10;
+    const AUTHOR_ID: i64 = 7001;
+    const SOURCE_TWEET_ID: i64 = 9;
+    const CONVERSATION_AUTHOR_ID: i64 = 7003;
+
+    fn field(proto: &mut Proto<'_>, id: i16, ty: TType, value: impl FnOnce(&mut Proto<'_>)) {
+        proto
+            .write_field_begin(&TFieldIdentifier::new("", ty, id))
+            .unwrap();
+        value(proto);
+        proto.write_field_end().unwrap();
+    }
+
+    fn bare_struct(proto: &mut Proto<'_>, fields: impl FnOnce(&mut Proto<'_>)) {
+        proto
+            .write_struct_begin(&TStructIdentifier::new(""))
+            .unwrap();
+        fields(proto);
+        proto.write_field_stop().unwrap();
+        proto.write_struct_end().unwrap();
+    }
+
+    fn structure(proto: &mut Proto<'_>, id: i16, fields: impl FnOnce(&mut Proto<'_>)) {
+        field(proto, id, TType::Struct, |p| bare_struct(p, fields));
+    }
+
+    fn list(
+        proto: &mut Proto<'_>,
+        id: i16,
+        ty: TType,
+        len: usize,
+        elements: impl FnOnce(&mut Proto<'_>),
+    ) {
+        field(proto, id, TType::List, |p| {
+            p.write_list_begin(&TListIdentifier::new(ty, len as i32))
+                .unwrap();
+            elements(p);
+            p.write_list_end().unwrap();
+        });
+    }
+
+    fn i64_field(proto: &mut Proto<'_>, id: i16, value: i64) {
+        field(proto, id, TType::I64, |p| p.write_i64(value).unwrap());
+    }
+
+    fn bool_field(proto: &mut Proto<'_>, id: i16, value: bool) {
+        field(proto, id, TType::Bool, |p| p.write_bool(value).unwrap());
+    }
+
+    fn encode_option(option: Fields<'_>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut proto = TBinaryOutputProtocol::new(&mut bytes, false);
+        bare_struct(&mut proto, |p| {
+            structure(p, 4, |p| {
+                structure(p, 2556, |p| structure(p, 118, |p| option(p)));
+            });
+        });
+        bytes
+    }
+
+    fn encode_tweet(core_data: Fields<'_>, rest: Fields<'_>) -> Vec<u8> {
+        encode_option(&mut |p| {
+            structure(p, 26900, |p| {
+                i64_field(p, 1, TWEET_ID);
+                structure(p, 2, |p| {
+                    i64_field(p, 1, AUTHOR_ID);
+                    field(p, 2, TType::String, |p| {
+                        p.write_string("tweet text").unwrap()
+                    });
+                    core_data(p);
+                });
+                rest(p);
+            });
+        })
+    }
+
+    fn non_empty_list(proto: &mut Proto<'_>, id: i16, non_empty: bool) {
+        list(proto, id, TType::Struct, usize::from(non_empty), |p| {
+            if non_empty {
+                bare_struct(p, |_| {});
+            }
+        });
+    }
+
+    fn media_fixture(
+        has_refs: bool,
+        has_card: bool,
+        keys: Option<bool>,
+        entities: &[MediaEntity],
+    ) -> Vec<u8> {
+        encode_tweet(&mut |_| {}, &mut |p| {
+            list(p, 7, TType::Struct, entities.len(), |p| {
+                for entity in entities {
+                    entity.write_to_out_protocol(p).unwrap();
+                }
+            });
+            if has_card {
+                structure(p, 118, |_| {});
+            }
+            non_empty_list(p, 162, has_refs);
+            if let Some(non_empty) = keys {
+                non_empty_list(p, 32766, non_empty);
+            }
+        })
+    }
+
+    fn restricted_media(has_key: bool, dmca: bool, allow: &[&str], deny: &[&str]) -> MediaEntity {
+        MediaEntity {
+            media_key: has_key.then(MediaKey::default),
+            additional_metadata: Some(AdditionalMetadata {
+                restrictions: Some(Restrictions {
+                    is_dmca: Some(dmca),
+                    geo_restrictions: Some(GeoRestrictions {
+                        whitelisted_country_codes: Some(
+                            allow.iter().map(|s| s.to_string()).collect(),
+                        ),
+                        blacklisted_country_codes: Some(
+                            deny.iter().map(|s| s.to_string()).collect(),
+                        ),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn decode_fixture(bytes: &[u8]) -> TweetFeatures {
+        decode_tweet(bytes).unwrap().unwrap()
+    }
+
+    #[test]
+    fn projects_every_read_field_of_a_found_tweet() {
+        let bytes = encode_tweet(
+            &mut |p| {
+                structure(p, 7, |p| i64_field(p, 1, SOURCE_TWEET_ID));
+                bool_field(p, 9, true);
+                bool_field(p, 10, false);
+                bool_field(p, 11, true);
+            },
+            &mut |p| {
+                list(p, 7, TType::Struct, 1, |p| {
+                    restricted_media(true, true, &[], &[])
+                        .write_to_out_protocol(p)
+                        .unwrap()
+                });
+                list(p, 30, TType::Struct, 1, |p| {
+                    bare_struct(p, |p| structure(p, 4, |_| {}))
+                });
+                structure(p, 118, |_| {});
+                structure(p, 125, |p| {
+                    list(p, 1, TType::I64, 1, |p| p.write_i64(500).unwrap())
+                });
+                structure(p, 155, |p| i64_field(p, 1, CONVERSATION_AUTHOR_ID));
+                structure(p, 157, |p| {
+                    structure(p, 1, |p| {
+                        list(p, 1, TType::I64, 1, |p| p.write_i64(TWEET_ID).unwrap());
+                        i64_field(p, 3, 4);
+                    })
+                });
+                list(p, 162, TType::Struct, 1, |p| bare_struct(p, |_| {}));
+                list(p, 32766, TType::Struct, 1, |p| bare_struct(p, |_| {}));
+            },
+        );
+        let media = MediaFeature {
+            has_media: true,
+            has_uploaded_media: true,
+            has_dmca_media: true,
+            ..Default::default()
+        };
+        let edit_control = Some(EditControl::Initial(EditControlInitial {
+            edit_tweet_ids: vec![TWEET_ID as u64],
+            edits_remaining: Some(4),
+            ..Default::default()
+        }));
+
+        assert_eq!(
+            decode_fixture(&bytes),
+            TweetFeatures {
+                source_tweet_id: Some(SOURCE_TWEET_ID as u64),
+                media,
+                takedown_reasons: vec![TakedownReason::Dmca],
+                nsfw: NsfwFeature {
+                    user: true,
+                    admin: false
+                },
+                is_nullcast: true,
+                is_community_tweet: true,
+                edit_control,
+                exclusive_conversation_author_id: Some(CONVERSATION_AUTHOR_ID as u64),
+            }
+        );
+    }
+
+    #[test]
+    fn plain_tweet_decodes_default_features() {
+        let bytes = encode_tweet(&mut |_| {}, &mut |_| {});
+
+        assert_eq!(decode_fixture(&bytes), TweetFeatures::default());
+    }
+
+    #[test]
+    fn media_restrictions_fold_only_across_keyed_entities() {
+        let bytes = media_fixture(
+            true,
+            false,
+            Some(true),
+            &[
+                restricted_media(true, true, &["us"], &["de"]),
+                restricted_media(true, false, &["gb"], &["fr"]),
+                restricted_media(false, true, &["ignored"], &["ignored"]),
+                MediaEntity::default(),
+            ],
+        );
+
+        assert_eq!(
+            decode_fixture(&bytes).media,
+            MediaFeature {
+                has_media: true,
+                has_uploaded_media: true,
+                has_dmca_media: true,
+                geo_allow_list: vec!["us".to_string(), "gb".to_string()],
+                geo_deny_list: vec!["de".to_string(), "fr".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn media_presence_comes_from_refs_or_card_reference_and_uploads_from_own_media_keys() {
+        for (name, bytes, has_media, has_uploaded_media) in [
+            (
+                "own media keys",
+                media_fixture(true, false, Some(true), &[]),
+                true,
+                true,
+            ),
+            (
+                "empty media keys",
+                media_fixture(true, false, Some(false), &[]),
+                true,
+                false,
+            ),
+            (
+                "no media keys field",
+                media_fixture(true, false, None, &[]),
+                true,
+                false,
+            ),
+            ("card", media_fixture(false, true, None, &[]), true, false),
+            (
+                "entities only",
+                media_fixture(false, false, None, &[MediaEntity::default()]),
+                false,
+                false,
+            ),
+        ] {
+            let media = decode_fixture(&bytes).media;
+            assert_eq!(
+                (media.has_media, media.has_uploaded_media),
+                (has_media, has_uploaded_media),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn community_tweet_requires_a_nonempty_community_id_list() {
+        for (community_ids, expected) in [(vec![500], true), (vec![], false)] {
+            let bytes = encode_tweet(&mut |_| {}, &mut |p| {
+                structure(p, 125, |p| {
+                    list(p, 1, TType::I64, community_ids.len(), |p| {
+                        for id in &community_ids {
+                            p.write_i64(*id).unwrap();
+                        }
+                    });
+                });
+            });
+
+            assert_eq!(decode_fixture(&bytes).is_community_tweet, expected);
+        }
+    }
+
+    #[test]
+    fn truncated_share_is_an_error_not_a_panic() {
+        let bytes = encode_tweet(
+            &mut |p| structure(p, 7, |p| i64_field(p, 1, SOURCE_TWEET_ID)),
+            &mut |_| {},
+        );
+        let end = bytes
+            .windows(8)
+            .position(|window| window == SOURCE_TWEET_ID.to_be_bytes())
+            .unwrap()
+            + 4;
+
+        assert!(decode_tweet(&bytes[..end]).is_err());
+    }
+
+    #[test]
+    fn absent_value_or_missing_core_data_decodes_as_missing() {
+        for bytes in [
+            encode_option(&mut |p| field(p, 9048, TType::Void, |_| {})),
+            encode_option(&mut |p| structure(p, 26900, |p| i64_field(p, 1, TWEET_ID))),
+        ] {
+            assert!(decode_tweet(&bytes).unwrap().is_none());
+        }
+    }
+}

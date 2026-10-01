@@ -1,6 +1,6 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
 
 pub struct RetweetDeduplicationFilter;
@@ -11,17 +11,21 @@ impl Filter<ScoredPostsQuery, PostCandidate> for RetweetDeduplicationFilter {
         _query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
     ) -> FilterResult<PostCandidate> {
-        let mut seen_tweet_ids: FxHashSet<u64> =
-            FxHashSet::with_capacity_and_hasher(candidates.len(), Default::default());
-        let mut kept = Vec::with_capacity(candidates.len());
+        let mut kept_index: FxHashMap<u64, usize> =
+            FxHashMap::with_capacity_and_hasher(candidates.len(), Default::default());
+        let mut kept: Vec<PostCandidate> = Vec::with_capacity(candidates.len());
         let mut removed = Vec::new();
 
-        for candidate in candidates {
+        for mut candidate in candidates {
             let dedup_id = candidate.retweeted_tweet_id.unwrap_or(candidate.tweet_id);
-            if seen_tweet_ids.insert(dedup_id) {
-                kept.push(candidate);
-            } else {
+            if let Some(&idx) = kept_index.get(&dedup_id) {
+                kept[idx]
+                    .retrieval_sources
+                    .append(&mut candidate.retrieval_sources);
                 removed.push(candidate);
+            } else {
+                kept_index.insert(dedup_id, kept.len());
+                kept.push(candidate);
             }
         }
 

@@ -1,8 +1,8 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    exponential_buckets, register_histogram_vec, register_int_counter, register_int_counter_vec,
-    register_int_gauge, register_int_gauge_vec, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    IntGaugeVec,
+    exponential_buckets, register_histogram, register_histogram_vec, register_int_counter,
+    register_int_counter_vec, register_int_gauge, register_int_gauge_vec, Histogram, HistogramVec,
+    IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
 };
 
 lazy_static! {
@@ -144,6 +144,13 @@ lazy_static! {
             &["entity_type"])  
             .unwrap();
 
+                        pub static ref CONFIG_RESTART_PENDING: IntGaugeVec =
+        register_int_gauge_vec!(
+            "abuse_enforcement_config_restart_pending",
+            "1 while a restart-requiring config change is pending, by whether it validates.",
+            &["valid"])  
+            .unwrap();
+
                                                 pub static ref LIMITER_COUNTER_RESET_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_limiter_counter_reset_total",
@@ -213,6 +220,72 @@ lazy_static! {
             "Records published to a Kafka publish sink, by sink and produce result.",
             &["sink", "result"])
             .unwrap();
+
+
+                                                                                                                                            pub static ref HOLD_GATE_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "abuse_enforcement_hold_gate_total",
+            "Overturn-hold gate decisions on suspend- or gated-label-shaped rows, by mode, outcome and topic.",
+            &["mode", "outcome", "topic"])
+            .unwrap();
+
+                pub static ref HOLD_GATE_BREAKER_SKIP_TOTAL: IntCounter =
+        register_int_counter!(
+            "abuse_enforcement_hold_gate_breaker_skip_total",
+            "Overturn-hold gate probes skipped because the circuit breaker was open.")
+            .unwrap();
+
+                                            pub static ref HOLD_GATE_BACKOFF_SKIP_TOTAL: IntCounter =
+        register_int_counter!(
+            "abuse_enforcement_hold_gate_backoff_skip_total",
+            "Overturn-hold gate probes skipped because the reachable-error backoff was armed (ledger answers but cannot serve).")
+            .unwrap();
+
+                                        pub static ref HOLD_GATE_PROBE_SECONDS: Histogram =
+        register_histogram!(
+            "abuse_enforcement_hold_gate_probe_seconds",
+            "Overturn-hold gate ledger probe latency.",
+            vec![0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 2.5, 5.0])
+            .unwrap();
+
+                                            pub static ref HOLD_GATE_PROBE_SCHED_DELAY_SECONDS: Histogram =
+        register_histogram!(
+            "abuse_enforcement_hold_gate_probe_sched_delay_seconds",
+            "Overturn-hold gate: delay between a probe finishing and the decision task observing it.",
+            vec![0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 2.5, 5.0])
+            .unwrap();
+
+                            pub static ref HOLD_GATE_MODE: IntGaugeVec =
+        register_int_gauge_vec!(
+            "abuse_enforcement_hold_gate_mode",
+            "Overturn-hold gate mode in effect on this pod (1 for the current mode, 0 otherwise).",
+            &["mode"])
+            .unwrap();
+
+                        pub static ref HOLD_GATE_CONFIG_INFO: IntGaugeVec =
+        register_int_gauge_vec!(
+            "abuse_enforcement_hold_gate_config_info",
+            "Overturn-hold gate effective config (1 for the current mode/on_probe_error/kinds triple).",
+            &["mode", "on_probe_error", "kinds"])
+            .unwrap();
+
+                                    pub static ref HOLD_GATE_DB_CONNECTED: IntGauge =
+        register_int_gauge!(
+            "abuse_enforcement_hold_gate_db_connected",
+            "Overturn-hold gate: ledger service reachable (1 = the last request got an HTTP response).")
+            .unwrap();
+
+                                        pub static ref HOLD_GATE_EXPIRED_HOLD_TOTAL: IntCounter =
+        register_int_counter!(
+            "abuse_enforcement_hold_gate_expired_hold_total",
+            "Overturn-hold gate: holds returned by the ledger service already past expires_at (dropped).")
+            .unwrap();
+
+                            pub static ref HOLD_GATE_BREAKER_OPEN: IntGauge =
+        register_int_gauge!(
+            "abuse_enforcement_hold_gate_breaker_open",
+            "Overturn-hold gate circuit breaker state (1 = open, probes skipped).")
+            .unwrap();
 }
 
 pub fn observe_user_active_seconds(
@@ -270,6 +343,7 @@ pub fn init() {
     let _ = &*RETRY_QUEUE_SIZE;
     let _ = &*LIMITER_DECISIONS_TOTAL;
     let _ = &*RATE_LIMIT_REMAINING;
+    let _ = &*CONFIG_RESTART_PENDING;
     let _ = &*LIMITER_COUNTER_RESET_TOTAL;
     let _ = &*MANHATTAN_ERRORS_TOTAL;
     let _ = &*KAFKA_SELF_DELETE_TOTAL;
@@ -278,6 +352,16 @@ pub fn init() {
     let _ = &*HTTP_LATENCY;
     let _ = &*HTTP_INFLIGHT;
     let _ = &*KAFKA_PUBLISH_TOTAL;
+    let _ = &*HOLD_GATE_TOTAL;
+    let _ = &*HOLD_GATE_BREAKER_SKIP_TOTAL;
+    let _ = &*HOLD_GATE_BACKOFF_SKIP_TOTAL;
+    let _ = &*HOLD_GATE_PROBE_SECONDS;
+    let _ = &*HOLD_GATE_PROBE_SCHED_DELAY_SECONDS;
+    let _ = &*HOLD_GATE_DB_CONNECTED;
+    let _ = &*HOLD_GATE_EXPIRED_HOLD_TOTAL;
+    let _ = &*HOLD_GATE_BREAKER_OPEN;
+    let _ = &*HOLD_GATE_MODE;
+    let _ = &*HOLD_GATE_CONFIG_INFO;
 }
 
 #[cfg(test)]

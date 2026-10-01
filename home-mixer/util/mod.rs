@@ -1,6 +1,5 @@
 pub mod author_rules;
 pub mod candidates_util;
-pub mod composition;
 pub mod conversation_grouping;
 pub mod country_codes;
 pub mod egress;

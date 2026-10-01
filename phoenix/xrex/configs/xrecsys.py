@@ -19,6 +19,7 @@ from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.recsys_embedding import HashKeys, HashTable
 from xrex.models.recsys_feature_prep import FeaturePrepConfig
 from xrex.models.recsys_model import (
+    MATCHED_WORD_FRACTION_NUM_BUCKETS,
     POST_AGE_MAX_MINUTES,
     CategoricalFeatureConfig,
     ContextFeaturesConfig,
@@ -86,6 +87,8 @@ def _make_feature_prep_config(mparams: dict, scale_config: ScaleConfig) -> Featu
         sid_codebook_size=mparams.get("sid_codebook_size", 1024),
         sid_hash_level=mparams.get("sid_hash_level", False),
         sid_cross_attn=mparams.get("sid_cross_attn", False),
+        sid_embedding_mode=mparams.get("sid_embedding_mode", "learned"),
+        sid_decoder_path=mparams.get("sid_decoder_path", ""),
         enable_stale_post=mparams.get("enable_stale_post", False),
     )
 
@@ -196,6 +199,7 @@ def _make_dataset(
     _use_post_sid = mparams.get("use_post_sid", False)
     _sid_num_levels = mparams.get("sid_num_levels", 6)
     _enable_stale_post = mparams.get("enable_stale_post", False)
+    _ads_head_masking = mparams.get("ads_head_masking", False)
 
     match dataset_type:
         case "aggregated_kafka":
@@ -213,6 +217,7 @@ def _make_dataset(
                 use_post_sid=_use_post_sid,
                 sid_num_levels=_sid_num_levels,
                 enable_stale_post=_enable_stale_post,
+                ads_head_masking=_ads_head_masking,
             )
         case "toy_dataset":
             return PhoenixToyDataset(
@@ -227,6 +232,7 @@ def _make_dataset(
                 use_post_sid=_use_post_sid,
                 sid_num_levels=_sid_num_levels,
                 enable_stale_post=_enable_stale_post,
+                ads_head_masking=_ads_head_masking,
             )
         case _:
             raise ValueError(f"Uknown {dataset_type=}, must be one of {DATASET_TYPES}")
@@ -652,6 +658,7 @@ for config in configs:
                 "condition_search_relevance_on_prompt", False
             ),
             metric_group=mparams.get("metric_group", "default"),
+            enable_platform_metrics=mparams.get("enable_platform_metrics", False),
             metric_mask_keys=mparams.get("metric_mask_keys"),
             continuous_metrics_mae_mean=mparams.get("continuous_metrics_mae_mean", False),
             emb_table_width=mparams["emb_table_width"],
@@ -694,6 +701,7 @@ for config in configs:
                 enabled=mparams.get("enable_context_features", True),
                 enable_engagement_counts=mparams.get("enable_engagement_counts", False),
                 enable_author_nsfw=mparams.get("enable_author_nsfw", False),
+                enable_search_lexical_match=mparams.get("enable_search_lexical_match", False),
                 categorical_features=[
                     CategoricalFeatureConfig(
                         feature_name="product_surface",
@@ -765,6 +773,18 @@ for config in configs:
                         index=CategoricalFeature.viewCountBucketSeq,
                         feature_name="view_count_bucket",
                         cardinality=32,
+                        embedding_dim=16,
+                    ),
+                    CategoricalFeatureConfig(
+                        index=CategoricalFeature.exactPhraseSeq,
+                        feature_name="exact_phrase",
+                        cardinality=3,
+                        embedding_dim=16,
+                    ),
+                    CategoricalFeatureConfig(
+                        index=CategoricalFeature.matchedWordFractionBucketSeq,
+                        feature_name="matched_word_fraction_bucket",
+                        cardinality=MATCHED_WORD_FRACTION_NUM_BUCKETS,
                         embedding_dim=16,
                     ),
                 ],

@@ -1352,7 +1352,7 @@ class Trainer(Config):
                     )
                     self.host_state = None
                 else:
-                    self.state = None
+                    staged_state = self.state = None
                     self.state = jax.device_put(self.host_state, self.state_sharding)
                     self.host_state = jax.device_put(self.state, self.host_sharding)
 

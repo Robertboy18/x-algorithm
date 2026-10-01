@@ -1,9 +1,9 @@
 use crate::candidate_hydrators::core_data_candidate_hydrator::CoreDataCandidateHydrator;
 use crate::clients::simclusters_ann_client::SimClustersAnnClient;
-use crate::models::candidate::PostCandidate;
+use crate::models::candidate::{PostCandidate, RetrievalSource};
 use crate::models::engagement_signals::EngagementSignal;
 use crate::models::query::ScoredPostsQuery;
-use crate::params::EnableSimclustersSource;
+use crate::params::{EnableSimclustersSource, SimclustersMaxCandidateAgeHours};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,14 +30,13 @@ const ANN_MAX_NUM_RESULTS: i32 = 200;
 const ANN_MIN_SCORE: f64 = 0.0;
 const ANN_MAX_TOP_POSTS_PER_CLUSTER: i32 = 800;
 const ANN_MAX_SCAN_CLUSTERS: i32 = 50;
-const ANN_MAX_POST_CANDIDATE_AGE_HOURS: i32 = 48;
 const ANN_MIN_POST_CANDIDATE_AGE_HOURS: i32 = 0;
 const POST_ANN_MIN_SCORE: f64 = 0.5;
 const CACHE_METRIC: &str = "SimclustersSource.cache";
 
 pub struct SimclustersSource {
     client: Arc<dyn SimClustersAnnClient + Send + Sync>,
-    cache: MokaCache<i64, Vec<SimClustersANNTweetCandidate>>,
+    cache: MokaCache<(i64, i32), Vec<SimClustersANNTweetCandidate>>,
     core_data_hydrator: CoreDataCandidateHydrator,
 }
 
@@ -59,8 +58,10 @@ impl SimclustersSource {
     async fn get_post_candidates(
         &self,
         signal_id: i64,
+        max_candidate_age_hours: i32,
     ) -> Result<Vec<SimClustersANNTweetCandidate>, String> {
-        if let Some(cached) = self.cache.get(&signal_id).await {
+        let cache_key = (signal_id, max_candidate_age_hours);
+        if let Some(cached) = self.cache.get(&cache_key).await {
             Self::stat_cache("cache_hit");
             return Ok(cached);
         }
@@ -68,11 +69,11 @@ impl SimclustersSource {
 
         let candidates = self
             .client
-            .get_tweet_candidates(build_query(signal_id))
+            .get_tweet_candidates(build_query(signal_id, max_candidate_age_hours))
             .await
             .map_err(|e| format!("SimclustersSource: {e}"))?;
 
-        self.cache.insert(signal_id, candidates.clone()).await;
+        self.cache.insert(cache_key, candidates.clone()).await;
         Ok(candidates)
     }
 
@@ -99,9 +100,12 @@ impl Source<ScoredPostsQuery, PostCandidate> for SimclustersSource {
         }
 
         let max_per_query = (MAX_SANN_CANDIDATES / signal_ids.len()).max(1);
+        let max_candidate_age_hours: i32 = query.params.get(SimclustersMaxCandidateAgeHours);
 
         let futures = signal_ids.into_iter().map(|signal_id| async move {
-            let candidates = self.get_post_candidates(signal_id).await?;
+            let candidates = self
+                .get_post_candidates(signal_id, max_candidate_age_hours)
+                .await?;
             Ok::<_, String>(candidates)
         });
 
@@ -121,9 +125,16 @@ impl Source<ScoredPostsQuery, PostCandidate> for SimclustersSource {
         interleaved.truncate(MAX_RESULTS);
         let mut candidates: Vec<PostCandidate> = interleaved
             .into_iter()
-            .map(|c| PostCandidate {
+            .enumerate()
+            .map(|(index, c)| PostCandidate {
                 tweet_id: c.tweet_id as u64,
                 served_type: Some(pb::ServedType::ForYouSimclusters),
+                retrieval_sources: vec![RetrievalSource {
+                    served_type: pb::ServedType::ForYouSimclusters,
+                    cluster: None,
+                    score: Some(*c.score as f32),
+                    position: Some(index as u32 + 1),
+                }],
                 ..Default::default()
             })
             .collect();
@@ -172,7 +183,7 @@ fn post_signal_ids(query: &ScoredPostsQuery) -> Vec<i64> {
     ids
 }
 
-fn build_query(signal_id: i64) -> Query {
+fn build_query(signal_id: i64, max_candidate_age_hours: i32) -> Query {
     Query {
         source_embedding_id: SimClustersEmbeddingId {
             embedding_type: SOURCE_EMBEDDING_TYPE,
@@ -185,7 +196,7 @@ fn build_query(signal_id: i64) -> Query {
             candidate_embedding_type: CANDIDATE_EMBEDDING_TYPE,
             max_top_tweets_per_cluster: ANN_MAX_TOP_POSTS_PER_CLUSTER,
             max_scan_clusters: ANN_MAX_SCAN_CLUSTERS,
-            max_tweet_candidate_age_hours: ANN_MAX_POST_CANDIDATE_AGE_HOURS,
+            max_tweet_candidate_age_hours: max_candidate_age_hours,
             min_tweet_candidate_age_hours: ANN_MIN_POST_CANDIDATE_AGE_HOURS,
             ann_algorithm: ScoringAlgorithm::COSINE_SIMILARITY,
             engagement_threshold: None,

@@ -8,7 +8,7 @@ import optax
 from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec as P
 
-from xrex.models.ads_head_masking import EARLY_RELABEL_STREAM_ID
+from xrex.data.recsys.ads_head_masking import EARLY_RELABEL_STREAM_ID
 
 logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
@@ -160,14 +160,14 @@ def purchase_value_loss_compute(
         ]
     )
     stats = {
-        "purchase-value_delayed_clicked-loss": loss,
-        "purchase-value_delayed_clicked-valid-count": jnp.sum(valid),
-        "purchase-value_delayed_clicked-weight-sum": weight_sum,
-        "purchase-value_delayed_clicked-ratio-mae": sums[1] / denominator,
-        "purchase-value_delayed_clicked-target-ratio": sums[2] / denominator,
-        "purchase-value_delayed_clicked-baseline-mean-usd": sums[3] / denominator,
-        "purchase-value_delayed_clicked-usd-mae": sums[7] / denominator,
-        "purchase-value_delayed_clicked-calib": sums[8] / (sums[2] + 1e-12),
+        "purchase-value_delayed_website_clicked-loss": loss,
+        "purchase-value_delayed_website_clicked-valid-count": jnp.sum(valid),
+        "purchase-value_delayed_website_clicked-weight-sum": weight_sum,
+        "purchase-value_delayed_website_clicked-ratio-mae": sums[1] / denominator,
+        "purchase-value_delayed_website_clicked-target-ratio": sums[2] / denominator,
+        "purchase-value_delayed_website_clicked-baseline-mean-usd": sums[3] / denominator,
+        "purchase-value_delayed_website_clicked-usd-mae": sums[7] / denominator,
+        "purchase-value_delayed_website_clicked-calib": sums[8] / (sums[2] + 1e-12),
         "_purchase-value-sums": sums,
     }
     return loss, stats
@@ -200,7 +200,7 @@ def purchase_value_smoothed_stats(
     new_ema: dict[str, jax.Array] = {}
     for i, ws in enumerate(smoothing_windows):
         new_ema[f"purchase_value/{ws}"] = updated[i]
-        prefix = "purchase-value_delayed_clicked-smoothed"
+        prefix = "purchase-value_delayed_website_clicked-smoothed"
         for name, col in (
             ("loss", 0),
             ("ratio-mae", 1),

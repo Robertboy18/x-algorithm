@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, BooleanArray, Int64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ use super::writer::{atomic_write_parquet, find_latest_versioned_file, read_parqu
 use super::{SnapshotStore, StoreConfig, StoreError, WindowRouter};
 use crate::config::WindowConfig;
 use crate::metrics::PipelineMetrics;
-use crate::processor::record::{IndexRecord, PostId};
+use crate::processor::record::{EngagementCounts, IndexRecord, PostId};
 
 #[derive(Debug, Clone)]
 enum StoredValue {
@@ -48,6 +48,15 @@ impl StoredValue {
         }
     }
 
+    fn merge(existing: Self, incoming: Self) -> Self {
+        match (existing, incoming) {
+            (StoredValue::Full(old), StoredValue::Full(new)) => StoredValue::Full(Arc::new(
+                old.as_ref().clone().merge_with(new.as_ref().clone()),
+            )),
+            (_, incoming) => incoming,
+        }
+    }
+
     fn author_id(&self) -> i64 {
         match self {
             StoredValue::Core(author_id) => *author_id,
@@ -72,6 +81,14 @@ impl StoredValue {
 }
 
 type WindowData = HashMap<PostId, StoredValue>;
+
+fn upsert_stored(map: &mut WindowData, post_id: PostId, incoming: StoredValue) {
+    let merged = match map.remove(&post_id) {
+        Some(existing) => StoredValue::merge(existing, incoming),
+        None => incoming,
+    };
+    map.insert(post_id, merged);
+}
 
 type BufferMap = HashMap<String, WindowData>;
 
@@ -331,7 +348,7 @@ impl BaseSnapshotStore {
                 let mut state = self.state.lock().await;
                 let main = state.main_data.entry(window_name.clone()).or_default();
                 for (post_id, record) in pending {
-                    main.insert(*post_id, record.clone());
+                    upsert_stored(main, *post_id, record.clone());
                 }
             }
 
@@ -434,11 +451,11 @@ impl SnapshotStore for BaseSnapshotStore {
             let window_names = (self.router)(&record, &self.config.windows);
             let (post_id, stored) = StoredValue::from_record(record);
             for wn in window_names {
-                state
-                    .pending
-                    .entry(wn)
-                    .or_default()
-                    .insert(post_id, stored.clone());
+                upsert_stored(
+                    state.pending.entry(wn).or_default(),
+                    post_id,
+                    stored.clone(),
+                );
             }
         }
         Ok(())
@@ -496,7 +513,7 @@ impl SnapshotStore for BaseSnapshotStore {
                         let mut st = store_state.lock().await;
                         let main = st.main_data.entry(window_name.clone()).or_default();
                         for (post_id, record) in pending {
-                            main.insert(*post_id, record.clone());
+                            upsert_stored(main, *post_id, record.clone());
                         }
                     }
 
@@ -873,14 +890,6 @@ fn stored_to_metadata_batch(entries: &[(i64, &StoredValue)]) -> anyhow::Result<R
                     author_followers_count: af,
                     engagement: e,
                     ..
-                }
-                | IndexRecord::MmMetadata {
-                    has_video: hv,
-                    has_image: hi,
-                    video_duration_ms: vd,
-                    author_followers_count: af,
-                    engagement: e,
-                    ..
                 } => {
                     has_video.push(*hv);
                     video_duration_ms.push(*vd);
@@ -991,6 +1000,68 @@ fn load_post_ids_from_batch(batch: &RecordBatch, target: &mut WindowData, pipeli
                     author_id,
                     post_sid,
                 },
+            );
+        }
+    } else if pipeline == "metadata" {
+        let i64_col = |name: &str| {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        };
+        let bool_col = |name: &str| {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+        };
+        let i64_at = |col: Option<&Int64Array>, i: usize| {
+            col.filter(|c| c.is_valid(i))
+                .map(|c| c.value(i))
+                .unwrap_or(0)
+        };
+        let bool_at = |col: Option<&BooleanArray>, i: usize| {
+            col.filter(|c| c.is_valid(i))
+                .map(|c| c.value(i))
+                .unwrap_or(false)
+        };
+
+        let has_video = bool_col("has_video");
+        let has_image = bool_col("has_image");
+        let video_duration_ms = i64_col("video_duration_ms");
+        let author_followers_count = i64_col("author_followers_count");
+        let retweet_count = i64_col("retweet_count");
+        let reply_count = i64_col("reply_count");
+        let fav_count = i64_col("fav_count");
+        let quote_count = i64_col("quote_count");
+        let bookmark_count = i64_col("bookmark_count");
+        let view_count = i64_col("view_count");
+        let not_interested_in_count = i64_col("not_interested_in_count");
+        let report_count = i64_col("report_count");
+        let block_count = i64_col("block_count");
+
+        for i in 0..batch.num_rows() {
+            let post_id = post_ids.value(i);
+            let author_id = author_ids.value(i);
+            target.insert(
+                post_id,
+                StoredValue::Full(Arc::new(IndexRecord::Metadata {
+                    post_id,
+                    author_id,
+                    has_video: bool_at(has_video, i),
+                    has_image: bool_at(has_image, i),
+                    video_duration_ms: i64_at(video_duration_ms, i),
+                    author_followers_count: i64_at(author_followers_count, i),
+                    engagement: EngagementCounts {
+                        retweet_count: i64_at(retweet_count, i),
+                        reply_count: i64_at(reply_count, i),
+                        fav_count: i64_at(fav_count, i),
+                        quote_count: i64_at(quote_count, i),
+                        bookmark_count: i64_at(bookmark_count, i),
+                        view_count: i64_at(view_count, i),
+                        not_interested_in_count: i64_at(not_interested_in_count, i),
+                        report_count: i64_at(report_count, i),
+                        block_count: i64_at(block_count, i),
+                    },
+                })),
             );
         }
     } else {
@@ -1186,6 +1257,21 @@ mod tests {
         }
     }
 
+    fn make_metadata_record(post_id: i64, author_id: i64, fav_count: i64) -> IndexRecord {
+        IndexRecord::Metadata {
+            post_id,
+            author_id,
+            has_video: false,
+            has_image: false,
+            video_duration_ms: 0,
+            author_followers_count: 0,
+            engagement: crate::processor::record::EngagementCounts {
+                fav_count,
+                ..Default::default()
+            },
+        }
+    }
+
     #[test]
     fn prefix_router_routes_to_matching_windows() {
         let windows = vec![
@@ -1298,6 +1384,111 @@ mod tests {
 
         let batches = read_parquet_file(&symlink).unwrap();
         assert_eq!(batches[0].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn metadata_keeps_fav_when_later_event_has_zero_engagement() {
+        let dir = TempDir::new().unwrap();
+        let metrics = make_metrics();
+        let config = StoreConfig {
+            output_dir: dir.path().to_path_buf(),
+            windows: vec![WindowConfig::new("metadata", 24)],
+            compaction_interval_secs: 999,
+            versions_to_keep: 3,
+            pipeline: "metadata".to_string(),
+            sid_num_levels: 6,
+        };
+        let store = BaseSnapshotStore::new(config, metadata_window_router(), metrics);
+
+        let now_secs = chrono::Utc::now().timestamp() as f64;
+        let post_id = timestamp_secs_to_snowflake(now_secs - 100.0);
+
+        store
+            .add_batch(vec![make_metadata_record(post_id, 10, 50)])
+            .await
+            .unwrap();
+        store.dump_all_windows().await.unwrap();
+        store
+            .add_batch(vec![make_metadata_record(post_id, 10, 0)])
+            .await
+            .unwrap();
+        store.dump_all_windows().await.unwrap();
+
+        let symlink = dir.path().join("metadata_1day.parquet");
+        let batches = read_parquet_file(&symlink).unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
+        let favs = batches[0]
+            .column_by_name("fav_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(favs.value(0), 50);
+    }
+
+    #[tokio::test]
+    async fn metadata_reload_preserves_fav() {
+        let dir = TempDir::new().unwrap();
+        let metrics = make_metrics();
+        let config = StoreConfig {
+            output_dir: dir.path().to_path_buf(),
+            windows: vec![WindowConfig::new("metadata", 24)],
+            compaction_interval_secs: 999,
+            versions_to_keep: 3,
+            pipeline: "metadata".to_string(),
+            sid_num_levels: 6,
+        };
+        let store1 = BaseSnapshotStore::new(config, metadata_window_router(), Arc::clone(&metrics));
+
+        let now_secs = chrono::Utc::now().timestamp() as f64;
+        let post_id = timestamp_secs_to_snowflake(now_secs - 100.0);
+        store1
+            .add_batch(vec![IndexRecord::Metadata {
+                post_id,
+                author_id: 10,
+                has_video: false,
+                has_image: true,
+                video_duration_ms: 0,
+                author_followers_count: 99,
+                engagement: crate::processor::record::EngagementCounts {
+                    fav_count: 50,
+                    view_count: 200,
+                    ..Default::default()
+                },
+            }])
+            .await
+            .unwrap();
+        store1.dump_all_windows().await.unwrap();
+
+        let config2 = StoreConfig {
+            output_dir: dir.path().to_path_buf(),
+            windows: vec![WindowConfig::new("metadata", 24)],
+            compaction_interval_secs: 999,
+            versions_to_keep: 3,
+            pipeline: "metadata".to_string(),
+            sid_num_levels: 6,
+        };
+        let store2 = BaseSnapshotStore::new(config2, metadata_window_router(), metrics);
+        store2.load_existing_data().await.unwrap();
+        store2
+            .add_batch(vec![make_metadata_record(post_id, 10, 0)])
+            .await
+            .unwrap();
+        store2.dump_all_windows().await.unwrap();
+
+        let batches = read_parquet_file(&dir.path().join("metadata_1day.parquet")).unwrap();
+        let col = |name: &str| {
+            batches[0]
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(col("fav_count"), 50);
+        assert_eq!(col("view_count"), 200);
+        assert_eq!(col("author_followers_count"), 99);
     }
 
     #[tokio::test]

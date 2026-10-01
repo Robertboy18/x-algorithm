@@ -12,6 +12,7 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
+from jax.experimental.xla_metadata import set_xla_metadata
 from jax.lax import with_sharding_constraint
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -340,6 +341,8 @@ class DenseBlock(hk.Module):
 @chex.dataclass(kw_only=True)
 class DecoderOutput:
     output: jax.Array
+    attn_loss: float | jax.Array = 0.0
+    ffn_loss: float | jax.Array = 0.0
     layer_dumps: tuple[jax.Array] | None = None
 
 
@@ -411,6 +414,7 @@ class DecoderLayer(hk.Module):
         positions: jax.Array | None = None,
         seqpack_layout: SequencePackedLayout | None = None,
         remat_fn: Optional[Callable[[Callable], Callable]] = None,
+        padding_mask: Optional[jax.Array] = None,
     ) -> DecoderOutput:
         layer_norm = partial(
             rms_norm_fn,
@@ -452,13 +456,20 @@ class DecoderLayer(hk.Module):
             )
             h_attn = checkpoint_name(attn_outputs.output, "attn_outputs")
 
+            with jax.named_scope("attn_loss"), set_xla_metadata(_xla_collective_group="metrics"):
+                if padding_mask is None:
+                    attn_loss = jnp.mean(jnp.mean(h_attn**2, axis=-1))
+                else:
+                    attn_loss = jnp.mean(jnp.mean(h_attn**2, axis=-1) * padding_mask)
+                attn_loss = checkpoint_name(attn_loss, "scalar_stats")
+
             if self.primer_norm:
                 h_attn = with_sharding_constraint(h_attn, activation_pspec)
                 h_attn = layer_norm(h_attn, "post_attn_norm")
 
-            return h_attn, attn_input, attn_outputs
+            return h_attn, attn_input, attn_outputs, attn_loss
 
-        h_attn, attn_input, attn_outputs = remat_fn(run_attn_layer)(h_attn_in)
+        h_attn, attn_input, attn_outputs, attn_loss = remat_fn(run_attn_layer)(h_attn_in)
 
         residual = residual + h_attn
         residual = with_sharding_constraint(residual, activation_pspec)
@@ -487,13 +498,20 @@ class DecoderLayer(hk.Module):
             h_ffn = ffn_result.output
             ffn_output = h_ffn
 
+            with jax.named_scope("ffn_loss"), set_xla_metadata(_xla_collective_group="loss"):
+                if padding_mask is None:
+                    ffn_loss = jnp.mean(jnp.mean(h_ffn**2, axis=-1))
+                else:
+                    ffn_loss = jnp.mean(jnp.mean(h_ffn**2, axis=-1) * padding_mask)
+                ffn_loss = checkpoint_name(ffn_loss, "scalar_stats")
+
             if self.primer_norm:
                 h_ffn = with_sharding_constraint(h_ffn, activation_pspec)
                 h_ffn = layer_norm(h_ffn, "post_ffn_norm")
 
-            return h_ffn, ffn_input, ffn_output
+            return h_ffn, ffn_input, ffn_output, ffn_loss
 
-        h_ffn, ffn_input, ffn_output = remat_fn(run_ffn_layer)(h_ffn_in)
+        h_ffn, ffn_input, ffn_output, ffn_loss = remat_fn(run_ffn_layer)(h_ffn_in)
 
         residual = residual + h_ffn
         residual = with_sharding_constraint(residual, activation_pspec)
@@ -523,6 +541,8 @@ class DecoderLayer(hk.Module):
 
         return DecoderOutput(
             output=residual,
+            attn_loss=attn_loss,
+            ffn_loss=ffn_loss,
             layer_dumps=layer_dumps,
         )
 
@@ -535,6 +555,7 @@ def layer_stack_block(
     mask: jax.Array | None = None,
     segment_ids: jax.Array | None = None,
     segment_ids_k: jax.Array | None = None,
+    padding_mask: jax.Array | None = None,
     debug_tensor_dump_output_folder: str | None = None,
     seqpack_layout: SequencePackedLayout | None = None,
     name_prefix: str = "decoder_layer",
@@ -552,11 +573,14 @@ def layer_stack_block(
         mask=mask,
         segment_ids=segment_ids,
         segment_ids_k=segment_ids_k,
+        padding_mask=padding_mask,
         name=f"{name_prefix}_0",
         global_layer_index=global_layer_index + layer_index_offset,
         seqpack_layout=seqpack_layout,
     )
     h = d.output
+    attn_loss = jnp.stack([d.attn_loss], axis=0)
+    ffn_loss = jnp.stack([d.ffn_loss], axis=0)
     if debug_tensor_dump_output_folder is not None:
         layer_dumps.append(d.layer_dumps)
 
@@ -577,6 +601,8 @@ def layer_stack_block(
 
     return h, DecoderOutput(
         output=jnp.zeros(()),
+        attn_loss=attn_loss,
+        ffn_loss=ffn_loss,
         layer_dumps=layer_dumps,
     )
 
@@ -646,6 +672,7 @@ class Transformer(hk.Module):
             mask,
             segment_ids,
             segment_ids_k: Optional[jax.Array] = None,
+            padding_mask: Optional[jax.Array] = None,
             name: Optional[str] = None,
             global_layer_index: Optional[jax.Array] = None,
             seqpack_layout: SequencePackedLayout | None = None,
@@ -674,20 +701,26 @@ class Transformer(hk.Module):
                 positions,
                 seqpack_layout,
                 layer_remat_fn,
+                padding_mask,
             )
 
         if not config.use_layer_stack:
+            attn_losses, ffn_losses = [], []
             for i in range(config.num_layers):
                 d = block(
                     h,
                     mask,
                     segment_ids,
                     segment_ids_k,
+                    padding_mask=padding_mask,
                     name=f"decoder_layer_{i}",
                     global_layer_index=i,
                     seqpack_layout=seqpack_layout,
                 )
                 h = d.output
+                attn_losses.append(d.attn_loss)
+                ffn_losses.append(d.ffn_loss)
+            d = replace(d, attn_loss=jnp.stack(attn_losses), ffn_loss=jnp.stack(ffn_losses))
 
         else:
             num_main_layers = config.num_layers
@@ -704,12 +737,13 @@ class Transformer(hk.Module):
                 mask=mask,
                 segment_ids=segment_ids,
                 segment_ids_k=segment_ids_k,
+                padding_mask=padding_mask,
                 layer_index_offset=1,
                 debug_tensor_dump_output_folder=self.config.debug_tensor_dump_output_folder,
                 seqpack_layout=seqpack_layout,
             )
             h, d = main_stack(main_layer_block)(h)
-            d = replace(d, output=h)
+            d = replace(d, output=h, attn_loss=d.attn_loss.flatten(), ffn_loss=d.ffn_loss.flatten())
 
             if self.config.debug_tensor_dump_output_folder:
                 layer_dumps = unroll_layer_dumps(d.layer_dumps)
@@ -723,6 +757,9 @@ class Transformer(hk.Module):
                 )
 
         h_final = d.output
+
+        summarize(f"{self.summarizer_prefix}attn-loss", jnp.sum(d.attn_loss))
+        summarize(f"{self.summarizer_prefix}ffn-loss", jnp.sum(d.ffn_loss))
 
         summarize(
             f"{self.summarizer_prefix}act-l2-loss",

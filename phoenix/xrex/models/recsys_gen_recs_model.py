@@ -97,7 +97,7 @@ class RecsysGenRecsModelConfig(RecsysAggregatedModelConfig):
             author_ids=jnp.arange(M * 2, dtype=jnp.int32).reshape(-1, 2),
             embeddings=Parameter(
                 x=jnp.empty((M, emb_dim), dtype=jnp.bfloat16),
-                pspec=P(("expert", "replica"), ("seq", "model")),
+                pspec=P(("stage", "expert", "replica", "data"), ("seq", "model")),
             ),
             dataset_types=jnp.full((M, 1), RetrievalDataset.PAD.value, dtype=jnp.int32),
         )

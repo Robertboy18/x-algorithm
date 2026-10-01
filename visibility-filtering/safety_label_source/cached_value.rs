@@ -5,6 +5,7 @@ use xai_x_thrift::servo_repo::{CachedValue, CachedValueStatus};
 
 use super::codec;
 
+#[derive(Debug, PartialEq)]
 pub(crate) enum CacheLookup {
     Hit(vf_pb::SafetyLabelMap),
     NotFound,
@@ -87,27 +88,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn decode_not_found_returns_not_found() {
-        assert!(matches!(
-            decode(&cached_value_not_found()),
-            CacheLookup::NotFound
-        ));
-    }
-
-    #[test]
-    fn decode_deleted_returns_not_found() {
-        assert!(matches!(
-            decode(&cached_value_deleted()),
-            CacheLookup::NotFound
-        ));
-    }
-
-    #[test]
-    fn decode_do_not_cache_returns_miss() {
-        assert!(matches!(
-            decode(&cached_value_do_not_cache()),
-            CacheLookup::Miss
-        ));
+    fn decode_status_selects_cache_disposition() {
+        for (blob, expected) in [
+            (cached_value_not_found(), CacheLookup::NotFound),
+            (cached_value_deleted(), CacheLookup::NotFound),
+            (cached_value_do_not_cache(), CacheLookup::Miss),
+        ] {
+            assert_eq!(decode(&blob), expected);
+        }
     }
 
     #[test]
@@ -125,23 +113,6 @@ pub(crate) mod tests {
     fn decode_found_with_no_value_returns_decode_error() {
         let blob = cached_value_blob(CachedValueStatus::FOUND, None);
         assert!(matches!(decode(&blob), CacheLookup::DecodeError));
-    }
-
-    #[test]
-    fn decode_found_with_mval_label() {
-        let blob = cached_value_found_mval();
-        let cv: CachedValue = xai_x_thrift::deserialize_binary(&blob).unwrap();
-        let inner = cv.value.as_deref().unwrap();
-        let decoded = crate::safety_label_source::codec::decode_mval_payload(inner);
-        assert!(decoded.is_some());
-        match decode(&blob) {
-            CacheLookup::Hit(proto) => {
-                assert!(proto
-                    .labels
-                    .contains_key(&i32::from(SafetyLabelType::NSFA_HIGH_PRECISION)));
-            }
-            _ => panic!("expected Hit"),
-        }
     }
 
     #[test]

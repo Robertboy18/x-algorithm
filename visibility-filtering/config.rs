@@ -1,6 +1,10 @@
 pub const ENV_DUAL_CALL_HARNESS_ENABLED: &str = "VF_DUAL_CALL_HARNESS_ENABLED";
 pub const ENV_FALLBACK_CACHE_ENABLED: &str = "VF_FALLBACK_CACHE_ENABLED";
 pub const ENV_CACHE_WARM_ENABLED: &str = "VF_CACHE_WARM_ENABLED";
+pub const ENV_AUTHOR_ID_FALLBACK_ENABLED: &str = "VF_AUTHOR_ID_FALLBACK_ENABLED";
+pub const ENV_AUTHOR_ID_FALLBACK_CAPACITY: &str = "VF_AUTHOR_ID_FALLBACK_CAPACITY";
+pub const ENV_IMAGE: &str = "VF_IMAGE";
+pub const ENV_DARK_TRAFFIC_ENABLED: &str = "DARK_TRAFFIC_ENABLED";
 pub const ENV_APP_ENV: &str = "APP_ENV";
 pub const ENV_FS_PATH: &str = "VF_FS_PATH";
 pub const ENV_GIZMODUCK_CLIENT_ID: &str = "VF_GIZMODUCK_CLIENT_ID";
@@ -45,13 +49,13 @@ pub(crate) fn fallback_cache_enabled() -> bool {
 }
 
 pub(crate) fn author_id_fallback_enabled() -> bool {
-    std::env::var("VF_AUTHOR_ID_FALLBACK_ENABLED")
+    std::env::var(ENV_AUTHOR_ID_FALLBACK_ENABLED)
         .ok()
         .is_none_or(|value| parse_env_flag(Some(&value)))
 }
 
 pub(crate) fn author_id_fallback_capacity() -> usize {
-    std::env::var("VF_AUTHOR_ID_FALLBACK_CAPACITY")
+    std::env::var(ENV_AUTHOR_ID_FALLBACK_CAPACITY)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|capacity| *capacity > 0)
@@ -93,24 +97,26 @@ mod tests {
             resolve_twemcache_client_name(None),
             "visibility-filtering-service"
         );
-        assert_eq!(
-            resolve_gizmoduck_client_id(Some("xai-vf-service.staging"), Some("staging")),
-            "xai-vf-service.staging"
-        );
     }
 
     #[test]
-    fn parses_enabled_environment_values() {
-        for value in ["1", "true", "TRUE", "yes", "on"] {
-            assert!(parse_env_flag(Some(value)), "{value}");
-        }
-    }
-
-    #[test]
-    fn missing_or_disabled_environment_values_are_off() {
-        assert!(!parse_env_flag(None));
-        for value in ["", "0", "false", "FALSE", "no", "off", "other"] {
-            assert!(!parse_env_flag(Some(value)), "{value}");
+    fn environment_flags_accept_only_enabled_values() {
+        for (value, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("FALSE"), false),
+            (Some("no"), false),
+            (Some("off"), false),
+            (Some("other"), false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("yes"), true),
+            (Some("on"), true),
+        ] {
+            assert_eq!(parse_env_flag(value), expected, "{value:?}");
         }
     }
 }

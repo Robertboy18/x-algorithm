@@ -1,5 +1,5 @@
 use crate::clients::night_owl_client::{NightOwlClient, REQUEST_TIMEOUT_MS};
-use crate::models::candidate::PostCandidate;
+use crate::models::candidate::{PostCandidate, RetrievalSource};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::FOLLOWING_POST_FETCH_SIZE;
 use night_owl_proto as night_owl;
@@ -212,11 +212,14 @@ fn hit_to_post_candidate(hit: night_owl::SearchHit) -> PostCandidate {
         quoted_user_id: (quoted_user_id != 0).then_some(quoted_user_id),
         score: Some(0.0),
         in_network: Some(true),
-        served_type: Some(ServedType::FollowingInNetwork),
         ancestors,
         tweet_text: doc
             .map(|d| d.text.clone().unwrap_or_default())
             .unwrap_or_default(),
+        served_type: Some(ServedType::FollowingInNetwork),
+        retrieval_sources: vec![RetrievalSource::from_served_type(
+            ServedType::FollowingInNetwork,
+        )],
         ..Default::default()
     }
 }

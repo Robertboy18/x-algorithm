@@ -211,34 +211,39 @@ def _convert_domains(domains: dict[str, Any], host_state: dict[str, jax.Array]) 
     return domains
 
 
-def _open_tensor(
-    checkpoint_name: str,
-    name: str,
+def _open_tensors(
+    plan: list[tuple[str, str, list[bool], int]],
     path: pathlib.Path,
     use_zarr3: bool,
     ts_context: ts.Context,
-    dest: jax.Array,
-    has_domain: bool,
+    arrays: dict[str, jax.Array],
+    domains: dict[str, Any],
     tspec_transform: Callable[[dict[str, Any]], dict[str, Any]] | None,
-) -> ts.TensorStore:
-    info = ocp.type_handlers.ParamInfo(
-        name=checkpoint_name,
-        path=path / checkpoint_name,
-        parent_dir=path,
-        is_ocdbt_checkpoint=True,
-        use_zarr3=use_zarr3,
-    )
-    tspec = ocp.type_handlers.get_json_tspec_read(info, use_ocdbt=True)
-    if tspec_transform is not None:
-        tspec = tspec_transform(tspec)
-    t = ts.open(ts.Spec(tspec), open=True, context=ts_context).result()
-    if not has_domain and tuple(t.shape) != tuple(dest.shape):
-        raise ValueError(
-            f"Tensor {name!r}: checkpoint has shape {tuple(t.shape)}, "
-            f"but initialized state has shape {tuple(dest.shape)}. "
-            f"Use 'no_loading' to skip this tensor or 'domains' to load a partial slice."
+) -> dict[str, ts.TensorStore]:
+    futures = {}
+    for checkpoint_name, _, _, _ in plan:
+        info = ocp.type_handlers.ParamInfo(
+            name=checkpoint_name,
+            path=path / checkpoint_name,
+            parent_dir=path,
+            is_ocdbt_checkpoint=True,
+            use_zarr3=use_zarr3,
         )
-    return t
+        tspec = ocp.type_handlers.get_json_tspec_read(info, use_ocdbt=True)
+        if tspec_transform is not None:
+            tspec = tspec_transform(tspec)
+        futures[checkpoint_name] = ts.open(ts.Spec(tspec), open=True, context=ts_context)
+
+    stores = {}
+    for checkpoint_name, name, _, _ in plan:
+        t = stores[checkpoint_name] = futures[checkpoint_name].result()
+        if domains.get(name) is None and tuple(t.shape) != tuple(arrays[name].shape):
+            raise ValueError(
+                f"Tensor {name!r}: checkpoint has shape {tuple(t.shape)}, "
+                f"but initialized state has shape {tuple(arrays[name].shape)}. "
+                f"Use 'no_loading' to skip this tensor or 'domains' to load a partial slice."
+            )
+    return stores
 
 
 def _read_into_shards(
@@ -397,25 +402,17 @@ def load_checkpoint(
         if kvstore_base is not None:
             tspec_transform = _encrypted_tspec_transform(kvstore_base)
 
+        stores = _open_tensors(
+            plan, path, use_zarr3, ts_context, host_state, domains, tspec_transform
+        )
         for batch_index, batch in enumerate(batches, start=1):
             with node_lock if node_lock is not None else contextlib.nullcontext():
-                stores = []
                 for checkpoint_name, name, mask, _nbytes in batch:
-                    t = _open_tensor(
-                        checkpoint_name,
-                        name,
-                        path,
-                        use_zarr3,
-                        ts_context,
-                        host_state[name],
-                        has_domain=domains.get(name) is not None,
-                        tspec_transform=tspec_transform,
-                    )
+                    t = stores[checkpoint_name]
                     for s, future in enumerate(
                         _read_into_shards(t, host_state[name], mask, domains.get(name))
                     ):
                         futures[future] = (checkpoint_name, name, s)
-                    stores.append(t)
 
                 inflight_bytes = sum(nbytes for *_, nbytes in batch)
                 rank_logger.info(
@@ -425,7 +422,6 @@ def load_checkpoint(
                     len(futures),
                 )
                 _drain_read_futures(futures, host_state, path, timeout, log_loaded=True)
-                del stores
             _release_batch_memory()
 
     rank_logger.info("Loading checkpoint took %.2f sec", time.time() - start)
@@ -538,64 +534,40 @@ def load_checkpoint_streamed(
     replaced: list[tuple[jax.Array, jax.Array]] = []
     futures: dict[Any, tuple[str, str, int]] = {}
 
-    node_lock: _NodeBatchLock | None = None
-    if _restore_node_serialize_enabled():
-        node_lock = _NodeBatchLock(_node_lock_path())
-        rank_logger.info(
-            "restore node-serialize ACTIVE (flock per batch) lock=%s pid=%d num_batches=%d",
-            node_lock._path,
-            os.getpid(),
-            num_batches,
-        )
+    tspec_transform = None if kvstore_base is None else _encrypted_tspec_transform(kvstore_base)
+    stores = _open_tensors(
+        plan, path, use_zarr3, ts_context, device_state, domains, tspec_transform
+    )
 
-    with contextlib.ExitStack() as stack:
-        if node_lock is not None:
-            stack.callback(node_lock.close)
-        tspec_transform = None
-        if kvstore_base is not None:
-            tspec_transform = _encrypted_tspec_transform(kvstore_base)
+    for batch in batches:
+        staging = _stage_to_host({name: device_state[name] for _, name, _, _ in batch})
 
-        for batch in batches:
-            with node_lock if node_lock is not None else contextlib.nullcontext():
-                staging = _stage_to_host({name: device_state[name] for _, name, _, _ in batch})
+        for checkpoint_name, name, mask, _nbytes in batch:
+            t = stores[checkpoint_name]
+            for s, future in enumerate(
+                _read_into_shards(t, staging[name], mask, domains.get(name))
+            ):
+                futures[future] = (checkpoint_name, name, s)
 
-                stores = []
-                for checkpoint_name, name, mask, _nbytes in batch:
-                    t = _open_tensor(
-                        checkpoint_name,
-                        name,
-                        path,
-                        use_zarr3,
-                        ts_context,
-                        staging[name],
-                        has_domain=domains.get(name) is not None,
-                        tspec_transform=tspec_transform,
-                    )
-                    for s, future in enumerate(
-                        _read_into_shards(t, staging[name], mask, domains.get(name))
-                    ):
-                        futures[future] = (checkpoint_name, name, s)
-                    stores.append(t)
+        _drain_read_futures(futures, staging, path, timeout)
 
-                _drain_read_futures(futures, staging, path, timeout)
+        new_arrays = {
+            name: jax.device_put(staging[name], device_state[name].sharding)
+            for _, name, _, _ in batch
+        }
+        jax.block_until_ready(list(new_arrays.values()))
+        batch_replaced = []
+        for _, name, _, _ in batch:
+            batch_replaced.append((device_state[name], new_arrays[name]))
+            device_state[name] = new_arrays[name]
+        if on_replaced is not None:
+            on_replaced(batch_replaced)
+        else:
+            replaced.extend(batch_replaced)
 
-                new_arrays = {
-                    name: jax.device_put(staging[name], device_state[name].sharding)
-                    for _, name, _, _ in batch
-                }
-                jax.block_until_ready(list(new_arrays.values()))
-                batch_replaced = []
-                for _, name, _, _ in batch:
-                    batch_replaced.append((device_state[name], new_arrays[name]))
-                    device_state[name] = new_arrays[name]
-                if on_replaced is not None:
-                    on_replaced(batch_replaced)
-                else:
-                    replaced.extend(batch_replaced)
+        del staging, new_arrays, batch_replaced
 
-                del staging, new_arrays, stores, batch_replaced
-            _release_batch_memory()
-
+    _release_batch_memory()
     rank_logger.info("Loading checkpoint (streamed) took %.2f sec", time.time() - start)
     return replaced
 
@@ -606,6 +578,9 @@ def broadcast_replicated(
     srcs: PyTree[jax.Array],
     mesh: jax.sharding.Mesh,
 ):
+    if all(math.prod(mesh.shape[axis] for axis in spec) == 1 for spec in jax.tree.leaves(axes)):
+        return jax.block_until_ready(state)
+
     shardings = jax.tree.map(lambda t: t.sharding, state)
     pspecs = jax.tree.map(lambda s: s.spec, shardings)
     donate_argnums = () if os.getenv("XAI_CHECKPOINT_BROADCAST_DONATE", "1") == "0" else (0,)

@@ -8,24 +8,11 @@ from xrex.inference.checkpoint_storage import (
     resolve_checkpoint_arg,
 )
 
-
-def _select_serving_filters_runner(model_runner_cls: type, args) -> type:
-    if args.service_type == "retrieval" and (args.enable_bloom_filter or args.enable_topic_filter):
-        from xrex.inference.serving_filters_runner import FilteredRetrievalModelRunner
-
-        return FilteredRetrievalModelRunner
-    return model_runner_cls
-
-
-service_registry.RUNNER_CLASS_HOOKS.append(_select_serving_filters_runner)
 service_registry.CHECKPOINT_RESOLVERS.append(resolve_checkpoint_arg)
 service_registry.STORAGE_OVERRIDE_HOOKS.append(append_storage_overrides)
 service_registry.CHECKPOINT_STORE_DETECTORS.append(detect_store)
 service_registry.CHECKPOINT_STORAGE_LOADERS.append(maybe_load_from_storage)
 
-assert _select_serving_filters_runner in service_registry.RUNNER_CLASS_HOOKS, (
-    "serving_services: candidate-filter runner hook not registered"
-)
 assert resolve_checkpoint_arg in service_registry.CHECKPOINT_RESOLVERS, (
     "serving_services: checkpoint-storage resolver not registered"
 )

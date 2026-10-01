@@ -22,6 +22,7 @@ from xrex.data.recsys.feature_config import (
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.models.layers import get_parameter
 from xrex.models.recsys_embedding import HashKeys, RecsysEmbeddings
+from xrex.models.recsys_sid import reconstruct_entity_sid
 from xrex.models.scaling import ScaleConfig
 
 ENGAGEMENT_COUNT_ORDER: tuple[Int64Feature, ...] = (
@@ -213,6 +214,8 @@ class FeaturePrepConfig(Config):
     sid_codebook_size: int = 256
     sid_hash_level: bool = True
     sid_cross_attn: bool = True
+    sid_embedding_mode: Literal["learned", "recon"] = "learned"
+    sid_decoder_path: str = ""
 
     multimodal_embedding_dim: int = 0
     search_query_embedding_dim: int = 0
@@ -783,8 +786,19 @@ def _add_sid_features(
         )
     else:
         sids_jax = _cast_jax(sids_in)
-    entity_hashes = _cast_jax(batch_seq["post_hashes"]) if config.sid_hash_level else None
     fprop_dtype = DTYPE_BY_NAME[config.fprop_dtype]
+    if config.sid_embedding_mode == "recon":
+        sid_emb = reconstruct_entity_sid(
+            sids_jax,
+            config.emb_size,
+            config.sid_decoder_path,
+            config.scale_config.emb_lr_multiplier,
+            config.embed_init_scale,
+            fprop_dtype,
+            "feat_prep_post",
+        )
+        return result + sid_emb.astype(fprop_dtype)
+    entity_hashes = _cast_jax(batch_seq["post_hashes"]) if config.sid_hash_level else None
     sid_emb = _embed_entity_sid_scaled(
         sids_jax,
         config.emb_size,

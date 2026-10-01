@@ -7,6 +7,7 @@ use crate::params::{
     PhoenixXdsRetrievalMaxRetries, TopicFilteringId, TopicFilteringOverrides,
 };
 use crate::util::egress::RetrievalDispatch;
+use crate::util::phoenix_request::candidates_from_retrieval_response;
 use tonic::async_trait;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalCluster;
 use xai_candidate_pipeline::component_library::utils::quality_factor;
@@ -80,27 +81,15 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixTopicsSource {
                 None,
                 query.params.get(PhoenixXdsRetrievalMaxRetries),
                 query.params.get(EnablePhoenixRetrievalFallback),
+                vec![],
             )
             .await
             .map_err(|e| format!("PhoenixTopicsSource: {e}"))?;
 
-        let candidates: Vec<PostCandidate> = response
-            .top_k_candidates
-            .into_iter()
-            .flat_map(|scored_candidates| scored_candidates.candidates)
-            .filter_map(|scored_candidate| scored_candidate.candidate)
-            .map(|tweet_info| PostCandidate {
-                tweet_id: tweet_info.tweet_id,
-                author_id: tweet_info.author_id,
-                in_reply_to_tweet_id: (tweet_info.in_reply_to_tweet_id != 0)
-                    .then_some(tweet_info.in_reply_to_tweet_id),
-                retweeted_tweet_id: (tweet_info.retweeted_tweet_id != 0)
-                    .then_some(tweet_info.retweeted_tweet_id),
-                served_type: Some(pb::ServedType::ForYouPhoenixRetrieval),
-                ..Default::default()
-            })
-            .collect();
-
-        Ok(candidates)
+        Ok(candidates_from_retrieval_response(
+            response,
+            |_| pb::ServedType::ForYouPhoenixRetrieval,
+            cluster,
+        ))
     }
 }

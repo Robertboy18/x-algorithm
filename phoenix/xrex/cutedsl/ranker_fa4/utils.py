@@ -184,6 +184,52 @@ def create_softcap_scoremod_bwd(softcap_val):
     return scoremod_bwd_fn
 
 
+def create_softsign_scoremod(cap_val):
+    inv_cap = 1.0 / float(cap_val)
+
+    @cute.jit
+    def scoremod_premask_fn(
+        acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+    ):
+        scores = cute.make_rmem_tensor(acc_S_SSA.shape, Float32)
+        scores.store(acc_S_SSA)
+        for i in cutlass.range_constexpr(cute.size(scores.shape)):
+            s = scores[i]
+            scores[i] = s * cute.arch.rcp_approx(1.0 + cute.math.absf(s) * inv_cap)
+        return scores.load()
+
+    return scoremod_premask_fn
+
+
+def create_softsign_scoremod_bwd(cap_val):
+    inv_cap = 1.0 / float(cap_val)
+
+    @cute.jit
+    def scoremod_bwd_fn(
+        grad_out_SSA, score_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+    ):
+        grads = cute.make_rmem_tensor(grad_out_SSA.shape, Float32)
+        grads.store(grad_out_SSA)
+        scores = cute.make_rmem_tensor(score_SSA.shape, Float32)
+        scores.store(score_SSA)
+        for i in cutlass.range_constexpr(cute.size(scores.shape)):
+            soft_sign = cute.arch.rcp_approx(1.0 + cute.math.absf(scores[i]) * inv_cap)
+            grads[i] = grads[i] * (soft_sign * soft_sign)
+        return grads.load()
+
+    return scoremod_bwd_fn
+
+
+def create_cap_scoremods(cap, cap_method):
+    if cap is None or cap <= 0.0 or cap_method == "none":
+        return None, None
+    if cap_method == "tanh":
+        return create_softcap_scoremod(cap), create_softcap_scoremod_bwd(cap)
+    if cap_method == "soft_sign":
+        return create_softsign_scoremod(cap), create_softsign_scoremod_bwd(cap)
+    raise ValueError(f"cap_method must be one of [tanh, soft_sign, none], got {cap_method!r}")
+
+
 LOG2_E = math.log2(math.e)
 
 

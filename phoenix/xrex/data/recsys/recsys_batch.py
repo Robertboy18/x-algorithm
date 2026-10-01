@@ -14,7 +14,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy import typing as npt
 
-from xrex.data.recsys.constants import action_type_map
+from xrex.data.recsys.ads_head_masking import build_trained_candidate_mask
+from xrex.data.recsys.constants import (
+    CONVERSION_KEEP_APP,
+    CONVERSION_KEEP_WEB,
+    action_type_map,
+)
 from xrex.data.recsys.feature_config import (
     ADS_PRODUCT_KEY_HASH_BIAS,
     ADS_PRODUCT_KEY_HASH_BIAS_2,
@@ -199,6 +204,16 @@ def _col_null_filled(
         values = values.fill_null(0)
     arr = values.to_numpy(zero_copy_only=False).reshape(batch_size, -1).astype(t)
     return typing.cast(npt.NDArray[_T], arr)
+
+
+def _bool_col_as_categorical(
+    rb: pa.RecordBatch, col: str, batch_size: int
+) -> npt.NDArray[np.int16]:
+    values = rb.column(col).values
+    valid = values.is_valid().to_numpy(zero_copy_only=False)
+    filled = values.fill_null(False).to_numpy(zero_copy_only=False).astype(np.int16)
+    arr = np.where(valid, filled + 1, 0).astype(np.int16).reshape(batch_size, -1)
+    return typing.cast(npt.NDArray[np.int16], arr)
 
 
 class PostSeq(TypedDict):
@@ -401,6 +416,7 @@ def from_record_batch(
     sid_num_levels: int = 0,
     compute_post_unexplored_label: bool = False,
     zero_stale_post_14d_candidate_counts: bool = False,
+    ads_head_masking: bool = False,
 ) -> RecsysFeaturesBatch:
     start = time.time()
     batch_size = record_batch.num_rows
@@ -452,14 +468,23 @@ def from_record_batch(
     else:
         seq_len = actions.shape[1]
         client_app_id = np.zeros((batch_size, seq_len), dtype=np.int32)
-    if "conversionKeepMask" in record_batch.schema.names:
-        conversion_keep = _col(record_batch, "conversionKeepMask", batch_size, np.bool_)
-        null_rows = ~record_batch.column("conversionKeepMask").is_valid().to_numpy(
+    if "conversionKeepBits" in record_batch.schema.names:
+        conversion_keep_bits = _col(record_batch, "conversionKeepBits", batch_size, np.uint8)
+        null_rows = ~record_batch.column("conversionKeepBits").is_valid().to_numpy(
             zero_copy_only=False
         )
-        conversion_keep[null_rows] = True
+        conversion_keep_bits[null_rows] = CONVERSION_KEEP_WEB | CONVERSION_KEEP_APP
     else:
-        conversion_keep = None
+        conversion_keep_bits = None
+    sample_source = (
+        record_batch.column("sample_source")
+        .fill_null(0)
+        .to_numpy(zero_copy_only=False)
+        .astype(np.int8)
+        .reshape(-1, 1)
+        if "sample_source" in record_batch.schema.names
+        else np.zeros((batch_size, 1), dtype=np.int8)
+    )
 
     post_creation_ts_sec = (((tweet_ids >> 22) + TWITTER_EPOCH_MS) // 1000).astype(np.int32)
     post_creation_ts_sec = np.where(tweet_ids == 0, 0, post_creation_ts_sec)
@@ -581,6 +606,12 @@ def from_record_batch(
     hist_raw_categorical["authorIsNsfwSeq"] = _author_is_nsfw
     cand_raw_categorical["authorIsNsfwSeq"] = _author_is_nsfw
 
+    _exact_phrase_col = CategoricalFeature.exactPhraseSeq.name
+    if _exact_phrase_col in record_batch.schema.names:
+        _exact_phrase = _bool_col_as_categorical(record_batch, _exact_phrase_col, batch_size)
+        hist_raw_categorical[_exact_phrase_col] = _exact_phrase
+        cand_raw_categorical[_exact_phrase_col] = _exact_phrase
+
     apps_col = record_batch.column("installedAppsMultiHot")
     user_installed_apps_multihot = (
         apps_col.values.to_numpy(zero_copy_only=False).reshape(batch_size, -1).astype(np.bool_)
@@ -624,7 +655,9 @@ def from_record_batch(
     candidate_impr_ts = np.zeros(cand_shape_2d, dtype=np.int32)
     candidate_product_surface = np.zeros(cand_shape_2d, dtype=np.int32)
     candidate_client_app_id = np.zeros(cand_shape_2d, dtype=np.int32)
-    candidate_trained_mask = np.ones(cand_shape_2d, dtype=np.bool_)
+    candidate_trained_actions_bits = np.full(
+        cand_shape_2d, CONVERSION_KEEP_WEB | CONVERSION_KEEP_APP, dtype=np.uint8
+    )
     candidate_value_labels: dict[str, np.ndarray] = {
         key: np.zeros(cand_shape_2d, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()
     }
@@ -787,8 +820,8 @@ def from_record_batch(
             candidate_impr_ts[*cslice] = ts_values.astype(np.int32)
             candidate_product_surface[*cslice] = product_surface[*dslice]
             candidate_client_app_id[*cslice] = client_app_id[*dslice]
-            if conversion_keep is not None:
-                candidate_trained_mask[*cslice] = conversion_keep[*dslice]
+            if conversion_keep_bits is not None:
+                candidate_trained_actions_bits[*cslice] = conversion_keep_bits[*dslice]
             candidate_post_creation_ts_sec[*cslice] = post_creation_ts_sec[*dslice]
             candidate_actions[*cslice] = actions[*dslice, :]
             candidate_continuous_actions[*cslice] = continuous_actions[*dslice, :]
@@ -963,6 +996,12 @@ def from_record_batch(
         post_creation_ts_sec=history_post_creation_ts_sec,
         post_sids=history_post_sids,
     )
+    candidate_trained_mask = build_trained_candidate_mask(
+        candidate_actions,
+        sample_source,
+        candidate_trained_actions_bits,
+        ads_head_masking=ads_head_masking,
+    )
     candidate_seq = PostSeq(
         impr_ts=candidate_impr_ts,
         actions=candidate_actions,
@@ -994,6 +1033,8 @@ def from_record_batch(
         num_negatives_per_example,
         batch_size,
         max_candidate_post_action_pairs,
+        sample_source=sample_source,
+        ads_head_masking=ads_head_masking,
     )
 
     candidate_seq_with_negatives = apply_global_negative_sampling(
@@ -1004,6 +1045,8 @@ def from_record_batch(
         num_global_negatives_per_example,
         batch_size,
         global_post_sids=global_post_sids,
+        sample_source=sample_source,
+        ads_head_masking=ads_head_masking,
     )
 
     user_ip_ids = np.zeros(batch_size, dtype=np.int64)
@@ -1031,15 +1074,7 @@ def from_record_batch(
             if "sampleWeight" in record_batch.schema.names
             else np.ones((batch_size, 1), dtype=np.float32)
         ),
-        sample_source=(
-            record_batch.column("sample_source")
-            .fill_null(0)
-            .to_numpy(zero_copy_only=False)
-            .astype(np.int8)
-            .reshape(-1, 1)
-            if "sample_source" in record_batch.schema.names
-            else np.zeros((batch_size, 1), dtype=np.int8)
-        ),
+        sample_source=sample_source,
     )
     batch["num_positive_candidates"] = (
         num_positive_per_user.reshape(-1, 1)
@@ -1056,6 +1091,9 @@ def apply_negative_sampling(
     num_negatives_per_example: int,
     batch_size: int,
     max_candidate_post_action_pairs: int,
+    *,
+    sample_source: npt.NDArray[np.integer] | None = None,
+    ads_head_masking: bool = False,
 ) -> PostSeq:
     if num_negatives_per_example == 0:
         return post_seq
@@ -1118,7 +1156,9 @@ def apply_negative_sampling(
     )
     new_product_surface = np.zeros((batch_size, total_candidate_slots), dtype=product_surface.dtype)
     new_client_app_id = np.zeros((batch_size, total_candidate_slots), dtype=client_app_id.dtype)
-    new_trained_mask = np.ones((batch_size, total_candidate_slots), dtype=np.bool_)
+    new_trained_mask = np.ones(
+        (batch_size, total_candidate_slots, actions.shape[-1]), dtype=np.bool_
+    )
     new_post_creation_ts_sec = np.zeros(
         (batch_size, total_candidate_slots), dtype=post_creation_ts_sec.dtype
     )
@@ -1308,6 +1348,17 @@ def apply_negative_sampling(
                 curr_user_idx, start_slot, end_slot, post_src=curr_user_idx, query_src=neg_user_idx
             )
 
+    negative_slice = slice(max_candidate_post_action_pairs, total_candidate_slots)
+    new_trained_mask[:, negative_slice] = build_trained_candidate_mask(
+        new_actions[:, negative_slice].astype(np.bool_, copy=False),
+        sample_source,
+        np.full(
+            (batch_size, total_candidate_slots - max_candidate_post_action_pairs),
+            CONVERSION_KEEP_WEB | CONVERSION_KEEP_APP,
+            dtype=np.uint8,
+        ),
+        ads_head_masking=ads_head_masking,
+    )
     return PostSeq(
         impr_ts=new_impr_ts,
         actions=new_actions,
@@ -1342,6 +1393,9 @@ def apply_global_negative_sampling(
     num_global_negatives_per_example: int,
     batch_size: int,
     global_post_sids: npt.NDArray | None = None,
+    *,
+    sample_source: npt.NDArray[np.integer] | None = None,
+    ads_head_masking: bool = False,
 ) -> PostSeq:
     if num_global_negatives_per_example == 0:
         return post_seq
@@ -1391,7 +1445,6 @@ def apply_global_negative_sampling(
         dtype=client_app_id.dtype,
     )
     _gn_trained_mask = post_seq.get("trained_candidate_mask")
-    new_gn_trained_mask = np.ones((batch_size, expanded_candidate_slots), dtype=np.bool_)
     new_post_creation_ts_sec = np.zeros(
         (batch_size, expanded_candidate_slots),
         dtype=post_creation_ts_sec.dtype,
@@ -1425,8 +1478,6 @@ def apply_global_negative_sampling(
     new_ip_hashes[:, original_slice, :] = ip_hashes
     new_product_surface[:, original_slice] = product_surface
     new_client_app_id[:, original_slice] = client_app_id
-    if _gn_trained_mask is not None:
-        new_gn_trained_mask[:, original_slice] = _gn_trained_mask
     new_post_creation_ts_sec[:, original_slice] = post_creation_ts_sec
     new_continuous_actions[:, original_slice, :] = continuous_actions
     if categorical_features.shape[2] > 0:
@@ -1483,8 +1534,29 @@ def apply_global_negative_sampling(
         )
         new_actions[:, original_slice, :] = actions
         new_actions[:, expanded_slice, action_type_map["ClientTweetRecapNotDwelled"]] = 1
+        new_gn_trained_mask = np.ones(
+            (batch_size, expanded_candidate_slots, actions.shape[-1]), dtype=np.bool_
+        )
+        if _gn_trained_mask is not None:
+            new_gn_trained_mask[:, original_slice] = _gn_trained_mask
+        new_gn_trained_mask[:, expanded_slice] = build_trained_candidate_mask(
+            new_actions[:, expanded_slice].astype(np.bool_, copy=False),
+            sample_source,
+            np.full(
+                (batch_size, num_global_negatives_per_example),
+                CONVERSION_KEEP_WEB | CONVERSION_KEEP_APP,
+                dtype=np.uint8,
+            ),
+            ads_head_masking=ads_head_masking,
+        )
     else:
         new_actions = None
+        new_gn_trained_mask = None
+        if _gn_trained_mask is not None:
+            new_gn_trained_mask = np.ones(
+                (batch_size, expanded_candidate_slots, _gn_trained_mask.shape[-1]), dtype=np.bool_
+            )
+            new_gn_trained_mask[:, original_slice] = _gn_trained_mask
     if search_query_embeddings is not None:
         search_query_embedding_dim = search_query_embeddings.shape[2]
         new_search_query_embeddings = np.zeros(

@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::fmt::Display;
 use std::future::Future;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 use tracing::debug;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
+use xai_x_rpc::WithBudget;
 
 use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError};
 use crate::rules::SafetyLevel;
@@ -15,11 +15,17 @@ const HYDRATOR_LATENCY_MS: &str = "vf_hydrator_latency_ms";
 const HYDRATOR_KEYS: &str = "vf_hydrator_keys";
 const HYDRATOR_TWEET_IDS: &str = "vf_hydrator_tweet_ids";
 const HYDRATOR_BATCH_SIZE: &str = "vf_hydrator_batch_size";
+const HYDRATOR_EXPANDED_BATCHES: &str = "vf_hydrator_expanded_batches";
+const HYDRATOR_EXPANDED_KEYS: &str = "vf_hydrator_expanded_keys";
+const HYDRATOR_UNASKED_KEYS: &str = "vf_hydrator_unasked_keys";
 const FALLBACK_CACHE_KEYS: &str = "vf_fallback_cache_keys";
 const FALLBACK_CACHE_ENTRIES: &str = "vf_fallback_cache_entries";
 const AUTHOR_LABELS: &str = "vf_author_labels";
+const VIEWER_COUNTRY: &str = "vf_viewer_country";
+const WINGMAN_SECOND_DEGREE: &str = "vf_wingman_second_degree";
+const FLOCK_MISSING_KEYS: &str = "vf_flock_missing_keys";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum HydratorOutcome {
     Success,
@@ -28,20 +34,14 @@ pub(crate) enum HydratorOutcome {
     Error,
 }
 
-pub(crate) fn batch_outcome<K, V, E>(map: &HashMap<K, Result<V, E>>) -> HydratorOutcome {
-    if !map.is_empty() && map.values().all(|result| result.is_err()) {
-        HydratorOutcome::Error
-    } else {
-        HydratorOutcome::Success
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct KeyedResultCounts {
     success_keys: usize,
+    partial_keys: usize,
     timeout_keys: usize,
     error_keys: usize,
     success_candidates: usize,
+    partial_candidates: usize,
     timeout_candidates: usize,
     error_candidates: usize,
 }
@@ -49,17 +49,25 @@ struct KeyedResultCounts {
 impl KeyedResultCounts {
     fn from_batch<K, V>(
         candidate_count_by_key: &HashMap<K, usize>,
-        batch: &HydrationBatch<K, V>,
+        batches: &impl AsRef<[HydrationBatch<K, V>]>,
     ) -> Self
     where
         K: Eq + Hash,
     {
         let mut counts = Self::default();
         for (key, candidate_count) in candidate_count_by_key {
-            match batch.hydrated(key) {
+            let hydrated = batches
+                .as_ref()
+                .iter()
+                .find_map(|batch| batch.hydrated(key));
+            match hydrated {
                 Some(Hydrated::Found(_) | Hydrated::NotFound) => {
                     counts.success_keys += 1;
                     counts.success_candidates += candidate_count;
+                }
+                Some(Hydrated::Partial(_)) => {
+                    counts.partial_keys += 1;
+                    counts.partial_candidates += candidate_count;
                 }
                 Some(Hydrated::Failed(HydrationError::Timeout)) => {
                     counts.timeout_keys += 1;
@@ -75,68 +83,20 @@ impl KeyedResultCounts {
     }
 
     fn outcome(self) -> HydratorOutcome {
+        let answered = self.success_keys + self.partial_keys;
         let failures = self.timeout_keys + self.error_keys;
-        match (self.success_keys, failures) {
-            (_, 0) => HydratorOutcome::Success,
-            (0, _) if self.timeout_keys > 0 && self.error_keys == 0 => HydratorOutcome::Timeout,
+        match (answered, failures) {
+            (_, 0) if self.partial_keys == 0 => HydratorOutcome::Success,
+            (0, _) if self.error_keys == 0 => HydratorOutcome::Timeout,
             (0, _) => HydratorOutcome::Error,
             _ => HydratorOutcome::Partial,
         }
     }
 }
 
-pub(crate) fn record_hydrator_request(
-    client: &'static str,
-    method: &'static str,
-    safety_level: SafetyLevel,
-    outcome: HydratorOutcome,
-    candidate_count: usize,
-    latency_ms: f64,
-) {
-    if outcome != HydratorOutcome::Success {
-        debug!(
-            client,
-            method,
-            outcome = <&str>::from(outcome),
-            candidate_count,
-            "Hydrator fail-open"
-        );
-    }
-    incr(
-        HYDRATOR_REQUESTS,
-        &[
-            ("client", client),
-            ("method", method),
-            ("outcome", outcome.into()),
-            ("safety_level", safety_level.into()),
-        ],
-        1,
-    );
-    incr_nonzero(
-        HYDRATOR_TWEET_IDS,
-        &[
-            ("client", client),
-            ("method", method),
-            ("result", outcome.into()),
-            ("safety_level", safety_level.into()),
-        ],
-        candidate_count as u64,
-    );
-    observe(
-        HYDRATOR_LATENCY_MS,
-        &[
-            ("client", client),
-            ("method", method),
-            ("safety_level", safety_level.into()),
-        ],
-        latency_ms,
-        HistogramBuckets::Bucket50To500,
-    );
-}
-
 fn record_keyed_hydrator_request(
-    client: &'static str,
-    method: &'static str,
+    client: &str,
+    method: &str,
     safety_level: SafetyLevel,
     counts: KeyedResultCounts,
     latency_ms: f64,
@@ -148,6 +108,7 @@ fn record_keyed_hydrator_request(
             method,
             outcome = <&str>::from(outcome),
             success_keys = counts.success_keys,
+            partial_keys = counts.partial_keys,
             timeout_keys = counts.timeout_keys,
             error_keys = counts.error_keys,
             "Hydrator fail-open"
@@ -164,14 +125,31 @@ fn record_keyed_hydrator_request(
         1,
     );
     for (result, keys, candidates) in [
-        ("success", counts.success_keys, counts.success_candidates),
-        ("timeout", counts.timeout_keys, counts.timeout_candidates),
-        ("error", counts.error_keys, counts.error_candidates),
+        (
+            HydratorOutcome::Success,
+            counts.success_keys,
+            counts.success_candidates,
+        ),
+        (
+            HydratorOutcome::Partial,
+            counts.partial_keys,
+            counts.partial_candidates,
+        ),
+        (
+            HydratorOutcome::Timeout,
+            counts.timeout_keys,
+            counts.timeout_candidates,
+        ),
+        (
+            HydratorOutcome::Error,
+            counts.error_keys,
+            counts.error_candidates,
+        ),
     ] {
         let labels = [
             ("client", client),
             ("method", method),
-            ("result", result),
+            ("result", result.into()),
             ("safety_level", safety_level.into()),
         ];
         incr_nonzero(HYDRATOR_KEYS, &labels, keys as u64);
@@ -209,7 +187,49 @@ pub(crate) fn record_author_labels(mapped: usize, unmapped: usize) {
     }
 }
 
-pub(crate) fn record_batch_size(client: &'static str, candidate_count: usize) {
+pub(crate) fn record_viewer_country(result: &'static str, safety_level: SafetyLevel) {
+    incr(
+        VIEWER_COUNTRY,
+        &[("result", result), ("safety_level", safety_level.into())],
+        1,
+    );
+}
+
+pub(crate) fn record_wingman_second_degree(
+    in_network: usize,
+    not_in_network: usize,
+    safety_level: SafetyLevel,
+) {
+    for (result, count) in [
+        ("in_network", in_network),
+        ("not_in_network", not_in_network),
+    ] {
+        incr_nonzero(
+            WINGMAN_SECOND_DEGREE,
+            &[("result", result), ("safety_level", safety_level.into())],
+            count as u64,
+        );
+    }
+}
+
+pub(crate) fn record_flock_missing_keys(
+    client: &str,
+    method: &str,
+    safety_level: SafetyLevel,
+    keys: usize,
+) {
+    incr_nonzero(
+        FLOCK_MISSING_KEYS,
+        &[
+            ("client", client),
+            ("method", method),
+            ("safety_level", safety_level.into()),
+        ],
+        keys as u64,
+    );
+}
+
+pub(crate) fn record_batch_size(client: &str, candidate_count: usize) {
     observe(
         HYDRATOR_BATCH_SIZE,
         &[("client", client)],
@@ -218,20 +238,33 @@ pub(crate) fn record_batch_size(client: &'static str, candidate_count: usize) {
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_expanded_batch(client: &str, method: &str, keys: usize) {
+    let labels = [("client", client), ("method", method)];
+    incr(HYDRATOR_EXPANDED_BATCHES, &labels, 1);
+    incr_nonzero(HYDRATOR_EXPANDED_KEYS, &labels, keys as u64);
+}
+
+pub(crate) fn record_unasked_keys(client: &str, method: &str, keys: usize) {
+    incr_nonzero(
+        HYDRATOR_UNASKED_KEYS,
+        &[("client", client), ("method", method)],
+        keys as u64,
+    );
+}
+
 pub(crate) fn record_fallback_cache_keys(
     facet: &'static str,
     fresh: usize,
     stale: usize,
-    stale_not_found: usize,
     not_found: usize,
+    partial: usize,
     unavailable: usize,
 ) {
     for (result, count) in [
         ("fresh", fresh),
         ("stale", stale),
-        ("stale_not_found", stale_not_found),
         ("not_found", not_found),
+        ("partial", partial),
         ("unavailable", unavailable),
     ] {
         incr_nonzero(
@@ -242,106 +275,33 @@ pub(crate) fn record_fallback_cache_keys(
     }
 }
 
-pub(crate) async fn timed_rpc<T: Default>(
-    client: &'static str,
-    method: &'static str,
-    safety_level: SafetyLevel,
-    candidate_count: usize,
-    timeout: Duration,
-    classify: impl FnOnce(&T) -> HydratorOutcome,
-    fut: impl Future<Output = T>,
-) -> T {
-    let start = Instant::now();
-    let (outcome, body) = match tokio::time::timeout(timeout, fut).await {
-        Ok(body) => {
-            let outcome = classify(&body);
-            (outcome, body)
-        }
-        Err(_) => (HydratorOutcome::Timeout, T::default()),
-    };
-    record_hydrator_request(
-        client,
-        method,
-        safety_level,
-        outcome,
-        candidate_count,
-        start.elapsed().as_secs_f64() * 1000.0,
-    );
-    body
-}
-
-pub(crate) async fn timed_results<K, V, E>(
-    client: &'static str,
-    method: &'static str,
+pub(crate) async fn timed_results<K, V, A>(
+    client: &str,
+    method: &str,
     safety_level: SafetyLevel,
     candidate_count_by_key: &HashMap<K, usize>,
     timeout: Duration,
-    fut: impl Future<Output = HashMap<K, Result<Option<V>, E>>>,
-) -> HydrationBatch<K, V>
+    fut: impl Future<Output = A>,
+    timed_out: impl FnOnce(HydrationBatch<K, V>) -> A,
+) -> A
 where
     K: Copy + Eq + Hash,
-    E: Display,
-{
-    timed_batch(
-        client,
-        method,
-        safety_level,
-        candidate_count_by_key,
-        timeout,
-        fut,
-        |body| HydrationBatch::from_results(candidate_count_by_key.keys().copied(), body),
-    )
-    .await
-}
-
-pub(crate) async fn timed_values<K, V>(
-    client: &'static str,
-    method: &'static str,
-    safety_level: SafetyLevel,
-    candidate_count_by_key: &HashMap<K, usize>,
-    timeout: Duration,
-    fut: impl Future<Output = HashMap<K, V>>,
-) -> HydrationBatch<K, V>
-where
-    K: Copy + Eq + Hash,
-{
-    timed_batch(
-        client,
-        method,
-        safety_level,
-        candidate_count_by_key,
-        timeout,
-        fut,
-        |body| HydrationBatch::from_values(candidate_count_by_key.keys().copied(), body),
-    )
-    .await
-}
-
-async fn timed_batch<K, V, F: Future>(
-    client: &'static str,
-    method: &'static str,
-    safety_level: SafetyLevel,
-    candidate_count_by_key: &HashMap<K, usize>,
-    timeout: Duration,
-    fut: F,
-    into_batch: impl FnOnce(F::Output) -> HydrationBatch<K, V>,
-) -> HydrationBatch<K, V>
-where
-    K: Copy + Eq + Hash,
+    A: AsRef<[HydrationBatch<K, V>]>,
 {
     let start = Instant::now();
-    let batch = match tokio::time::timeout(timeout, fut).await {
-        Ok(body) => into_batch(body),
-        Err(_) => HydrationBatch::timed_out(candidate_count_by_key.keys().copied()),
-    };
+    let answer = fut.with_budget(timeout).await.unwrap_or_else(|_| {
+        timed_out(HydrationBatch::timed_out(
+            candidate_count_by_key.keys().copied(),
+        ))
+    });
     record_keyed_hydrator_request(
         client,
         method,
         safety_level,
-        KeyedResultCounts::from_batch(candidate_count_by_key, &batch),
+        KeyedResultCounts::from_batch(candidate_count_by_key, &answer),
         start.elapsed().as_secs_f64() * 1000.0,
     );
-    batch
+    answer
 }
 
 fn incr(metric: &str, labels: &[(&str, &str)], count: u64) {
@@ -374,9 +334,11 @@ fn observe(metric: &str, labels: &[(&str, &str)], value: f64, buckets: Histogram
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::identity;
 
     #[test]
-    fn dashboard_generator_pins_the_author_labels_metric_name() {
+    fn dashboard_generator_pins_the_author_labels_root_edges_method_wingman_metric_and_key_results()
+    {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
         let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
         let path = if std::path::Path::new(cargo).exists() {
@@ -387,24 +349,89 @@ mod tests {
         let dashboard =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         assert!(dashboard.contains(&format!("AUTHOR_LABELS_METRIC = \"{AUTHOR_LABELS}\"")));
+        use crate::hydration::Hydrator;
+        let root_edges = format!(
+            "{}+{}",
+            Hydrator::RootFollowsViewer.spec().label.1,
+            Hydrator::SuperFollowsRoot.spec().label.1
+        );
+        assert!(dashboard.contains(&format!("CC_ROOT_EDGES_METHOD = \"{root_edges}\"")));
+        assert!(dashboard.contains(&format!(
+            "WINGMAN_SECOND_DEGREE_METRIC = \"{WINGMAN_SECOND_DEGREE}\""
+        )));
+        let key_results: Vec<&str> = <HydratorOutcome as strum::VariantArray>::VARIANTS
+            .iter()
+            .map(|&result| result.into())
+            .collect();
+        assert!(dashboard.contains(&format!(
+            "HYDRATOR_KEY_RESULTS = \"{}\"",
+            key_results.join("|")
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_deadline_cancels_a_hop_before_the_static_ceiling() {
+        let start = tokio::time::Instant::now();
+        let context = crate::hydration::request_context(start, Some(Duration::from_millis(40)));
+        let result = context
+            .scope(std::future::pending::<()>().with_budget(crate::hydration::HYDRATION_TIMEOUT))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(start.elapsed(), Duration::from_millis(30));
     }
 
     #[test]
-    fn empty_batch_is_success() {
-        let map: HashMap<u64, Result<u8, ()>> = HashMap::new();
-        assert_eq!(batch_outcome(&map), HydratorOutcome::Success);
-    }
+    fn partial_keys_make_a_partial_call_and_a_failed_one_key_call_is_an_error() {
+        use crate::hydration::decode::author::decode_authors;
+        use xai_core_entities::entities::{GizmoduckUserResult, UserResponseState};
+        let user = |state| {
+            Ok::<_, ()>(Some(GizmoduckUserResult {
+                user: Some(Default::default()),
+                response_state: Some(state),
+            }))
+        };
+        let authors = |states: &[(u64, UserResponseState)]| {
+            let results = states
+                .iter()
+                .map(|&(author, state)| (author, user(state)))
+                .collect::<HashMap<_, _>>();
+            let expected: Vec<u64> = results.keys().copied().collect();
+            decode_authors(HydrationBatch::from_results(expected, results))
+        };
+        let counts = HashMap::from([(10, 1), (20, 2)]);
 
-    #[test]
-    fn all_keys_errored_is_error() {
-        let map: HashMap<u64, Result<u8, ()>> = HashMap::from([(1, Err(())), (2, Err(()))]);
-        assert_eq!(batch_outcome(&map), HydratorOutcome::Error);
-    }
+        let one_partial = KeyedResultCounts::from_batch(
+            &counts,
+            &authors(&[
+                (10, UserResponseState::Found),
+                (20, UserResponseState::Partial),
+            ]),
+        );
+        assert_eq!(
+            (
+                one_partial.success_keys,
+                one_partial.partial_keys,
+                one_partial.partial_candidates
+            ),
+            (1, 1, 2)
+        );
+        assert_eq!(one_partial.outcome(), HydratorOutcome::Partial);
+        let all_partial = KeyedResultCounts::from_batch(
+            &counts,
+            &authors(&[
+                (10, UserResponseState::Failed),
+                (20, UserResponseState::Partial),
+            ]),
+        );
+        assert_eq!(all_partial.outcome(), HydratorOutcome::Partial);
 
-    #[test]
-    fn any_success_preserves_legacy_batch_success() {
-        let map: HashMap<u64, Result<u8, ()>> = HashMap::from([(1, Err(())), (2, Ok(7))]);
-        assert_eq!(batch_outcome(&map), HydratorOutcome::Success);
+        let viewer: HydrationBatch<u64, u8> = HydrationBatch::from_results(
+            [50],
+            HashMap::from([(50, Err::<Option<u8>, _>("gizmoduck unavailable"))]),
+        );
+        let viewer = KeyedResultCounts::from_batch(&HashMap::from([(50, 1)]), &viewer);
+        assert_eq!((viewer.error_keys, viewer.error_candidates), (1, 1));
+        assert_eq!(viewer.outcome(), HydratorOutcome::Error);
     }
 
     #[test]
@@ -439,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn timed_results_outer_timeout_fails_every_expected_key() {
         let expected = HashMap::from([(1, 2), (2, 3)]);
-        let never = std::future::pending::<HashMap<u64, Result<Option<u8>, &str>>>();
+        let never = std::future::pending::<HydrationBatch<u64, u8>>();
 
         let returned = timed_results(
             "test",
@@ -448,33 +475,15 @@ mod tests {
             &expected,
             Duration::ZERO,
             never,
+            identity,
         )
         .await;
 
-        assert!(matches!(
-            returned.hydrated(&1),
-            Some(Hydrated::Failed(HydrationError::Timeout))
-        ));
-    }
-
-    #[tokio::test]
-    async fn timed_values_backfills_absent_expected_keys() {
-        let expected = HashMap::from([(1, 1), (2, 1)]);
-
-        let returned = timed_values(
-            "test",
-            "values",
-            SafetyLevel::TimelineHome,
-            &expected,
-            Duration::from_secs(1),
-            std::future::ready(HashMap::from([(1, 7)])),
-        )
-        .await;
-
-        assert_eq!(returned.get(&1), Some(&7));
-        assert!(matches!(
-            returned.hydrated(&2),
-            Some(Hydrated::Failed(HydrationError::MissingResponse))
-        ));
+        for key in [1, 2] {
+            assert!(matches!(
+                returned.hydrated(&key),
+                Some(Hydrated::Failed(HydrationError::Timeout))
+            ));
+        }
     }
 }
