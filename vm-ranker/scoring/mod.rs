@@ -59,8 +59,14 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
             (None, None) => {}
         }
 
+        let config = ctx.config.clone();
         return tokio::task::spawn_blocking(move || {
-            let value_model = value_model::compute(&req, params.as_ref(), compute_value_model);
+            let value_model = value_model::compute(
+                &req,
+                params.as_ref(),
+                config.as_deref().map(RankingConfig::author_rules),
+                compute_value_model,
+            );
             let served_pre_dpp = served_pre_dpp_scores(&req, value_model.as_ref());
             let mut memo = EmbeddingMemo::default();
             let served = dpp_model::rank_with_memo(&req, &served_pre_dpp, &dpp, &mut memo);
@@ -70,7 +76,12 @@ pub async fn rank(req: RankRequest, ctx: RankContext) -> Result<Vec<RankedCandid
         .map_err(|e| format!("DPP spawn_blocking failed: {e}"));
     }
 
-    let value_model = value_model::compute(&req, params.as_ref(), compute_value_model);
+    let value_model = value_model::compute(
+        &req,
+        params.as_ref(),
+        ctx.config.as_deref().map(RankingConfig::author_rules),
+        compute_value_model,
+    );
     let served = served_pre_dpp_scores(&req, value_model.as_ref())
         .iter()
         .map(|s| s.unwrap_or(0.0))
@@ -123,6 +134,10 @@ fn ranked_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xai_feature_switches::{
+        BucketMembership, ExperimentBucket, ExperimentBucketsChooser, FeatureSwitches,
+        NullBucketImpressor, Recipient,
+    };
     use xai_value_model::{
         compute_value_scores, CandidateScoringInputs, QueryScoringContext, ValueModelWeights,
     };
@@ -266,6 +281,74 @@ rust_home_mixer:
         for (r, c) in passthrough.iter().zip(&candidates) {
             assert_eq!(r.tweet_id, c.tweet_id);
             assert_eq!(r.score, c.score.unwrap());
+        }
+    }
+
+    #[derive(Debug)]
+    struct TreatmentAuthor(u64);
+
+    impl ExperimentBucketsChooser for TreatmentAuthor {
+        fn choose_buckets(&self, _recipient: &dyn Recipient) -> BucketMembership {
+            BucketMembership::new()
+        }
+
+        fn choose_bucket_without_overrides(
+            &self,
+            experiment_key: &str,
+            recipient: &dyn Recipient,
+        ) -> Option<ExperimentBucket> {
+            (recipient.user_id()? == self.0)
+                .then(|| ExperimentBucket::new(experiment_key, "treatment").with_version(1))
+        }
+    }
+
+    #[tokio::test]
+    async fn author_exploration_bonus_boosts_treatment_authors() {
+        let yaml = format!(
+            "{FEATURES_YAML}\n{}",
+            r#"
+rust_home_mixer_author_exploration:
+  parameters:
+    rust_home_mixer_author_exploration_bonus:
+      type: double
+      default: 0.0
+  rules:
+    - query: "[author_exploration author_bucket_membership treatment]"
+      values:
+        rust_home_mixer_author_exploration_bonus: 0.2
+"#
+        );
+        let fs = FeatureSwitches::with_options(
+            xai_feature_switches::load_yaml_string(&yaml).unwrap(),
+            Arc::new(TreatmentAuthor(10)),
+            Arc::new(NullBucketImpressor),
+            None,
+            false,
+        )
+        .unwrap();
+        let author_config = Arc::new(RankingConfig::new(Arc::new(fs)));
+        let req = request(
+            vec![
+                candidate(1, 10, 0.5, None, true, 0.0),
+                candidate(2, 20, 0.5, None, true, 0.0),
+            ],
+            "US",
+        );
+
+        for pre_offset in [false, true] {
+            let mut req = req.clone();
+            req.viewer.as_mut().unwrap().fs_overrides.insert(
+                "rust_home_mixer_multiplier_pre_offset".to_string(),
+                pre_offset.to_string(),
+            );
+            let base = rank(req.clone(), context(config())).await.unwrap();
+            let boosted = rank(req, context(Arc::clone(&author_config)))
+                .await
+                .unwrap();
+
+            assert!((boosted[0].score - (base[0].score + 0.2)).abs() < 1e-12);
+            assert_eq!(boosted[1].score, base[1].score);
+            assert_eq!(boosted[0].weighted_score, base[0].weighted_score);
         }
     }
 }

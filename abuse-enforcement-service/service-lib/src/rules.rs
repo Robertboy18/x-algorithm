@@ -847,8 +847,8 @@ mod tests {
                 fn post_facts(author: UserFacts, score_labels: Vec<String>) -> Facts {
         let mut f = base_facts();
         f.entity_type = EntityType::Post;
-        f.entity_id = 999; 
-        f.user_id = 1; 
+        f.entity_id = 999;
+        f.user_id = 1;
         f.score.labels = score_labels;
         f.entity = EntityFacts::Post(PostFacts {
             present: false,
@@ -1398,14 +1398,14 @@ rules:
     #[test]
     fn mock_cred_follower_count_skips() {
         let mut f = base_facts();
-        f.cred_mut().follower_count = Some(1234); 
+        f.cred_mut().follower_count = Some(1234);
         assert_eq!(d(&f), Decision::Skip("cred_skip".into()));
     }
 
     #[test]
     fn mock_cred_score_skips() {
         let mut f = base_facts();
-        f.cred_mut().score = Some(7.5); 
+        f.cred_mut().score = Some(7.5);
         assert_eq!(d(&f), Decision::Skip("cred_skip".into()));
     }
 

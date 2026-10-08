@@ -1,4 +1,5 @@
 pub mod batch;
+pub(crate) mod community_source;
 mod decode;
 mod execute;
 pub(crate) mod fallback_cache;
@@ -12,10 +13,10 @@ pub mod tweet_source;
 use crate::models::{
     ClientCapability, HydratedTweetCandidate, RawCandidate, TweetId, ViewerFeatures,
 };
-pub(crate) use decode::author::fallback_cache as author_fallback_cache;
-pub(crate) use decode::tweet::pure_core_fallback_cache;
+pub(crate) use decode::author::{AuthorFallbackCache, fallback_cache as author_fallback_cache};
+pub(crate) use decode::tweet::{TweetFallbackCache, tweet_fallback_cache};
 pub(crate) use plan::HydrationPlan;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +62,12 @@ pub enum Hydrator {
     RootFollowsViewerSecondDegree,
     SuperFollowsRoot,
     ViewerCountry,
+    CommunityModeration,
+    CommunityModerator,
+    CommunityViewerRemoved,
+    ArticleLifecycle,
+    TrustedFriends,
+    OutsideNarrowcastPlace,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -130,7 +137,7 @@ impl<'a> HydrationRequest<'a> {
         }
     }
 
-        pub(crate) fn with_retweet_sources(self, is_expanding_retweet_sources: bool) -> Self {
+    pub(crate) fn with_retweet_sources(self, is_expanding_retweet_sources: bool) -> Self {
         Self {
             is_expanding_retweet_sources,
             ..self
@@ -140,8 +147,9 @@ impl<'a> HydrationRequest<'a> {
 
 pub(crate) fn candidate_count_by_key<K: Eq + Hash>(
     keys: impl Iterator<Item = K>,
-) -> HashMap<K, usize> {
-    let mut candidate_count_by_key = HashMap::with_capacity(keys.size_hint().0);
+) -> FxHashMap<K, usize> {
+    let mut candidate_count_by_key =
+        FxHashMap::with_capacity_and_hasher(keys.size_hint().0, Default::default());
     for key in keys {
         *candidate_count_by_key.entry(key).or_default() += 1;
     }
@@ -150,7 +158,7 @@ pub(crate) fn candidate_count_by_key<K: Eq + Hash>(
 
 pub(crate) struct Hydration {
     viewer: ViewerFeatures,
-    tweets: HashMap<TweetId, HydratedTweet>,
+    tweets: FxHashMap<TweetId, HydratedTweet>,
     has_fetched_sources: bool,
 }
 
@@ -163,37 +171,88 @@ impl Hydration {
         self.tweets.get(&id)
     }
 
-        pub(crate) fn has_fetched_sources(&self) -> bool {
+    pub(crate) fn has_fetched_sources(&self) -> bool {
         self.has_fetched_sources
     }
 }
 
-pub(crate) struct HydratedTweet {
-        candidate: Option<HydratedTweetCandidate>,
+#[expect(
+    clippy::large_enum_variant,
+    reason = "nearly every tweet resolves, so a box would cost an allocation per tweet"
+)]
+pub(crate) enum HydratedTweet {
+    Resolved {
+        candidate: HydratedTweetCandidate,
         has_failed_node: bool,
-    source_tweet_id: Option<TweetId>,
-    safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
+        source_tweet_id: Option<TweetId>,
+        safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
+    },
+    Unresolved {
+        reason: Unresolved,
+        safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Unresolved {
+    pub(crate) lookup: Lookup,
+    pub(crate) cause: Cause,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum Lookup {
+    Tweet,
+    Author,
+    SharedTweet,
+    SharedAuthor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum Cause {
+    NotFound,
+    Failed,
 }
 
 impl HydratedTweet {
     pub(crate) fn candidate(&self) -> Option<&HydratedTweetCandidate> {
-        self.candidate.as_ref()
-    }
-
-    pub(crate) fn has_failed_node(&self) -> bool {
-        self.has_failed_node
-    }
-
-        pub(crate) fn is_evaluable(&self) -> bool {
-        self.candidate.is_some() && !self.has_failed_node
+        match self {
+            Self::Resolved { candidate, .. } => Some(candidate),
+            Self::Unresolved { .. } => None,
+        }
     }
 
     pub(crate) fn source_tweet_id(&self) -> Option<TweetId> {
-        self.source_tweet_id
+        match self {
+            Self::Resolved {
+                source_tweet_id, ..
+            } => *source_tweet_id,
+            Self::Unresolved { .. } => None,
+        }
+    }
+
+    pub(crate) fn source_to_merge(&self) -> Option<TweetId> {
+        match self {
+            Self::Resolved {
+                has_failed_node: false,
+                source_tweet_id,
+                ..
+            } => *source_tweet_id,
+            Self::Resolved {
+                has_failed_node: true,
+                ..
+            }
+            | Self::Unresolved { .. } => None,
+        }
     }
 
     pub(crate) fn safety_labels(&self) -> Option<&Arc<vf_pb::SafetyLabelMap>> {
-        self.safety_labels.as_ref()
+        match self {
+            Self::Resolved { safety_labels, .. } | Self::Unresolved { safety_labels, .. } => {
+                safety_labels.as_ref()
+            }
+        }
     }
 }
 

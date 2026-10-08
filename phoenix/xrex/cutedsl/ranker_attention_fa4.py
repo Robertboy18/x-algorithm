@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 
-
 _FA4_KERNEL_CACHE = {}
 
 

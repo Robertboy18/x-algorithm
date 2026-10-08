@@ -1,22 +1,36 @@
 use crate::clients::about_this_account_client::AboutThisAccountClient;
+use crate::clients::article_client::ArticleClient;
 use crate::clients::gizmoduck_client::GizmoduckLookup;
 use crate::clients::socialgraph_client::{EdgeQuery, SocialgraphClient};
+use crate::clients::trusted_friends_client::TrustedFriendsClient;
+use crate::clients::user_location_client::UserLocationClient;
 use crate::clients::wingman_client::WingmanClient;
 use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError, RawHydrationBatch};
-use crate::hydration::decode::author::{decode_authors, AuthorFallbackCache, DecodedAuthor};
-use crate::hydration::decode::tweet::{pure_core, PureCoreFallbackCache};
-use crate::hydration::decode::viewer::{decode_viewer, DecodedViewer};
-use crate::hydration::tweet_source::TweetSource;
-use crate::models::{PureCore, TweetFeatures};
+use crate::hydration::community_source::{CommunityPost, CommunitySource};
+use crate::hydration::decode::article::decode_lifecycle;
+use crate::hydration::decode::author::AuthorFallbackCache;
+pub(crate) use crate::hydration::decode::author::{author_batch, DecodedAuthor};
+use crate::hydration::decode::tweet::{pure_core, TweetFallbackCache};
+use crate::hydration::decode::viewer::decode_viewer;
+pub(crate) use crate::hydration::decode::viewer::DecodedViewer;
+use crate::hydration::tweet_source::{decode_tweet, TweetSource};
+use crate::models::{ArticleLifecycle, CommunityModeration, PureCore, TweetFeatures};
 use crate::safety_label_source::SafetyLabelSource;
+pub(crate) use exchange::{Bytes, EdgeKey, Exchange, Id, Scope};
+use prost::Message;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+use std::iter;
 use std::sync::Arc;
 use tracing::warn;
 use wingman_client::Exists;
-use xai_core_entities::entities::ConversationControl;
+use xai_core_entities::entities::{ConversationControl, GizmoduckUser, PureCoreData};
 use xai_core_entities::gizmoduck_client::{GizmoduckClient, QueryFields};
 use xai_core_entities::tweet_entity_service_client::TESClient;
 use xai_visibility_filtering_proto as vf_pb;
+
+pub(crate) mod exchange;
 
 #[tonic::async_trait]
 pub(crate) trait Sources: Send + Sync {
@@ -60,7 +74,30 @@ pub(crate) trait Sources: Send + Sync {
         root_author_ids: &[u64],
     ) -> RawHydrationBatch<bool>;
 
-    fn pure_core_cache(&self) -> Option<&PureCoreFallbackCache> {
+    async fn community_moderations(
+        &self,
+        posts: &[CommunityPost],
+    ) -> RawHydrationBatch<CommunityModeration>;
+
+    async fn community_moderators(
+        &self,
+        viewer_id: u64,
+        community_ids: &[u64],
+    ) -> RawHydrationBatch<bool>;
+
+    async fn community_viewer_removals(
+        &self,
+        viewer_id: u64,
+        community_ids: &[u64],
+    ) -> RawHydrationBatch<bool>;
+
+    async fn article_lifecycles(&self, article_ids: &[u64]) -> RawHydrationBatch<ArticleLifecycle>;
+
+    async fn trusted_friends(&self, viewer_id: u64, list_ids: &[u64]) -> RawHydrationBatch<bool>;
+
+    async fn outside_places(&self, viewer_id: u64, place_ids: &[u64]) -> RawHydrationBatch<bool>;
+
+    fn tweet_cache(&self) -> Option<&TweetFallbackCache> {
         None
     }
 
@@ -69,17 +106,15 @@ pub(crate) trait Sources: Send + Sync {
     }
 }
 
-fn landed_edges(
+fn edge_batches(
     queries: &[EdgeQuery],
-    sets: Option<Vec<Option<HashSet<u64>>>>,
+    sets: Option<&[Option<HashSet<u64>>]>,
 ) -> Vec<RawHydrationBatch<bool>> {
     queries
         .iter()
         .enumerate()
         .map(|(position, query)| {
-            let set = sets
-                .as_ref()
-                .map(|sets| sets.get(position).and_then(Option::as_ref));
+            let set = sets.map(|sets| sets.get(position).and_then(Option::as_ref));
             let answers = query.destination_ids.iter().map(|&destination| {
                 let answer = match set {
                     None => Hydrated::Failed(HydrationError::Error),
@@ -93,16 +128,108 @@ fn landed_edges(
         .collect()
 }
 
-pub(crate) struct ProdSources {
+pub(crate) fn core_batch(cores: RawHydrationBatch<PureCoreData>) -> RawHydrationBatch<PureCore> {
+    cores.map(|core| pure_core(&core))
+}
+
+pub(crate) fn tweet_batch<B: AsRef<[u8]>>(
+    tweet_ids: &[u64],
+    values: HashMap<u64, anyhow::Result<B>>,
+) -> RawHydrationBatch<TweetFeatures> {
+    let tweets: FxHashMap<_, _> = values
+        .into_iter()
+        .map(|(id, value)| (id, value.and_then(|bytes| decode_tweet(bytes.as_ref()))))
+        .collect();
+    HydrationBatch::from_results(tweet_ids.iter().copied(), tweets)
+}
+
+pub(crate) fn label_batch<E>(
+    tweet_ids: &[u64],
+    labels: FxHashMap<u64, Result<Arc<vf_pb::SafetyLabelMap>, E>>,
+) -> RawHydrationBatch<Arc<vf_pb::SafetyLabelMap>> {
+    let labels: FxHashMap<_, _> = labels
+        .into_iter()
+        .map(|(id, labels)| (id, labels.map(Some)))
+        .collect();
+    HydrationBatch::from_results(tweet_ids.iter().copied(), labels)
+}
+
+pub(crate) fn viewer_batch<E>(
+    viewer_id: u64,
+    viewer: Result<Option<GizmoduckUser>, E>,
+    fields: &[QueryFields],
+) -> RawHydrationBatch<DecodedViewer> {
+    let viewer = viewer.map(|user| Some(decode_viewer(user.as_ref(), fields)));
+    one_viewer_batch(viewer_id, viewer)
+}
+
+pub(crate) fn country_batch<E>(
+    viewer_id: u64,
+    country: Result<Option<String>, E>,
+) -> RawHydrationBatch<Arc<str>> {
+    one_viewer_batch(viewer_id, country.map(|country| country.map(Arc::from)))
+}
+
+fn one_viewer_batch<V, E>(viewer_id: u64, answer: Result<Option<V>, E>) -> RawHydrationBatch<V> {
+    HydrationBatch::from_results([viewer_id], HashMap::from([(viewer_id, answer)]))
+}
+
+pub(crate) fn lifecycle_batch(rows: RawHydrationBatch<i32>) -> RawHydrationBatch<ArticleLifecycle> {
+    let decoded = rows.into_hydrated().into_iter().map(|(id, row)| {
+        let lifecycle = match row {
+            Hydrated::Found(value) => decode_lifecycle(value)
+                .map_or(Hydrated::Failed(HydrationError::Error), Hydrated::Found),
+            Hydrated::Partial(value) => decode_lifecycle(value)
+                .map_or(Hydrated::Failed(HydrationError::Error), Hydrated::Partial),
+            Hydrated::NotFound => Hydrated::NotFound,
+            Hydrated::Failed(error) => Hydrated::Failed(error),
+        };
+        (id, lifecycle)
+    });
+    HydrationBatch::from_hydrated(decoded.collect())
+}
+
+pub(crate) trait Observer: Send + Sync {
+    fn answered<X: Exchange>(&self, answers: impl Iterator<Item = (X::Key, Hydrated<X::Wire>)>);
+
+    fn asked<X: Exchange>(&self, fields: &[QueryFields]);
+}
+
+impl Observer for () {
+    fn answered<X: Exchange>(&self, _: impl Iterator<Item = (X::Key, Hydrated<X::Wire>)>) {}
+
+    fn asked<X: Exchange>(&self, _: &[QueryFields]) {}
+}
+
+fn seen<V, W, E>(
+    result: Option<&Result<V, E>>,
+    wire: impl FnOnce(&V) -> Hydrated<W>,
+) -> Hydrated<W> {
+    match result {
+        Some(Ok(value)) => wire(value),
+        Some(Err(_)) | None => Hydrated::Failed(HydrationError::Error),
+    }
+}
+
+fn found<W: Clone>(value: Option<&W>) -> Hydrated<W> {
+    value.cloned().map_or(Hydrated::NotFound, Hydrated::Found)
+}
+
+pub(crate) struct ProdSources<O = ()> {
     tes: Arc<dyn TESClient + Send + Sync>,
     tweets: TweetSource,
     gizmoduck: GizmoduckLookup,
     socialgraph: Arc<dyn SocialgraphClient + Send + Sync>,
     about_this_account: Arc<dyn AboutThisAccountClient>,
     wingman: Arc<dyn WingmanClient>,
+    articles: Arc<dyn ArticleClient>,
+    trusted_friends: Arc<dyn TrustedFriendsClient>,
+    user_location: Arc<dyn UserLocationClient>,
     safety_labels: Arc<SafetyLabelSource>,
+    communities: CommunitySource,
     author_cache: Option<AuthorFallbackCache>,
-    pure_core_cache: Option<PureCoreFallbackCache>,
+    tweet_cache: Option<TweetFallbackCache>,
+    observer: O,
 }
 
 impl ProdSources {
@@ -117,9 +244,13 @@ impl ProdSources {
         socialgraph: Arc<dyn SocialgraphClient + Send + Sync>,
         about_this_account: Arc<dyn AboutThisAccountClient>,
         wingman: Arc<dyn WingmanClient>,
+        articles: Arc<dyn ArticleClient>,
+        trusted_friends: Arc<dyn TrustedFriendsClient>,
+        user_location: Arc<dyn UserLocationClient>,
         safety_labels: Arc<SafetyLabelSource>,
+        communities: CommunitySource,
         author_cache: Option<AuthorFallbackCache>,
-        pure_core_cache: Option<PureCoreFallbackCache>,
+        tweet_cache: Option<TweetFallbackCache>,
     ) -> Self {
         Self {
             tes,
@@ -128,23 +259,72 @@ impl ProdSources {
             socialgraph,
             about_this_account,
             wingman,
+            articles,
+            trusted_friends,
+            user_location,
             safety_labels,
+            communities,
             author_cache,
-            pure_core_cache,
+            tweet_cache,
+            observer: (),
+        }
+    }
+
+    pub(crate) fn observed<O: Observer>(self, observer: O) -> ProdSources<O> {
+        ProdSources {
+            tes: self.tes,
+            tweets: self.tweets,
+            gizmoduck: self.gizmoduck,
+            socialgraph: self.socialgraph,
+            about_this_account: self.about_this_account,
+            wingman: self.wingman,
+            articles: self.articles,
+            trusted_friends: self.trusted_friends,
+            user_location: self.user_location,
+            safety_labels: self.safety_labels,
+            communities: self.communities,
+            author_cache: self.author_cache,
+            tweet_cache: self.tweet_cache,
+            observer,
         }
     }
 }
 
+impl<O: Observer> ProdSources<O> {
+    fn relay<X: Exchange, E>(
+        &self,
+        keys: impl Iterator<Item = X::Key> + Clone,
+        answers: HashMap<X::Key, Result<Option<X::Wire>, E>>,
+    ) -> HydrationBatch<X::Key, X::Wire>
+    where
+        X::Key: Eq + Hash,
+        X::Wire: Clone,
+    {
+        self.observer.answered::<X>(keys.clone().map(|key| {
+            let answer = seen(answers.get(&key), |wire| found(wire.as_ref()));
+            (key, answer)
+        }));
+        HydrationBatch::from_results(keys, answers)
+    }
+}
+
 #[tonic::async_trait]
-impl Sources for ProdSources {
+impl<O: Observer> Sources for ProdSources<O> {
     async fn pure_cores(&self, tweet_ids: &[u64]) -> RawHydrationBatch<PureCore> {
         let cores = self.tes.get_tweet_core_datas(tweet_ids.to_vec()).await;
-        HydrationBatch::from_results(tweet_ids.iter().copied(), cores).map(|core| pure_core(&core))
+        core_batch(self.relay::<exchange::TesPureCore, _>(tweet_ids.iter().copied(), cores))
     }
 
     async fn tweets(&self, tweet_ids: &[u64]) -> RawHydrationBatch<TweetFeatures> {
-        let tweets = self.tweets.get_tweets(tweet_ids).await;
-        HydrationBatch::from_results(tweet_ids.iter().copied(), tweets)
+        let values = self.tweets.get_tweet_values(tweet_ids).await;
+        self.observer
+            .answered::<exchange::TesTweet>(tweet_ids.iter().map(|&id| {
+                let answer = seen(values.get(&id), |bytes| {
+                    Hydrated::Found(Bytes(bytes.to_vec()))
+                });
+                (id, answer)
+            }));
+        tweet_batch(tweet_ids, values)
     }
 
     async fn conversation_controls(
@@ -152,21 +332,22 @@ impl Sources for ProdSources {
         tweet_ids: &[u64],
     ) -> RawHydrationBatch<ConversationControl> {
         let controls = self.tes.get_conversation_controls(tweet_ids.to_vec()).await;
-        HydrationBatch::from_results(tweet_ids.iter().copied(), controls)
+        self.relay::<exchange::TesConversationControl, _>(tweet_ids.iter().copied(), controls)
     }
 
     async fn safety_labels(
         &self,
         tweet_ids: &[u64],
     ) -> RawHydrationBatch<Arc<vf_pb::SafetyLabelMap>> {
-        let labels = self
-            .safety_labels
-            .get(tweet_ids)
-            .await
-            .into_iter()
-            .map(|(id, labels)| (id, labels.map(Some)))
-            .collect();
-        HydrationBatch::from_results(tweet_ids.iter().copied(), labels)
+        let labels = self.safety_labels.get(tweet_ids).await;
+        self.observer
+            .answered::<exchange::SafetyLabels>(tweet_ids.iter().map(|&id| {
+                let answer = seen(labels.get(&id), |labels| {
+                    Hydrated::Found(Bytes(labels.encode_to_vec()))
+                });
+                (id, answer)
+            }));
+        label_batch(tweet_ids, labels)
     }
 
     async fn viewer(
@@ -178,9 +359,13 @@ impl Sources for ProdSources {
             .gizmoduck
             .get_viewer(viewer_id, fields)
             .await
-            .inspect_err(|error| warn!(%error, "Gizmoduck viewer lookup failed; failing open"))
-            .map(|user| Some(decode_viewer(user.as_ref(), fields)));
-        HydrationBatch::from_results([viewer_id], HashMap::from([(viewer_id, viewer)]))
+            .inspect_err(|error| warn!(%error, "Gizmoduck viewer lookup failed; failing open"));
+        self.observer.asked::<exchange::GizmoduckViewer>(fields);
+        self.observer
+            .answered::<exchange::GizmoduckViewer>(iter::once_with(|| {
+                (viewer_id, seen(Some(&viewer), |user| found(user.as_ref())))
+            }));
+        viewer_batch(viewer_id, viewer, fields)
     }
 
     async fn users(
@@ -189,10 +374,8 @@ impl Sources for ProdSources {
         fields: &[QueryFields],
     ) -> RawHydrationBatch<DecodedAuthor> {
         let users = self.gizmoduck.get_users(user_ids.to_vec(), fields).await;
-        decode_authors(HydrationBatch::from_results(
-            user_ids.iter().copied(),
-            users,
-        ))
+        self.observer.asked::<exchange::GizmoduckAuthor>(fields);
+        author_batch(self.relay::<exchange::GizmoduckAuthor, _>(user_ids.iter().copied(), users))
     }
 
     async fn select_edges(
@@ -201,7 +384,18 @@ impl Sources for ProdSources {
         queries: &[EdgeQuery],
     ) -> Vec<RawHydrationBatch<bool>> {
         let sets = self.socialgraph.select_edges(viewer_id, queries).await;
-        landed_edges(queries, sets)
+        let edges = edge_batches(queries, sets.as_deref());
+        self.observer
+            .answered::<exchange::Flock>(queries.iter().zip(&edges).flat_map(|(query, batch)| {
+                query.destination_ids.iter().map(move |&destination| {
+                    let answer = batch
+                        .hydrated(&destination)
+                        .cloned()
+                        .unwrap_or(Hydrated::Failed(HydrationError::Error));
+                    (EdgeKey::of(query, destination), answer)
+                })
+            }));
+        edges
     }
 
     async fn viewer_country(&self, viewer_id: u64) -> RawHydrationBatch<Arc<str>> {
@@ -209,9 +403,15 @@ impl Sources for ProdSources {
             .about_this_account
             .tfe_top_country(viewer_id)
             .await
-            .inspect_err(|error| warn!(%error, "tfe_top_country lookup failed"))
-            .map(|country| country.map(Arc::from));
-        HydrationBatch::from_results([viewer_id], HashMap::from([(viewer_id, country)]))
+            .inspect_err(|error| warn!(%error, "tfe_top_country lookup failed"));
+        self.observer
+            .answered::<exchange::ViewerCountry>(iter::once_with(|| {
+                (
+                    viewer_id,
+                    seen(Some(&country), |country| found(country.as_ref())),
+                )
+            }));
+        country_batch(viewer_id, country)
     }
 
     async fn second_degree(
@@ -236,11 +436,80 @@ impl Sources for ProdSources {
                 (root, answer)
             })
             .collect();
-        HydrationBatch::from_results(root_author_ids.iter().copied(), answers)
+        self.relay::<exchange::Wingman, _>(root_author_ids.iter().copied(), answers)
     }
 
-    fn pure_core_cache(&self) -> Option<&PureCoreFallbackCache> {
-        self.pure_core_cache.as_ref()
+    async fn community_moderations(
+        &self,
+        posts: &[CommunityPost],
+    ) -> RawHydrationBatch<CommunityModeration> {
+        let moderations = self.communities.moderations(posts).await;
+        self.relay::<exchange::CommunityModeration, _>(
+            posts.iter().map(|post| post.tweet_id),
+            moderations,
+        )
+    }
+
+    async fn community_moderators(
+        &self,
+        viewer_id: u64,
+        community_ids: &[u64],
+    ) -> RawHydrationBatch<bool> {
+        let moderators = self.communities.moderators(viewer_id, community_ids).await;
+        self.relay::<exchange::CommunityModerator, _>(community_ids.iter().copied(), moderators)
+    }
+
+    async fn community_viewer_removals(
+        &self,
+        viewer_id: u64,
+        community_ids: &[u64],
+    ) -> RawHydrationBatch<bool> {
+        let removals = self
+            .communities
+            .viewer_removals(viewer_id, community_ids)
+            .await;
+        self.relay::<exchange::CommunityViewerRemoved, _>(community_ids.iter().copied(), removals)
+    }
+
+    async fn article_lifecycles(&self, article_ids: &[u64]) -> RawHydrationBatch<ArticleLifecycle> {
+        let rows = self.articles.lifecycles(article_ids).await;
+        lifecycle_batch(
+            self.relay::<exchange::ArticleLifecycle, _>(article_ids.iter().copied(), rows),
+        )
+    }
+
+    async fn trusted_friends(&self, viewer_id: u64, list_ids: &[u64]) -> RawHydrationBatch<bool> {
+        let answers = self
+            .trusted_friends
+            .batch_is_member_or_owner(viewer_id, list_ids)
+            .await;
+        let answers = list_ids
+            .iter()
+            .copied()
+            .zip(answers)
+            .map(|(list_id, answer)| (list_id, answer.map(Some)))
+            .collect();
+        self.relay::<exchange::TrustedFriends, _>(list_ids.iter().copied(), answers)
+    }
+
+    async fn outside_places(&self, viewer_id: u64, place_ids: &[u64]) -> RawHydrationBatch<bool> {
+        let places = self
+            .user_location
+            .places(viewer_id)
+            .await
+            .inspect_err(|error| warn!(%error, "Geoduck userLocation lookup failed"));
+        let answers = place_ids
+            .iter()
+            .map(|&place| {
+                let outside = places.as_ref().map(|places| Some(!places.contains(&place)));
+                (place, outside)
+            })
+            .collect();
+        self.relay::<exchange::UserLocation, _>(place_ids.iter().copied(), answers)
+    }
+
+    fn tweet_cache(&self) -> Option<&TweetFallbackCache> {
+        self.tweet_cache.as_ref()
     }
 
     fn author_cache(&self) -> Option<&AuthorFallbackCache> {
@@ -264,6 +533,16 @@ mod in_memory {
         ConversationControlArm, GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety,
         UserResponseState,
     };
+
+    pub(crate) fn found_user(user_id: u64) -> GizmoduckUserResult {
+        GizmoduckUserResult {
+            user: Some(GizmoduckUser {
+                user_id,
+                ..Default::default()
+            }),
+            response_state: Some(UserResponseState::Found),
+        }
+    }
 
     pub(crate) fn suspended() -> GizmoduckUserResult {
         GizmoduckUserResult {
@@ -297,6 +576,7 @@ mod in_memory {
         Fails,
         Hangs,
         Delays(std::time::Duration),
+        AnswersPartial,
     }
 
     #[derive(Default)]
@@ -310,6 +590,13 @@ mod in_memory {
         edges: HashSet<(Graph, u64, u64)>,
         countries: HashMap<u64, Arc<str>>,
         second_degree: HashSet<(u64, u64)>,
+        community_moderations: HashMap<u64, CommunityModeration>,
+        moderated_communities: HashSet<u64>,
+        removed_from_communities: HashSet<u64>,
+        community_posts: Mutex<Vec<CommunityPost>>,
+        lifecycles: HashMap<u64, ArticleLifecycle>,
+        trusted_friends: HashSet<(u64, u64)>,
+        viewer_places: HashSet<u64>,
         faults: Mutex<Vec<(Source, Fault)>>,
         failed_keys: HashSet<(Source, u64)>,
         latencies: HashMap<Source, Duration>,
@@ -319,7 +606,7 @@ mod in_memory {
         hung_graphs: HashSet<Graph>,
         missing_graphs: HashSet<Graph>,
         author_cache: Option<AuthorFallbackCache>,
-        pure_core_cache: Option<PureCoreFallbackCache>,
+        tweet_cache: Option<TweetFallbackCache>,
         calls: Mutex<Vec<(Source, Vec<u64>)>>,
         starts: Mutex<Vec<(Source, Instant)>>,
         selects: Mutex<Vec<Vec<EdgeQuery>>>,
@@ -339,6 +626,12 @@ mod in_memory {
 
         pub(crate) fn pure_core(mut self, tweet_id: u64, core: PureCoreData) -> Self {
             self.pure_cores.insert(tweet_id, core);
+            self.tweets.entry(tweet_id).or_default();
+            self
+        }
+
+        pub(crate) fn without_tweet_row(mut self, tweet_id: u64) -> Self {
+            self.tweets.remove(&tweet_id);
             self
         }
 
@@ -367,6 +660,12 @@ mod in_memory {
             self
         }
 
+        pub(crate) fn authors(self, user_ids: &[u64]) -> Self {
+            user_ids.iter().fold(self, |sources, &user_id| {
+                sources.user(user_id, found_user(user_id))
+            })
+        }
+
         pub(crate) fn edge(mut self, graph: Graph, source: u64, destination: u64) -> Self {
             self.edges.insert((graph, source, destination));
             self
@@ -379,6 +678,44 @@ mod in_memory {
 
         pub(crate) fn second_degree_path(mut self, root_author: u64, viewer_id: u64) -> Self {
             self.second_degree.insert((root_author, viewer_id));
+            self
+        }
+
+        pub(crate) fn community_moderation(
+            mut self,
+            tweet_id: u64,
+            moderation: CommunityModeration,
+        ) -> Self {
+            self.community_moderations.insert(tweet_id, moderation);
+            self
+        }
+
+        pub(crate) fn moderator_of(mut self, community_id: u64) -> Self {
+            self.moderated_communities.insert(community_id);
+            self
+        }
+
+        pub(crate) fn removed_from(mut self, community_id: u64) -> Self {
+            self.removed_from_communities.insert(community_id);
+            self
+        }
+
+        pub(crate) fn community_posts(&self) -> Vec<CommunityPost> {
+            self.community_posts.lock().unwrap().clone()
+        }
+
+        pub(crate) fn lifecycle(mut self, article_id: u64, lifecycle: ArticleLifecycle) -> Self {
+            self.lifecycles.insert(article_id, lifecycle);
+            self
+        }
+
+        pub(crate) fn trusted_friend(mut self, list_id: u64, viewer_id: u64) -> Self {
+            self.trusted_friends.insert((list_id, viewer_id));
+            self
+        }
+
+        pub(crate) fn located_in(mut self, place_id: u64) -> Self {
+            self.viewer_places.insert(place_id);
             self
         }
 
@@ -431,8 +768,8 @@ mod in_memory {
             self
         }
 
-        pub(crate) fn with_pure_core_cache(mut self, cache: PureCoreFallbackCache) -> Self {
-            self.pure_core_cache = Some(cache);
+        pub(crate) fn with_tweet_cache(mut self, cache: TweetFallbackCache) -> Self {
+            self.tweet_cache = Some(cache);
             self
         }
 
@@ -496,22 +833,24 @@ mod in_memory {
             if let Some(latency) = latency {
                 sleep(*latency).await;
             }
-            let fault = self
-                .faults
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|(faulty, _)| *faulty == source)
-                .map(|(_, fault)| *fault);
-            match fault {
+            match self.fault_for(source) {
                 Some(Fault::Hangs) => std::future::pending().await,
                 Some(Fault::Delays(delay)) => {
                     tokio::time::sleep(delay).await;
                     false
                 }
                 Some(Fault::Fails) => true,
-                None => false,
+                Some(Fault::AnswersPartial) | None => false,
             }
+        }
+
+        fn fault_for(&self, source: Source) -> Option<Fault> {
+            self.faults
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(faulty, _)| *faulty == source)
+                .map(|(_, fault)| *fault)
         }
 
         async fn keyed<V: Clone>(
@@ -521,7 +860,7 @@ mod in_memory {
             values: &HashMap<u64, V>,
         ) -> RawHydrationBatch<V> {
             let fails = self.enter(source, ids).await;
-            let results = ids
+            let results: FxHashMap<_, _> = ids
                 .iter()
                 .map(|&id| {
                     let result = if fails || self.failed_keys.contains(&(source, id)) {
@@ -570,9 +909,10 @@ mod in_memory {
             fields: &[QueryFields],
         ) -> RawHydrationBatch<DecodedViewer> {
             self.record_fields(Source::GizmoduckViewer, fields);
-            self.keyed(Source::GizmoduckViewer, &[viewer_id], &self.viewers)
+            let viewer = HashMap::from([(viewer_id, self.viewers.get(&viewer_id).cloned())]);
+            self.keyed(Source::GizmoduckViewer, &[viewer_id], &viewer)
                 .await
-                .map(|user| decode_viewer(Some(&user), fields))
+                .map(|user| decode_viewer(user.as_ref(), fields))
         }
 
         async fn users(
@@ -581,10 +921,17 @@ mod in_memory {
             fields: &[QueryFields],
         ) -> RawHydrationBatch<DecodedAuthor> {
             self.record_fields(Source::GizmoduckAuthor, fields);
-            decode_authors(
-                self.keyed(Source::GizmoduckAuthor, user_ids, &self.users)
-                    .await,
-            )
+            let users = self
+                .keyed(Source::GizmoduckAuthor, user_ids, &self.users)
+                .await;
+            let users = match self.fault_for(Source::GizmoduckAuthor) {
+                Some(Fault::AnswersPartial) => users.map(|user| GizmoduckUserResult {
+                    response_state: Some(UserResponseState::Partial),
+                    ..user
+                }),
+                _ => users,
+            };
+            author_batch(users)
         }
 
         async fn select_edges(
@@ -635,8 +982,8 @@ mod in_memory {
                         .collect()
                 })
             };
-            let sets = (!fails).then(|| queries.iter().map(answer).collect());
-            landed_edges(queries, sets)
+            let sets: Option<Vec<_>> = (!fails).then(|| queries.iter().map(answer).collect());
+            edge_batches(queries, sets.as_deref())
         }
 
         async fn viewer_country(&self, viewer_id: u64) -> RawHydrationBatch<Arc<str>> {
@@ -656,8 +1003,86 @@ mod in_memory {
             self.keyed(Source::Wingman, root_author_ids, &paths).await
         }
 
-        fn pure_core_cache(&self) -> Option<&PureCoreFallbackCache> {
-            self.pure_core_cache.as_ref()
+        async fn community_moderations(
+            &self,
+            posts: &[CommunityPost],
+        ) -> RawHydrationBatch<CommunityModeration> {
+            self.community_posts
+                .lock()
+                .unwrap()
+                .extend_from_slice(posts);
+            let tweet_ids: Vec<u64> = posts.iter().map(|post| post.tweet_id).collect();
+            let moderations = tweet_ids
+                .iter()
+                .map(|&id| {
+                    let moderation = self.community_moderations.get(&id).copied();
+                    (id, moderation.unwrap_or_default())
+                })
+                .collect();
+            self.keyed(Source::CommunityModeration, &tweet_ids, &moderations)
+                .await
+        }
+
+        async fn community_moderators(
+            &self,
+            _viewer_id: u64,
+            community_ids: &[u64],
+        ) -> RawHydrationBatch<bool> {
+            let moderators = community_ids
+                .iter()
+                .map(|&id| (id, self.moderated_communities.contains(&id)))
+                .collect();
+            self.keyed(Source::CommunityModerator, community_ids, &moderators)
+                .await
+        }
+
+        async fn community_viewer_removals(
+            &self,
+            _viewer_id: u64,
+            community_ids: &[u64],
+        ) -> RawHydrationBatch<bool> {
+            let removals = community_ids
+                .iter()
+                .map(|&id| (id, self.removed_from_communities.contains(&id)))
+                .collect();
+            self.keyed(Source::CommunityViewerRemoved, community_ids, &removals)
+                .await
+        }
+
+        async fn article_lifecycles(
+            &self,
+            article_ids: &[u64],
+        ) -> RawHydrationBatch<ArticleLifecycle> {
+            self.keyed(Source::ArticleLifecycle, article_ids, &self.lifecycles)
+                .await
+        }
+
+        async fn trusted_friends(
+            &self,
+            viewer_id: u64,
+            list_ids: &[u64],
+        ) -> RawHydrationBatch<bool> {
+            let lists = list_ids
+                .iter()
+                .map(|&list| (list, self.trusted_friends.contains(&(list, viewer_id))))
+                .collect();
+            self.keyed(Source::TrustedFriends, list_ids, &lists).await
+        }
+
+        async fn outside_places(
+            &self,
+            _viewer_id: u64,
+            place_ids: &[u64],
+        ) -> RawHydrationBatch<bool> {
+            let outside = place_ids
+                .iter()
+                .map(|&place| (place, !self.viewer_places.contains(&place)))
+                .collect();
+            self.keyed(Source::UserLocation, place_ids, &outside).await
+        }
+
+        fn tweet_cache(&self) -> Option<&TweetFallbackCache> {
+            self.tweet_cache.as_ref()
         }
 
         fn author_cache(&self) -> Option<&AuthorFallbackCache> {

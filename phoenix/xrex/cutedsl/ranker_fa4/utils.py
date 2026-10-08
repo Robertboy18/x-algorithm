@@ -40,12 +40,13 @@ from typing import Callable, Optional, Tuple, Type, overload
 
 import cutlass
 import cutlass.cute as cute
-import quack.activation
 from cutlass import Float32, Int32, const_expr
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from xrex.cutedsl.quack import activation as quack_activation
 
 _MIXER_ATTRS = ("__vec_size__",)
 
@@ -712,10 +713,10 @@ def ex2_emulation_2(
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
-    xy_rounded_back = quack.activation.sub_packed_f32x2(
+    xy_rounded_back = quack_activation.sub_packed_f32x2(
         xy_rounded, (fp32_round_int, fp32_round_int)
     )
-    xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_frac = quack_activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)

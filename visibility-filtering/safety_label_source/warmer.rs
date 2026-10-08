@@ -134,7 +134,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn drain_lingers_then_flushes_in_chunks() {
         let fetcher = FakeFetcher::new();
-        let warmer = CacheWarmer::spawn(fetcher.clone());
+        let warmer = CacheWarmer::spawn(Arc::<FakeFetcher>::clone(&fetcher));
 
         warmer.warm((0..30).collect());
         warmer.warm((30..60).collect());

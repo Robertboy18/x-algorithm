@@ -127,7 +127,7 @@ mod tests {
     #[tokio::test]
     async fn author_lookups_include_deactivated_erased_and_offboarded_users() {
         let client = Arc::new(Recording::default());
-        GizmoduckLookup::new(client.clone())
+        GizmoduckLookup::new(Arc::<Recording>::clone(&client))
             .get_users(vec![10], &[QueryFields::SAFETY])
             .await;
         let contexts = client.0.lock().unwrap();
@@ -142,9 +142,10 @@ mod tests {
     #[tokio::test]
     async fn viewer_lookups_pass_no_context() {
         let client = Arc::new(Recording::default());
-        let _ = GizmoduckLookup::new(client.clone())
+        let viewer = GizmoduckLookup::new(Arc::<Recording>::clone(&client))
             .get_viewer(10, &[QueryFields::SAFETY])
             .await;
+        assert!(viewer.is_err(), "an empty batch is an error");
         assert!(matches!(client.0.lock().unwrap().as_slice(), [None]));
     }
 }

@@ -1,6 +1,7 @@
+use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::slice;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +50,7 @@ impl<V, E> From<Result<Option<V>, E>> for Hydrated<V> {
 
 #[derive(Clone)]
 pub(crate) struct HydrationBatch<K, V> {
-    results: HashMap<K, Hydrated<V>>,
+    results: FxHashMap<K, Hydrated<V>>,
 }
 
 pub(crate) type RawHydrationBatch<V> = HydrationBatch<u64, V>;
@@ -57,13 +58,13 @@ pub(crate) type RawHydrationBatch<V> = HydrationBatch<u64, V>;
 impl<K: Eq + Hash, V> HydrationBatch<K, V> {
     pub(crate) fn empty() -> Self {
         Self {
-            results: HashMap::new(),
+            results: FxHashMap::default(),
         }
     }
 
-    pub(crate) fn from_results<E>(
+    pub(crate) fn from_results<E, S: BuildHasher>(
         expected: impl IntoIterator<Item = K>,
-        mut results: HashMap<K, Result<Option<V>, E>>,
+        mut results: HashMap<K, Result<Option<V>, E>, S>,
     ) -> Self {
         Self::from_expected(expected, |key| {
             results
@@ -73,7 +74,7 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         })
     }
 
-    pub(crate) fn from_hydrated(results: HashMap<K, Hydrated<V>>) -> Self {
+    pub(crate) fn from_hydrated(results: FxHashMap<K, Hydrated<V>>) -> Self {
         Self { results }
     }
 
@@ -81,7 +82,7 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         expected: impl IntoIterator<Item = K>,
         mut resolve: impl FnMut(&K) -> Hydrated<V>,
     ) -> Self {
-        let mut results = HashMap::new();
+        let mut results = FxHashMap::default();
         for key in expected {
             if let Entry::Vacant(entry) = results.entry(key) {
                 let hydrated = resolve(entry.key());
@@ -104,7 +105,7 @@ impl<K: Eq + Hash, V> HydrationBatch<K, V> {
         self.results.get(key)
     }
 
-    pub(crate) fn into_hydrated(self) -> HashMap<K, Hydrated<V>> {
+    pub(crate) fn into_hydrated(self) -> FxHashMap<K, Hydrated<V>> {
         self.results
     }
 

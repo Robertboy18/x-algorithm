@@ -20,15 +20,22 @@ pub(crate) fn request_payload(query: &ScoredPostsQuery, candidates: &[PostCandid
     .encode_to_vec()
 }
 
-pub(crate) fn candidate_payload(candidate: &PostCandidate) -> Vec<u8> {
-    CandidatePayload {
-        content_features: Some(content_features_proto(&content_features::build(candidate))),
-        quoted_content_features: content_features::build_quoted(candidate)
-            .map(|f| content_features_proto(&f)),
-        quoted_tweet_id: candidate.quoted_tweet_id.unwrap_or(0),
-        ..Default::default()
+pub(crate) fn candidate_payload(candidate: &PostCandidate, debias: bool, pacing: bool) -> Vec<u8> {
+    let mut payload = CandidatePayload::default();
+    if debias {
+        payload.content_features =
+            Some(content_features_proto(&content_features::build(candidate)));
+        payload.quoted_content_features =
+            content_features::build_quoted(candidate).map(|f| content_features_proto(&f));
+        payload.quoted_tweet_id = candidate.quoted_tweet_id.unwrap_or(0);
     }
-    .encode_to_vec()
+    if pacing {
+        payload.view_count = candidate.view_count;
+        payload.author_followers_count = candidate
+            .author_followers_count
+            .and_then(|n| u64::try_from(n).ok());
+    }
+    payload.encode_to_vec()
 }
 
 fn phoenix_scored_at_ms(candidates: &[PostCandidate]) -> Option<i64> {

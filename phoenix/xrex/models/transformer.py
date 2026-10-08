@@ -13,7 +13,6 @@ import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental.xla_metadata import set_xla_metadata
-from jax.lax import with_sharding_constraint
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -34,6 +33,7 @@ from xrex.models.scaling import ScaleConfig
 from xrex.models.sharding_context import NamedShape, ShardingContext
 from xrex.utils import layer_stack
 from xrex.utils.gpu import peak_tflops
+from xrex.utils.sharding import with_sharding_constraint_unless_manual
 from xrex.utils.utils import (
     dump_block_outputs,
     ffn_size,
@@ -201,14 +201,14 @@ class MHABlock(hk.Module):
         activation_pspecs = self.sharding_context.sharding_specs(
             attn_input_named_shape, namespace=self.config.attn_sharding_namespace
         )
-        inputs = with_sharding_constraint(
+        inputs = with_sharding_constraint_unless_manual(
             inputs,
             activation_pspecs,
         )
         attn_output = attn_block(inputs, inputs, inputs, mask, segment_ids, segment_ids_k)
         attn_output = replace(
             attn_output,
-            output=with_sharding_constraint(attn_output.output, activation_pspecs),
+            output=with_sharding_constraint_unless_manual(attn_output.output, activation_pspecs),
         )
 
         return attn_output
@@ -246,7 +246,7 @@ class DenseBlock(hk.Module):
             self.sharding_context.logical_axis_to_physical("replicated"),
         )
         input_sharding = NamedSharding(self.sharding_context.mesh, input_spec)
-        inputs = with_sharding_constraint(inputs, input_sharding)
+        inputs = with_sharding_constraint_unless_manual(inputs, input_sharding)
 
         weights_pspec = P(None, None)
         activation_spec = P(
@@ -270,7 +270,7 @@ class DenseBlock(hk.Module):
                 )(inputs)
 
                 h = jnp.reshape(h, (batch_size, seq_len, -1, 2))
-                h = with_sharding_constraint(h, activation_sharding)
+                h = with_sharding_constraint_unless_manual(h, activation_sharding)
                 h = checkpoint_name(h, "gate_up_proj")
                 h_up, h_gate = jnp.split(h, 2, axis=-1)
                 h_up = jnp.reshape(h_up, (batch_size, seq_len, -1))
@@ -299,7 +299,7 @@ class DenseBlock(hk.Module):
                 h_up = checkpoint_name(h_up, f"{self.checkpoint_name_prefix}up_proj")
                 h_gate = checkpoint_name(h_gate, f"{self.checkpoint_name_prefix}gate_proj")
             combined = h_up * gelu_fn(h_gate, approximate=True)
-            combined = with_sharding_constraint(combined, activation_sharding)
+            combined = with_sharding_constraint_unless_manual(combined, activation_sharding)
 
             h_dense = Linear(
                 model_size,
@@ -334,7 +334,7 @@ class DenseBlock(hk.Module):
             )(h_up)
 
         h_dense = checkpoint_name(h_dense, f"{self.checkpoint_name_prefix}outputs_individual")
-        h_dense = with_sharding_constraint(h_dense, input_sharding)
+        h_dense = with_sharding_constraint_unless_manual(h_dense, input_sharding)
         return h_dense
 
 
@@ -429,17 +429,17 @@ class DecoderLayer(hk.Module):
         activation_pspec = self.sharding_context.sharding_specs(
             NamedShape(inputs.shape, names=("batch", "sequence", "replicated"))
         )
-        residual = with_sharding_constraint(inputs, activation_pspec)
+        residual = with_sharding_constraint_unless_manual(inputs, activation_pspec)
 
         h_attn_in = residual
-        residual = with_sharding_constraint(residual, activation_pspec)
+        residual = with_sharding_constraint_unless_manual(residual, activation_pspec)
 
         def run_attn_layer(h_attn_in: jax.Array):
             if self.pre_norm:
                 h_ln = layer_norm(h_attn_in, self.pre_attn_norm_name)
             else:
                 h_ln = h_attn_in
-            h_ln = with_sharding_constraint(h_ln, activation_pspec)
+            h_ln = with_sharding_constraint_unless_manual(h_ln, activation_pspec)
 
             attn_input = h_ln
             attn_outputs: MultiHeadAttentionOutput = MHABlock(
@@ -464,7 +464,7 @@ class DecoderLayer(hk.Module):
                 attn_loss = checkpoint_name(attn_loss, "scalar_stats")
 
             if self.primer_norm:
-                h_attn = with_sharding_constraint(h_attn, activation_pspec)
+                h_attn = with_sharding_constraint_unless_manual(h_attn, activation_pspec)
                 h_attn = layer_norm(h_attn, "post_attn_norm")
 
             return h_attn, attn_input, attn_outputs, attn_loss
@@ -472,19 +472,19 @@ class DecoderLayer(hk.Module):
         h_attn, attn_input, attn_outputs, attn_loss = remat_fn(run_attn_layer)(h_attn_in)
 
         residual = residual + h_attn
-        residual = with_sharding_constraint(residual, activation_pspec)
+        residual = with_sharding_constraint_unless_manual(residual, activation_pspec)
 
         attn_post_ln_output = residual
 
         h_ffn_in = residual
-        residual = with_sharding_constraint(residual, activation_pspec)
+        residual = with_sharding_constraint_unless_manual(residual, activation_pspec)
 
         def run_ffn_layer(h_ffn_in: jax.Array):
             if self.pre_norm:
                 h_ln = layer_norm(h_ffn_in, self.pre_ffn_norm_name)
             else:
                 h_ln = h_ffn_in
-            h_ln = with_sharding_constraint(h_ln, activation_pspec)
+            h_ln = with_sharding_constraint_unless_manual(h_ln, activation_pspec)
 
             ffn_input = h_ln
             ffn_result: FFNLayerOutput = FFNLayer(
@@ -506,7 +506,7 @@ class DecoderLayer(hk.Module):
                 ffn_loss = checkpoint_name(ffn_loss, "scalar_stats")
 
             if self.primer_norm:
-                h_ffn = with_sharding_constraint(h_ffn, activation_pspec)
+                h_ffn = with_sharding_constraint_unless_manual(h_ffn, activation_pspec)
                 h_ffn = layer_norm(h_ffn, "post_ffn_norm")
 
             return h_ffn, ffn_input, ffn_output, ffn_loss
@@ -514,7 +514,7 @@ class DecoderLayer(hk.Module):
         h_ffn, ffn_input, ffn_output, ffn_loss = remat_fn(run_ffn_layer)(h_ffn_in)
 
         residual = residual + h_ffn
-        residual = with_sharding_constraint(residual, activation_pspec)
+        residual = with_sharding_constraint_unless_manual(residual, activation_pspec)
 
         ffn_post_ln_output = residual
 

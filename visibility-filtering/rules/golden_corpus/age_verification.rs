@@ -687,6 +687,7 @@ pub(super) fn rows() -> Vec<Row> {
                                 verify_blur_support: Some(Supported),
                                 modern_blur: true,
                                 stale_tweet_limits: true,
+                                community_viewer_removed_limits: true,
                                 gore_blur_ignores_settings: false,
                                 fosnr_rules: true,
                                 fosnr_fallback_drops: false,

@@ -468,6 +468,18 @@ MMP_CLICK_VIEW_THROUGH_ACTION_INDICES = [
 CONVERSION_KEEP_WEB = 1 << 0
 CONVERSION_KEEP_APP = 1 << 1
 
+CONVERSION_DELAY_NONE = -1
+CONVERSION_DELAY_HEAD_COLUMNS: dict[str, str] = {
+    "IsAttributedClickConversion": "conversionDelayMsSeq",
+    "IsAttributedKeyClickConversion": "conversionDelayMsSeq_KEY",
+    "IsPurchaseConversion": "conversionDelayMsSeq_PURCHASE",
+    "IsSignupConversion": "conversionDelayMsSeq_SIGN_UP",
+    "IsCustomConversion": "conversionDelayMsSeq_CUSTOM",
+    "IsAddToCartConversion": "conversionDelayMsSeq_ADD_TO_CART",
+    "IsCheckoutInitiatedConversion": "conversionDelayMsSeq_CHECKOUT_INITIATED",
+}
+CONVERSION_DELAY_COLUMNS: tuple[str, ...] = tuple(CONVERSION_DELAY_HEAD_COLUMNS.values())
+
 MACT_IN_APP_LOSS_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_PURCHASE,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_ADD_TO_CART,

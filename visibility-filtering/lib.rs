@@ -4,15 +4,30 @@
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
+    clippy::clone_on_ref_ptr,
     clippy::dbg_macro,
+    clippy::exit,
     clippy::expect_used,
+    clippy::format_push_string,
+    clippy::get_unwrap,
     clippy::indexing_slicing,
+    clippy::large_futures,
+    clippy::let_underscore_must_use,
+    clippy::mem_forget,
+    clippy::needless_pass_by_value,
     clippy::panic,
+    clippy::panic_in_result_fn,
     clippy::print_stderr,
     clippy::print_stdout,
+    clippy::ref_option,
+    clippy::string_slice,
     clippy::todo,
     clippy::unimplemented,
-    clippy::unwrap_used
+    clippy::unreachable,
+    clippy::unused_self,
+    clippy::unwrap_in_result,
+    clippy::unwrap_used,
+    clippy::wildcard_enum_match_arm
 )]
 #![cfg_attr(
     test,
@@ -22,10 +37,14 @@
         clippy::cast_sign_loss,
         clippy::dbg_macro,
         clippy::expect_used,
+        clippy::get_unwrap,
         clippy::indexing_slicing,
         clippy::panic,
+        clippy::panic_in_result_fn,
         clippy::print_stderr,
         clippy::print_stdout,
+        clippy::unreachable,
+        clippy::unwrap_in_result,
         clippy::unwrap_used,
         reason = "fixtures may panic and cast freely"
     )
@@ -43,11 +62,10 @@ pub(crate) mod hydration;
 pub(crate) mod limited_actions_copy;
 pub(crate) mod models;
 pub mod params;
-pub mod reference;
-pub(crate) mod reference_compare;
 pub(crate) mod retweet;
 pub(crate) mod rules;
 pub(crate) mod safety_label_source;
 pub mod server;
 pub(crate) mod server_deps;
+pub mod staging;
 pub(crate) mod treatment;

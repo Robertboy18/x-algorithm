@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,8 +21,8 @@ impl ManhattanSource {
 
 #[async_trait]
 impl ManhattanLookup for ManhattanSource {
-    async fn get(&self, ids: &[u64]) -> HashMap<u64, ManhattanOutcome> {
-        let mut results = HashMap::with_capacity(ids.len());
+    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome> {
+        let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         if ids.is_empty() {
             return results;
         }
@@ -106,6 +106,7 @@ impl ManhattanLookup for ManhattanSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Mutex;
     use xai_manhattan::ManhattanError;
     use xai_safety_label_store::types::encode_lkey;
@@ -209,7 +210,7 @@ mod tests {
     async fn get_with_fetcher(
         fetcher: FakeLabelFetcher,
         ids: &[u64],
-    ) -> HashMap<u64, ManhattanOutcome> {
+    ) -> FxHashMap<u64, ManhattanOutcome> {
         ManhattanSource::new(Arc::new(fetcher)).get(ids).await
     }
 

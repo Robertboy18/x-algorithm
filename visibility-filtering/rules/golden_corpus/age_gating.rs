@@ -245,11 +245,13 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_user_flag_media_retweet",
-            post: tweet_candidate(|t| {
-                t.nsfw.user = true;
-                t.media.has_media = true;
-                t.source_tweet_id = Some(2);
-            }),
+            post: HydratedTweetCandidate {
+                source_tweet_id: Some(2),
+                ..tweet_candidate(|t| {
+                    t.nsfw.user = true;
+                    t.media.has_media = true;
+                })
+            },
             expect: vec![(
                 TimelineHome,
                 Role::As("underage", viewer_with_age(ViewerAge::Known(17))),

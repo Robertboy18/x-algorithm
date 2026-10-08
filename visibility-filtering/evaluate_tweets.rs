@@ -1,8 +1,8 @@
 use crate::caller_identity::{self, Endpoint};
-use crate::filter::{EvaluationStatus, FilterOutcome, FilterRequest, FilterTweets};
+use crate::filter::{FilterRequest, FilterTweets};
 use crate::filter_tweets::normalize_viewer_id;
 use crate::limited_actions_copy::LimitedActionsCopy;
-use crate::models::{RawCandidate, TweetId, Verdict};
+use crate::models::{Evaluation, RawCandidate, TweetId, Verdict};
 use crate::params::{ClientSwitches, LimitedActionsPolicies};
 use crate::retweet;
 use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard, Rpc};
@@ -45,7 +45,7 @@ impl EvaluateTweetsEndpoint {
     ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
         let entered = tokio::time::Instant::now();
         let request_metrics = RequestMetricsGuard::named(REQUESTS, LATENCY_MS);
-        caller_identity::record(Endpoint::EvaluateTweets, &request);
+        let caller = caller_identity::record(Endpoint::EvaluateTweets, &request);
         let context = crate::hydration::request_context(
             entered,
             crate::filter_tweets::parse_grpc_timeout(request.metadata()),
@@ -57,10 +57,12 @@ impl EvaluateTweetsEndpoint {
         {
             Ok(response) => {
                 request_metrics.mark_success();
+                caller.mark_success();
                 Ok(Response::new(response))
             }
             Err(status) => {
                 request_metrics.mark_failure();
+                caller.mark_failure();
                 Err(status)
             }
         }
@@ -75,12 +77,8 @@ impl EvaluateTweetsEndpoint {
         if !ThriftLevel::ENUM_VALUES.contains(&level) {
             return Err(Status::invalid_argument("unknown safety level"));
         }
-        let safety_level = match level {
-            ThriftLevel::FILTER_ALL => SafetyLevel::FilterAll,
-            ThriftLevel::TIMELINE_HOME => SafetyLevel::TimelineHome,
-            ThriftLevel::TIMELINE_HOME_RECOMMENDATIONS => SafetyLevel::TimelineHomeRecommendations,
-            ThriftLevel::TIMELINE_HOME_HYDRATION => SafetyLevel::TimelineHomeHydration,
-            _ => return Err(Status::unimplemented("safety level has no Rust policy")),
+        let Some(safety_level) = SafetyLevel::from_thrift(level) else {
+            return Err(Status::unimplemented("safety level has no Rust policy"));
         };
         ft_metrics::record_batch_size(BATCH_SIZE, req.tweets.len());
         let candidates = req
@@ -93,16 +91,18 @@ impl EvaluateTweetsEndpoint {
             })
             .collect();
         let viewer_id = normalize_viewer_id(req.viewer_id);
-        let client_capability = self.client_switches.resolve(
-            twitter_context.as_ref(),
-            viewer_id,
-            req.country_code.as_deref(),
-        );
+        let country_code = twitter_context
+            .as_ref()
+            .map(|context| context.request_country_code.as_str())
+            .filter(|code| !code.is_empty());
+        let client_capability =
+            self.client_switches
+                .resolve(twitter_context.as_ref(), viewer_id, country_code);
         let outcomes = retweet::evaluate_merging_sources(
             &self.filter_tweets,
             FilterRequest {
                 viewer_id,
-                country_code: req.country_code.clone(),
+                country_code: country_code.map(str::to_owned),
                 client_capability,
                 safety_level,
                 candidates,
@@ -113,20 +113,27 @@ impl EvaluateTweetsEndpoint {
         ft_metrics::record_verdicts(
             Rpc::EvaluateTweets,
             safety_level,
-            outcomes.iter().map(|outcome| &outcome.verdict),
+            outcomes.iter().map(|outcome| outcome.evaluation.verdict()),
         );
-        ft_metrics::record_rested_on(
+        ft_metrics::record_unresolved(
             Rpc::EvaluateTweets,
             safety_level,
-            outcomes.iter().map(|outcome| outcome.rested_on),
+            outcomes.iter().map(|outcome| &outcome.evaluation),
+        );
+        ft_metrics::record_fail_open_defaults(
+            Rpc::EvaluateTweets,
+            safety_level,
+            outcomes
+                .iter()
+                .map(|outcome| outcome.evaluation.fail_open_defaults()),
         );
         let policies = self.client_switches.limited_actions_policies(
             twitter_context.as_ref(),
             viewer_id,
-            req.country_code.as_deref(),
+            country_code,
             outcomes
                 .iter()
-                .filter_map(|outcome| match &outcome.verdict {
+                .filter_map(|outcome| match outcome.evaluation.verdict() {
                     Verdict::Shown {
                         engagement: Some(limit),
                         ..
@@ -137,9 +144,9 @@ impl EvaluateTweetsEndpoint {
             &self.limited_actions_copy,
             xai_stats_receiver::global_stats_receiver().as_deref(),
         );
-        let outcomes: HashMap<TweetId, FilterOutcome> = outcomes
+        let evaluations: HashMap<TweetId, Evaluation> = outcomes
             .into_iter()
-            .map(|outcome| (outcome.tweet_id, outcome))
+            .map(|outcome| (outcome.tweet_id, outcome.evaluation))
             .collect();
         let results = req
             .tweets
@@ -148,13 +155,16 @@ impl EvaluateTweetsEndpoint {
                 let outcome = if tweet.quote_context.is_some() {
                     Outcome::NotEvaluated(vf_pb::NotEvaluated {})
                 } else {
-                    match outcomes.get(&TweetId(tweet.tweet_id)) {
-                        Some(FilterOutcome {
-                            status: EvaluationStatus::Evaluated,
-                            verdict,
-                            ..
-                        }) => evaluated_outcome(verdict, safety_level, &policies),
-                        _ => Outcome::Failed(vf_pb::Failed {}),
+                    match evaluations.get(&TweetId(tweet.tweet_id)) {
+                        Some(evaluation @ Evaluation::Complete { .. }) => {
+                            evaluated_outcome(evaluation.verdict(), safety_level, &policies)
+                        }
+                        Some(
+                            Evaluation::NotFound(_)
+                            | Evaluation::Partial { .. }
+                            | Evaluation::Failed(_),
+                        )
+                        | None => Outcome::Failed(vf_pb::Failed {}),
                     }
                 };
                 vf_pb::TweetEvaluation {
@@ -181,12 +191,15 @@ fn evaluated_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clients::socialgraph_client::Graph;
     use crate::hydration::plan::Source;
-    use crate::hydration::sources::InMemorySources;
-    use crate::models::VerifyBlurSupport;
+    use crate::hydration::sources::{control, Fault, InMemorySources};
+    use crate::hydration::HYDRATION_TIMEOUT;
+    use crate::models::{TweetFeatures, VerifyBlurSupport};
     use crate::rules::RuleEngine;
     use xai_core_entities::entities::{
-        GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety, UserResponseState,
+        ConversationControlArm, GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety,
+        UserResponseState,
     };
     use xai_x_thrift::action::{self, Action, DropReason};
     use xai_x_thrift::safety_result::{FilteredReason as ThriftFilteredReason, SafetyResult};
@@ -194,12 +207,12 @@ mod tests {
         TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultState,
     };
 
-    fn encoded(state: TweetFieldsResultState) -> Outcome {
-        Outcome::ResultStateThriftCompact(xai_x_thrift::serialize_compact(&state).unwrap().into())
+    fn encoded(state: &TweetFieldsResultState) -> Outcome {
+        Outcome::ResultStateThriftCompact(xai_x_thrift::serialize_compact(state).unwrap().into())
     }
 
     fn filtered(reason: ThriftFilteredReason) -> Outcome {
-        encoded(TweetFieldsResultState::Filtered(
+        encoded(&TweetFieldsResultState::Filtered(
             TweetFieldsResultFiltered::new(reason),
         ))
     }
@@ -213,11 +226,14 @@ mod tests {
         };
         let sources = Arc::new(
             InMemorySources::default()
+                .tweet_features(1, TweetFeatures::default())
+                .fail_key(Source::TesPureCore, 1)
                 .pure_core(3, core(30, None))
                 .pure_core(4, core(40, Some(6)))
                 .pure_core(5, core(50, Some(6)))
                 .pure_core(6, core(60, None))
                 .pure_core(7, core(70, Some(8)))
+                .authors(&[30, 40, 50, 70])
                 .user(
                     60,
                     GizmoduckUserResult {
@@ -233,7 +249,10 @@ mod tests {
                 ),
         );
         let endpoint = EvaluateTweetsEndpoint::new(
-            Arc::new(FilterTweets::new(sources.clone(), RuleEngine::for_tests())),
+            Arc::new(FilterTweets::new(
+                Arc::<InMemorySources>::clone(&sources),
+                RuleEngine::for_tests(),
+            )),
             ClientSwitches::for_tests(),
             LimitedActionsCopy::from_json("[]"),
         );
@@ -274,7 +293,7 @@ mod tests {
             ),
             (
                 ThriftLevel::TIMELINE_HOME_HYDRATION.0,
-                encoded(TweetFieldsResultState::Found(TweetFieldsResultFound::new(
+                encoded(&TweetFieldsResultState::Found(TweetFieldsResultFound::new(
                     None,
                 ))),
             ),
@@ -336,6 +355,75 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_author_removed_community_post_and_its_retweet_drop_or_fail_with_the_lookup() {
+        use crate::models::CommunityModeration;
+        use std::num::NonZeroU64;
+        let dropped = filtered(ThriftFilteredReason::SafetyResult(SafetyResult::new(
+            None,
+            Action::Drop(action::Drop::new(None, None)),
+        )));
+        let failed = Outcome::Failed(vf_pb::Failed {});
+        for (fault, outcome) in [(None, dropped), (Some(Fault::Fails), failed)] {
+            let mut world = InMemorySources::default()
+                .pure_core(
+                    4,
+                    PureCoreData {
+                        author_id: 40,
+                        source_tweet_id: Some(6),
+                        ..Default::default()
+                    },
+                )
+                .tweet(6, 60)
+                .tweet_features(
+                    6,
+                    TweetFeatures {
+                        community_id: NonZeroU64::new(500),
+                        ..Default::default()
+                    },
+                )
+                .community_moderation(
+                    6,
+                    CommunityModeration {
+                        is_hidden: false,
+                        is_author_removed: true,
+                    },
+                )
+                .authors(&[40, 60]);
+            if let Some(fault) = fault {
+                world = world.fault(Source::CommunityModeration, fault);
+            }
+            let endpoint = EvaluateTweetsEndpoint::new(
+                Arc::new(FilterTweets::new(Arc::new(world), RuleEngine::for_tests())),
+                ClientSwitches::for_tests(),
+                LimitedActionsCopy::from_json("[]"),
+            );
+            let response = endpoint
+                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
+                    safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
+                    viewer_id: Some(50),
+                    tweets: [4, 6]
+                        .map(|tweet_id| vf_pb::TweetData {
+                            tweet_id,
+                            quote_context: None,
+                        })
+                        .to_vec(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response
+                    .results
+                    .into_iter()
+                    .map(|r| r.outcome.unwrap())
+                    .collect::<Vec<_>>(),
+                [outcome.clone(), outcome],
+                "{fault:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_conversation_control_limit_carries_its_prompt_in_the_request_language() {
         use crate::limited_actions_copy::tests::BUNDLE;
@@ -350,6 +438,7 @@ mod tests {
         let copy = LimitedActionsCopy::from_json(BUNDLE);
         let limit = limited(ConversationControl, "rule");
         let composite = Verdict::Shown {
+            notice: None,
             media: Some(Decided {
                 value: MediaRestriction::NsfwInterstitial,
                 by: "nsfw_rule",
@@ -390,7 +479,7 @@ mod tests {
                 "limited_replies".to_string(),
             );
             let found = |action| {
-                encoded(TweetFieldsResultState::Found(TweetFieldsResultFound::new(
+                encoded(&TweetFieldsResultState::Found(TweetFieldsResultFound::new(
                     ThriftFilteredReason::SafetyResult(SafetyResult::new(None, action)),
                 )))
             };
@@ -414,6 +503,47 @@ mod tests {
                     "{language:?} {verdict:?}"
                 );
             }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_root_edge_call_fails_the_tweet_whichever_input_lands_first() {
+        for delayed in [Source::TesConversationControl, Source::TesPureCore] {
+            let sources = InMemorySources::default()
+                .tweet(1, 10)
+                .authors(&[10])
+                .control(1, control(ConversationControlArm::Subscribers, 40, &[]))
+                .fault(delayed, Fault::Delays(HYDRATION_TIMEOUT / 2))
+                .hang_graph(Graph::SuperFollows);
+            let endpoint = EvaluateTweetsEndpoint::new(
+                Arc::new(FilterTweets::new(
+                    Arc::new(sources),
+                    RuleEngine::for_tests(),
+                )),
+                ClientSwitches::for_tests(),
+                LimitedActionsCopy::from_json("[]"),
+            );
+            let response = endpoint
+                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
+                    safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
+                    viewer_id: Some(50),
+                    tweets: vec![vf_pb::TweetData {
+                        tweet_id: 1,
+                        quote_context: None,
+                    }],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response
+                    .results
+                    .into_iter()
+                    .map(|r| r.outcome.unwrap())
+                    .collect::<Vec<_>>(),
+                [Outcome::Failed(vf_pb::Failed {})],
+                "{delayed:?} lands last"
+            );
         }
     }
 
@@ -462,7 +592,6 @@ mod tests {
                     tweet_id: 4,
                     quote_context: None,
                 }],
-                ..Default::default()
             });
             if let Some(header) = header {
                 request.metadata_mut().insert("twittercontext", header);

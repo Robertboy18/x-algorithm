@@ -1,6 +1,6 @@
 use super::builders::{author_candidate, tweet_candidate, viewer_in_country, viewer_with_age};
 use super::{Role, Row};
-use crate::models::{ViewerAge, ViewerFeatures};
+use crate::models::{HydratedTweetCandidate, ViewerAge, ViewerFeatures};
 use crate::rules::fixtures::{allow, author_viewer, dropped};
 use crate::rules::SafetyLevel::{
     ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeRecommendations,
@@ -225,10 +225,10 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "geo_denied_media_retweet",
-            post: tweet_candidate(|t| {
-                t.media.geo_deny_list = vec!["de".to_string()];
-                t.source_tweet_id = Some(2);
-            }),
+            post: HydratedTweetCandidate {
+                source_tweet_id: Some(2),
+                ..tweet_candidate(|t| t.media.geo_deny_list = vec!["de".to_string()])
+            },
             expect: vec![(
                 TimelineHomeRecommendations,
                 Role::As("in_de", viewer_in_country("de")),

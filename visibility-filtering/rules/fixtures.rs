@@ -1,20 +1,22 @@
 use crate::hydration::Hydrator;
 use crate::models::{
     AuthorFeatures, AuthorLabel, ClientCapability, ConversationControlFeatures, Decided,
-    DropReason, HydratedTweetCandidate, LimitedEngagement, LimitedEngagementReason,
-    MediaInterstitial, MediaRestriction, NsfwViewerDropReason, SafetyLabelMap, SafetyLabelType,
-    TombstoneReason, TweetFeatures, Verdict, VerifyBlurSupport, Viewer, ViewerFeatures,
-    ViewerProfile, Withholding,
+    DropReason, FosnrReason, HydratedTweetCandidate, LimitedEngagement, LimitedEngagementReason,
+    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, SafetyLabelMap,
+    SafetyLabelType, TombstoneReason, TweetFeatures, Verdict, VerifyBlurSupport, Viewer,
+    ViewerFeatures, ViewerProfile, Withholding,
 };
+use crate::params::LimitedActionType;
 use std::collections::HashSet;
 use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
 use xai_visibility_filtering::models::FilteredReason;
-use xai_x_thrift::action::{InterstitialAction, InterstitialReason};
+use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
 const TWEET_ID: u64 = 1;
 pub(super) const AUTHOR_ID: u64 = 100;
 pub(crate) const VIEWER_ID: u64 = 999;
 
+#[derive(Clone, Copy)]
 pub(crate) struct ClientClass {
     pub(crate) name: &'static str,
     pub(crate) app_id: i64,
@@ -22,7 +24,7 @@ pub(crate) struct ClientClass {
     pub(crate) capability: ClientCapability,
 }
 
-pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
+pub(crate) const CLIENT_CLASSES: [ClientClass; 8] = {
     use VerifyBlurSupport::{AndroidNeedsUpdate, IosNeedsUpdate, Supported, Unsupported};
     const RWEB: i64 = 3033300;
     const IPHONE: i64 = 129032;
@@ -44,10 +46,22 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
                 verify_blur_support: Some(verify_blur_support),
                 modern_blur,
                 stale_tweet_limits: true,
+                community_viewer_removed_limits: matches!(app_id, RWEB | IPHONE | ANDROID),
                 gore_blur_ignores_settings,
                 fosnr_rules: true,
                 fosnr_fallback_drops: false,
             },
+        }
+    }
+    const fn android_9_82(class: ClientClass) -> ClientClass {
+        ClientClass {
+            capability: ClientCapability {
+                fosnr_rules: false,
+                fosnr_fallback_drops: true,
+                community_viewer_removed_limits: false,
+                ..class.capability
+            },
+            ..class
         }
     }
     [
@@ -94,6 +108,15 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
             true,
             true,
         ),
+        android_9_82(class(
+            "android_without_fosnr",
+            ANDROID,
+            "TwitterAndroid/9.82.0-release.00 (29820000-r-0) Pixel 7/14 \
+             (Google;panther;google;panther;0;;1;2022)",
+            AndroidNeedsUpdate,
+            false,
+            false,
+        )),
         class(
             "mac_app",
             MAC,
@@ -115,6 +138,68 @@ pub(crate) const CLIENT_CLASSES: [ClientClass; 7] = {
 
 pub(crate) fn allow() -> Verdict {
     Verdict::Shown {
+        notice: None,
+        media: None,
+        engagement: None,
+    }
+}
+
+pub(crate) fn noticed(proactive: bool, appeal_submitted: bool, by: &'static str) -> Verdict {
+    Verdict::Shown {
+        notice: Some(Decided {
+            value: Notice::SoftIntervention(FosnrReason {
+                policy: AppealablePolicy::ABUSE,
+                level: 1,
+                proactive,
+                appeal_submitted,
+            }),
+            by,
+        }),
+        media: None,
+        engagement: None,
+    }
+}
+
+pub(crate) fn appealed(
+    policy: AppealablePolicy,
+    level: i8,
+    proactive: bool,
+    appeal_submitted: bool,
+    by: &'static str,
+) -> Verdict {
+    use LimitedActionType as A;
+    let limited_actions: &'static [LimitedActionType] = if level == 1 {
+        &[A::EditTweet]
+    } else {
+        &[
+            A::Like,
+            A::Reply,
+            A::Retweet,
+            A::QuoteTweet,
+            A::ShareTweetVia,
+            A::AddToBookmarks,
+            A::PinToProfile,
+            A::CopyLink,
+            A::SendViaDm,
+            A::EditTweet,
+            A::Highlight,
+            A::Embed,
+            A::ListsAddRemove,
+        ]
+    };
+    Verdict::Shown {
+        notice: Some(Decided {
+            value: Notice::Appealable {
+                reason: FosnrReason {
+                    policy,
+                    level,
+                    proactive,
+                    appeal_submitted,
+                },
+                limited_actions,
+            },
+            by,
+        }),
         media: None,
         engagement: None,
     }
@@ -159,6 +244,7 @@ fn media_blurred(
     by: &'static str,
 ) -> Verdict {
     Verdict::Shown {
+        notice: None,
         media: Some(Decided {
             value: MediaRestriction::MediaInterstitial(MediaInterstitial {
                 legacy: FilteredReason::ContainNsfwMedia,
@@ -173,6 +259,7 @@ fn media_blurred(
 
 pub(crate) fn legacy_interstitial(by: &'static str) -> Verdict {
     Verdict::Shown {
+        notice: None,
         media: Some(Decided {
             value: MediaRestriction::NsfwInterstitial,
             by,
@@ -192,6 +279,7 @@ pub(crate) fn limited_for(reasons: &[LimitedEngagementReason], by: &'static str)
         value.add(reason);
     }
     Verdict::Shown {
+        notice: None,
         media: None,
         engagement: Some(Decided { value, by }),
     }
@@ -199,9 +287,11 @@ pub(crate) fn limited_for(reasons: &[LimitedEngagementReason], by: &'static str)
 
 pub(crate) fn blurred_and_limited(blur: Verdict, limit: Verdict) -> Verdict {
     match (blur, limit) {
-        (Verdict::Shown { media, .. }, Verdict::Shown { engagement, .. }) => {
-            Verdict::Shown { media, engagement }
-        }
+        (Verdict::Shown { media, .. }, Verdict::Shown { engagement, .. }) => Verdict::Shown {
+            notice: None,
+            media,
+            engagement,
+        },
         (blur, limit) => panic!("expected two Shown verdicts, got {blur:?} and {limit:?}"),
     }
 }
@@ -270,12 +360,14 @@ pub(crate) fn candidate() -> CandidateBuilder {
             ..Default::default()
         },
         labels: HashSet::new(),
+        agent_labels: HashSet::new(),
     }
 }
 
 pub(crate) struct CandidateBuilder {
     candidate: HydratedTweetCandidate,
     labels: HashSet<SafetyLabelType>,
+    agent_labels: HashSet<SafetyLabelType>,
 }
 
 impl CandidateBuilder {
@@ -287,6 +379,11 @@ impl CandidateBuilder {
     pub(crate) fn with_label(mut self, label: SafetyLabelType) -> Self {
         self.labels.insert(label);
         self
+    }
+
+    pub(crate) fn with_agent_label(mut self, label: SafetyLabelType) -> Self {
+        self.agent_labels.insert(label);
+        self.with_label(label)
     }
 
     pub(crate) fn with_author_user_label(mut self, label: AuthorLabel) -> Self {
@@ -324,14 +421,17 @@ impl CandidateBuilder {
     }
 
     pub(crate) fn retweet_of(mut self, source_tweet_id: u64) -> Self {
-        self.candidate.tweet_features.source_tweet_id = Some(source_tweet_id);
+        self.candidate.source_tweet_id = Some(source_tweet_id);
         self
     }
 
     pub(crate) fn build(self) -> HydratedTweetCandidate {
         let mut candidate = self.candidate;
         if !self.labels.is_empty() {
-            candidate.safety_labels = SafetyLabelMap::new(self.labels);
+            candidate.safety_labels = self.agent_labels.into_iter().fold(
+                SafetyLabelMap::new(self.labels),
+                SafetyLabelMap::assigned_by_agent,
+            );
         }
         candidate
     }

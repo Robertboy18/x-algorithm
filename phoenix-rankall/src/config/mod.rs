@@ -176,6 +176,8 @@ impl PipelineKind {
                 WindowConfig::bounded("1fav_video", 24 * 4, 24 * 14),
                 WindowConfig::bounded("1fav_video", 24 * 4, 24 * 30),
                 WindowConfig::new("32fav", 24),
+                WindowConfig::new("1fav_reply", 24),
+                WindowConfig::new("32fav_reply", 24),
                 WindowConfig::new("video", 48),
                 WindowConfig::new("video", 96),
                 WindowConfig::new("video", 168),
@@ -202,6 +204,7 @@ impl PipelineKind {
             ],
             Self::Sid => vec![
                 WindowConfig::new("1fav", 24),
+                WindowConfig::new("1fav_reply", 24),
                 WindowConfig::new("1fav_video", 48),
                 WindowConfig::bounded("1fav_video", 24 * 2, 24 * 4),
                 WindowConfig::bounded("1fav_video", 24 * 4, 24 * 14),
@@ -307,7 +310,7 @@ mod tests {
         assert!(names.contains(&"1fav_video_4to30day".to_string()));
         assert!(names.contains(&"1fav_video_2day".to_string()));
         assert!(names.contains(&"1fav_video_2to4day".to_string()));
-        assert_eq!(configs.len(), 17);
+        assert_eq!(configs.len(), 19);
     }
 
     #[test]

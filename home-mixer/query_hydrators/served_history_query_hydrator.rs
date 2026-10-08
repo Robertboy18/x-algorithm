@@ -2,7 +2,7 @@ use crate::clients::served_history_client::{ServedHistoryClient, TimelineType};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
     EnableUrtMigrationComponents, ExcludeServedTweetIdsDuration, ExcludeServedTweetIdsNumber,
-    FeedSurveyFatigueMinutes, WhoToFollowFatigueHours,
+    FeedSurveyFatigueMinutes, VideoCarouselFatigueMinutes, WhoToFollowFatigueHours,
 };
 use std::sync::Arc;
 use tonic::async_trait;
@@ -49,6 +49,13 @@ impl QueryHydrator<ScoredPostsQuery> for ServedHistoryQueryHydrator {
             query.request_time_ms,
         );
 
+        let video_carousel_eligible = is_module_eligible(
+            &entries,
+            EntityIdType::VIDEO_CAROUSEL_MODULE,
+            query.params.get(VideoCarouselFatigueMinutes) as i64 * 60_000,
+            query.request_time_ms,
+        );
+
         let served_ids = recently_served_ids(
             &entries,
             query.request_time_ms,
@@ -61,6 +68,7 @@ impl QueryHydrator<ScoredPostsQuery> for ServedHistoryQueryHydrator {
             served_ids,
             who_to_follow_eligible,
             feed_survey_eligible,
+            video_carousel_eligible,
             ..Default::default()
         })
     }
@@ -70,6 +78,7 @@ impl QueryHydrator<ScoredPostsQuery> for ServedHistoryQueryHydrator {
         query.served_ids = hydrated.served_ids;
         query.who_to_follow_eligible = hydrated.who_to_follow_eligible;
         query.feed_survey_eligible = hydrated.feed_survey_eligible;
+        query.video_carousel_eligible = hydrated.video_carousel_eligible;
     }
 }
 

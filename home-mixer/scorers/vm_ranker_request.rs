@@ -9,12 +9,14 @@ const DPP_VALUE_MODEL_ID: &str = "dpp";
 
 pub(crate) struct RequestShape {
     debias: bool,
+    pacing: bool,
 }
 
 impl RequestShape {
     pub(crate) fn from_query(query: &ScoredPostsQuery) -> Self {
         Self {
             debias: !query.has_cached_posts && query.params.get(VMRankerSendDebiasInputs),
+            pacing: query.params.get(VMRankerSendPacingInputs),
         }
     }
 
@@ -58,10 +60,11 @@ impl RequestShape {
             min_video_duration_ms: c.min_video_duration_ms,
             phoenix_scores: Some(phoenix_scores_proto(&c.phoenix_scores)),
             weighted_score: c.weighted_score,
+            semantic_ids: c.semantic_ids.clone().unwrap_or_default(),
             ..Default::default()
         };
-        if self.debias {
-            out.experiment_payload = candidate_payload(c).into();
+        if self.debias || self.pacing {
+            out.experiment_payload = candidate_payload(c, self.debias, self.pacing).into();
         }
         out
     }
@@ -111,6 +114,7 @@ fn phoenix_scores_proto(s: &PhoenixScores) -> pb::PhoenixScores {
         open_link_score: s.open_link_score,
         quoted_vqv_score: s.quoted_vqv_score,
         post_unexplored_score: s.post_unexplored_score,
-        active_secs_5m_residual_norm: s.active_secs_5m_residual_norm,
+        home_video_continuation_secs: s.home_video_continuation_secs,
+        home_profile_visit_secs: s.home_profile_visit_secs,
     }
 }

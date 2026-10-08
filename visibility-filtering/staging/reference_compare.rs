@@ -1,6 +1,6 @@
-use crate::config::ENV_IMAGE;
 use crate::models::{Decided, Verdict, Withholding};
 use crate::rules::SafetyLevel;
+use crate::staging::reference::ENV_IMAGE;
 use crate::treatment;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +33,7 @@ fn service_triple(
             ..
         }) => Some(reason.legacy()),
         Verdict::Shown {
+            notice: _,
             media: Some(Decided { value, .. }),
             engagement: None | Some(_),
         } => Some(value.legacy()),
@@ -41,6 +42,7 @@ fn service_triple(
             ..
         })
         | Verdict::Shown {
+            notice: _,
             media: None,
             engagement: None | Some(_),
         } => None,
@@ -51,7 +53,7 @@ fn service_triple(
     (treatment::metric_label(verdict), reason, rule)
 }
 
-fn reference_action_label(reason: &Option<FilteredReason>) -> &'static str {
+fn reference_action_label(reason: Option<&FilteredReason>) -> &'static str {
     match reason {
         None => "allow",
         Some(FilteredReason::SafetyResult(safety_result)) => match safety_result.action {
@@ -76,7 +78,21 @@ fn reason_token(reason: &FilteredReason) -> String {
         FilteredReason::TweetMatchesViewerMutedKeyword(_) => {
             "TweetMatchesViewerMutedKeyword".to_string()
         }
-        other => format!("{other:?}"),
+        other @ (FilteredReason::ContainNsfwMedia
+        | FilteredReason::AuthorBlockViewer
+        | FilteredReason::PossiblyUndesirable
+        | FilteredReason::UnspecifiedReason
+        | FilteredReason::AuthorAccountIsInactive
+        | FilteredReason::AuthorIsProtected
+        | FilteredReason::AuthorIsUnsafe
+        | FilteredReason::ReportedTweet
+        | FilteredReason::TweetIsBounced
+        | FilteredReason::AuthorIsDeactivated
+        | FilteredReason::AuthorIsSuspended
+        | FilteredReason::ViewerMutesAuthor
+        | FilteredReason::TweetIsNullcast
+        | FilteredReason::ExclusiveTweet
+        | FilteredReason::ViewerBlocksAuthor) => format!("{other:?}"),
     }
 }
 
@@ -94,7 +110,7 @@ fn service_verdict_str(verdict: &Verdict) -> String {
     out
 }
 
-fn reference_verdict_str(reference: &Option<FilteredReason>) -> String {
+fn reference_verdict_str(reference: Option<&FilteredReason>) -> String {
     match reference {
         None => "allow".to_string(),
         Some(reason) => format!(
@@ -105,9 +121,9 @@ fn reference_verdict_str(reference: &Option<FilteredReason>) -> String {
     }
 }
 
-pub(crate) fn is_exact_match(service: &Verdict, reference: &Option<FilteredReason>) -> bool {
+pub(crate) fn is_exact_match(service: &Verdict, reference: Option<&FilteredReason>) -> bool {
     let (service_action, service_reason, _) = service_triple(service);
-    service_action == reference_action_label(reference) && service_reason == reference.as_ref()
+    service_action == reference_action_label(reference) && service_reason == reference
 }
 
 pub(crate) struct TweetVerdict {
@@ -129,6 +145,10 @@ enum CompareResult {
 }
 
 impl VerdictSender {
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "the compare task holds its receiver until it reads the verdicts, so a failed send means the task already ended and only the comparison is lost"
+    )]
     pub(crate) fn send(self, verdicts: Vec<TweetVerdict>) {
         let _ = self.sender.send(verdicts);
     }
@@ -175,14 +195,14 @@ pub(crate) fn compare_batch(
             Some(Ok(reason)) => reason,
         };
         counts.compared += 1;
-        if is_exact_match(verdict, reference) {
+        if is_exact_match(verdict, reference.as_ref()) {
             counts.exact_match += 1;
         } else {
             counts.differed += 1;
             diffs.push(Diff {
                 tweet_id: *tweet_id,
                 service: service_verdict_str(verdict),
-                reference: reference_verdict_str(reference),
+                reference: reference_verdict_str(reference.as_ref()),
             });
         }
     }
@@ -246,7 +266,7 @@ fn line_json(
     context: &CompareContext<'_>,
     batch: &str,
     chunk: [usize; 2],
-    diffs: Vec<serde_json::Value>,
+    diffs: &[serde_json::Value],
 ) -> serde_json::Value {
     serde_json::json!({
         "h": HARNESS_LINE_MARKER,
@@ -269,9 +289,7 @@ pub(crate) fn chunk_lines(
     if diffs.is_empty() {
         return Vec::new();
     }
-    let header_len = line_json(context, batch, [1, 1], Vec::new())
-        .to_string()
-        .len();
+    let header_len = line_json(context, batch, [1, 1], &[]).to_string().len();
     let budget = LINE_BUDGET_BYTES.saturating_sub(header_len);
     let mut pages: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut current: Vec<serde_json::Value> = Vec::new();
@@ -292,7 +310,7 @@ pub(crate) fn chunk_lines(
     pages
         .into_iter()
         .enumerate()
-        .map(|(index, page)| line_json(context, batch, [index + 1, total], page))
+        .map(|(index, page)| line_json(context, batch, [index + 1, total], &page))
         .collect()
 }
 
@@ -336,8 +354,8 @@ pub(crate) fn resolve_build_sha(compiled: &str, image: Option<&str>) -> String {
 }
 
 fn sha_prefix(s: &str) -> Option<&str> {
-    let n = s.bytes().take_while(u8::is_ascii_hexdigit).count();
-    (n >= BUILD_SHA_LEN).then(|| &s[..BUILD_SHA_LEN])
+    s.get(..BUILD_SHA_LEN)
+        .filter(|prefix| prefix.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 pub struct ReferenceCompareHarness {
@@ -458,7 +476,7 @@ impl ReferenceCompareHarness {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::models::{MediaInterstitial, MediaRestriction};
     use xai_visibility_filtering::models::{
@@ -493,6 +511,7 @@ pub(crate) mod tests {
 
     fn service_allow() -> Verdict {
         Verdict::Shown {
+            notice: None,
             media: None,
             engagement: None,
         }
@@ -511,6 +530,7 @@ pub(crate) mod tests {
 
     fn service_interstitial() -> Verdict {
         Verdict::Shown {
+            notice: None,
             media: Some(Decided {
                 value: MediaRestriction::MediaInterstitial(MediaInterstitial {
                     legacy: FilteredReason::ContainNsfwMedia,
@@ -525,26 +545,35 @@ pub(crate) mod tests {
 
     #[test]
     fn strict_equality_no_normalization() {
-        assert!(is_exact_match(&service_allow(), &reference_allow()));
-        assert!(is_exact_match(&service_drop(), &reference_bare_drop()));
+        assert!(is_exact_match(&service_allow(), reference_allow().as_ref()));
+        assert!(is_exact_match(
+            &service_drop(),
+            reference_bare_drop().as_ref()
+        ));
         assert!(!is_exact_match(
             &service_drop_of(FilteredReason::AuthorIsUnsafe),
-            &reference_bare_drop()
+            reference_bare_drop().as_ref()
         ));
-        assert!(!is_exact_match(&service_interstitial(), &reference_allow()));
+        assert!(!is_exact_match(
+            &service_interstitial(),
+            reference_allow().as_ref()
+        ));
         assert!(!is_exact_match(
             &service_allow(),
-            &reference_safety_result(Action::Avoid)
+            reference_safety_result(Action::Avoid).as_ref()
         ));
         assert!(!is_exact_match(
             &service_drop(),
-            &reference_safety_result(Action::Drop(DropReason {}))
+            reference_safety_result(Action::Drop(DropReason {})).as_ref()
         ));
         assert!(!is_exact_match(
             &service_allow(),
-            &reference_muted_keyword()
+            reference_muted_keyword().as_ref()
         ));
-        assert!(!is_exact_match(&service_drop(), &reference_muted_keyword()));
+        assert!(!is_exact_match(
+            &service_drop(),
+            reference_muted_keyword().as_ref()
+        ));
     }
 
     fn verdict(tweet_id: u64, verdict: Verdict) -> TweetVerdict {
@@ -591,7 +620,7 @@ pub(crate) mod tests {
 
     const RECORDER_LINE_FIXTURE: &str = "scripts/tests/fixtures/recorder_lines.json";
 
-                #[test]
+    #[test]
     fn recorder_line_fixture_matches_chunk_lines() {
         use xai_visibility_filtering::models::SafetyResultReason;
         let avoid_nsfw = Some(FilteredReason::SafetyResult(ReferenceSafetyResult {
@@ -628,7 +657,7 @@ pub(crate) mod tests {
             .map(|(i, (service, reference))| Diff {
                 tweet_id: ID + i as u64,
                 service: service_verdict_str(service),
-                reference: reference_verdict_str(reference),
+                reference: reference_verdict_str(reference.as_ref()),
             })
             .collect();
         let emitted = serde_json::Value::Array(chunk_lines(&context(), "b1", &diffs));
@@ -660,7 +689,7 @@ pub(crate) mod tests {
 
     #[test]
     fn muted_keyword_payload_never_reaches_the_line() {
-        let encoded = reference_verdict_str(&reference_muted_keyword());
+        let encoded = reference_verdict_str(reference_muted_keyword().as_ref());
         assert_eq!(encoded, "drop:TweetMatchesViewerMutedKeyword");
         assert!(!encoded.contains("spoilers"), "viewer content leaked");
     }
@@ -790,9 +819,7 @@ pub(crate) mod tests {
 
     #[test]
     fn chunk_lines_fills_a_page_to_the_exact_byte_budget() {
-        let header_len = line_json(&context(), "b5", [1, 1], Vec::new())
-            .to_string()
-            .len();
+        let header_len = line_json(&context(), "b5", [1, 1], &[]).to_string().len();
         let budget = LINE_BUDGET_BYTES - header_len;
         let slice_cost = |service: &str, id: u64| {
             serde_json::json!([service, "avoid:SafetyResult", [id]])
@@ -812,16 +839,16 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) type RecordedCall = (Vec<u64>, ReferenceSafetyLevel, u64, Option<String>);
+    type RecordedCall = (Vec<u64>, ReferenceSafetyLevel, u64, Option<String>);
 
-    pub(crate) enum FakeReply {
+    enum FakeReply {
         Immediate,
         Hangs,
     }
 
-    pub(crate) struct FakeReference {
-        pub(crate) calls: std::sync::Mutex<Vec<RecordedCall>>,
-        pub(crate) called: tokio::sync::Notify,
+    struct FakeReference {
+        calls: std::sync::Mutex<Vec<RecordedCall>>,
+        called: tokio::sync::Notify,
         reply: FakeReply,
     }
 
@@ -860,16 +887,17 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn fake_harness(
-        reply: FakeReply,
-    ) -> (Arc<ReferenceCompareHarness>, Arc<FakeReference>) {
+    fn fake_harness(reply: FakeReply) -> (Arc<ReferenceCompareHarness>, Arc<FakeReference>) {
         let fake = Arc::new(FakeReference {
             calls: std::sync::Mutex::new(Vec::new()),
             called: tokio::sync::Notify::new(),
             reply,
         });
         (
-            Arc::new(ReferenceCompareHarness::new(fake.clone(), "atla")),
+            Arc::new(ReferenceCompareHarness::new(
+                Arc::<FakeReference>::clone(&fake),
+                "atla",
+            )),
             fake,
         )
     }

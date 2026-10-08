@@ -1,14 +1,20 @@
 use crate::clients::about_this_account_client::ProdAboutThisAccountClient;
+use crate::clients::article_client::ProdArticleClient;
 use crate::clients::socialgraph_client::ProdSocialgraphClient;
+use crate::clients::trusted_friends_client::ProdTrustedFriendsClient;
+use crate::clients::user_location_client::ProdUserLocationClient;
 use crate::clients::wingman_client::ProdWingmanClient;
 use crate::evaluate_tweets::EvaluateTweetsEndpoint;
-use crate::filter::{EvaluationStatus, FilterRequest, FilterResponse, FilterTweets};
-use crate::filter_tweets::FilterTweetsEndpoint;
+use crate::filter::{FilterRequest, FilterResponse, FilterTweets};
+use crate::filter_tweets::{Comparator, FilterTweetsEndpoint};
 use crate::get_safety_labels::GetSafetyLabelsEndpoint;
+use crate::hydration::community_source::CommunitySource;
 use crate::hydration::sources::ProdSources;
 use crate::hydration::tweet_source::TweetSource;
+use crate::hydration::{AuthorFallbackCache, Lookup, TweetFallbackCache};
 use crate::limited_actions_copy::LimitedActionsCopy;
-use crate::models::{ClientCapability, RawCandidate, TweetId};
+use crate::models::{ClientCapability, Evaluation, RawCandidate, TweetId};
+use crate::params::ClientSwitches;
 use crate::rules::metrics::Rpc;
 use crate::rules::SafetyLevel;
 use crate::safety_label_source::lookup::RemoteSource;
@@ -21,6 +27,7 @@ use anyhow::Context;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tonic::metadata::MetadataMap;
 use tracing::{error, info, warn};
 use xai_cache::discovery::WilyDiscovery;
 use xai_cache::{
@@ -41,9 +48,16 @@ use xai_xds_client::StartFrom;
 const CACHE_PATH: &str = "/s/cache/safety_label_store:twemcaches";
 const READINESS_PROBE_PORT: u16 = 8081;
 
-const CLIENT_INIT_RETRY_BUDGET: Duration = Duration::from_secs(240);
+pub(crate) const CLIENT_INIT_RETRY_BUDGET: Duration = Duration::from_secs(240);
 const CLIENT_INIT_MAX_BACKOFF: Duration = Duration::from_secs(15);
 const CLIENT_INIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) fn with_metadata(strato: StratoGrpc, metadata: Option<&MetadataMap>) -> StratoGrpc {
+    match metadata {
+        Some(metadata) => strato.with_default_metadata(metadata.clone()),
+        None => strato,
+    }
+}
 
 pub(crate) async fn init_client_with_retry<T, E, Fut>(
     client: &str,
@@ -99,11 +113,19 @@ where
     }
 }
 
+pub(crate) struct ServerDeps {
+    pub(crate) init_deadline: tokio::time::Instant,
+    pub(crate) filter_tweets: Arc<FilterTweets>,
+    pub(crate) client_switches: ClientSwitches,
+    limited_actions_copy: LimitedActionsCopy,
+    safety_label_source: Arc<SafetyLabelSource>,
+}
+
 #[expect(
     clippy::expect_used,
     reason = "startup fail-fast: init failure is fatal"
 )]
-pub async fn build_prod_server(datacenter: &str) -> VFServer {
+pub(crate) async fn build(datacenter: &str, metadata: Option<&MetadataMap>) -> ServerDeps {
     info!("Initializing prod clients for datacenter={}", datacenter);
 
     let (limited_actions_copy, copy_drift) = LimitedActionsCopy::load_baked(
@@ -113,13 +135,87 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
     let init_deadline = tokio::time::Instant::now() + CLIENT_INIT_RETRY_BUDGET;
 
     let deterministic_aperture = std::env::var("APP_ENV").as_deref() == Ok("prod");
-    let fallback_cache_enabled = crate::config::fallback_cache_enabled();
-    let fallback_cache = fallback_cache_enabled.then(crate::hydration::author_fallback_cache);
-    let author_id_fallback_enabled = crate::config::author_id_fallback_enabled();
-    let author_id_fallback_capacity = crate::config::author_id_fallback_capacity();
-    let pure_core_fallback_cache = author_id_fallback_enabled
-        .then(|| crate::hydration::pure_core_fallback_cache(author_id_fallback_capacity));
+    let author_cache_capacity = crate::config::author_cache_capacity();
+    let author_cache = author_cache_capacity.map(crate::hydration::author_fallback_cache);
+    let tweet_cache_capacity = crate::config::tweet_cache_capacity();
+    let tweet_cache = tweet_cache_capacity.map(crate::hydration::tweet_fallback_cache);
 
+    let (sources, safety_label_source) = prod_sources(
+        datacenter,
+        init_deadline,
+        deterministic_aperture,
+        author_cache,
+        tweet_cache,
+        metadata,
+    )
+    .await;
+    let stats = xai_stats_receiver::global_stats_receiver();
+    let mut switch_files = crate::params::SwitchFiles::beside(&crate::config::fs_path());
+    let feature_switches = Arc::new(arc_swap::ArcSwap::from_pointee(
+        switch_files
+            .load(stats.as_deref())
+            .expect("files that each built an engine build one together"),
+    ));
+    let country_lists = Arc::new(crate::params::CountryLists::starting_at_default());
+    country_lists.refresh(&feature_switches.load());
+    let client_switches = crate::params::ClientSwitches::new(Arc::clone(&feature_switches));
+    crate::params::spawn_refresh(
+        switch_files,
+        feature_switches,
+        Arc::clone(&country_lists),
+        copy_drift,
+        stats,
+    );
+    let rule_engine = crate::rules::RuleEngine::with_country_lists(country_lists);
+    let (home_rule_count, recommendations_rule_count) = rule_engine.rule_counts();
+    let filter_tweets = Arc::new(FilterTweets::new(Arc::new(sources), rule_engine));
+
+    warm_filter_tweets(&filter_tweets).await;
+
+    info!(
+        hydrator_count = 5,
+        author_cache_capacity = author_cache_capacity.unwrap_or(0),
+        tweet_cache_capacity = tweet_cache_capacity.unwrap_or(0),
+        home_rule_count,
+        recommendations_rule_count,
+        "VFServer initialized with prod clients"
+    );
+
+    ServerDeps {
+        init_deadline,
+        filter_tweets,
+        client_switches,
+        limited_actions_copy,
+        safety_label_source,
+    }
+}
+
+impl ServerDeps {
+    pub(crate) fn into_server(self, comparator: Option<Box<dyn Comparator>>) -> VFServer {
+        VFServer::from_endpoints(
+            EvaluateTweetsEndpoint::new(
+                Arc::clone(&self.filter_tweets),
+                self.client_switches,
+                self.limited_actions_copy,
+            ),
+            FilterTweetsEndpoint::new(self.filter_tweets, comparator),
+            GetSafetyLabelsEndpoint::new(self.safety_label_source),
+        )
+    }
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "startup fail-fast: init failure is fatal"
+)]
+pub(crate) async fn prod_sources(
+    datacenter: &str,
+    init_deadline: tokio::time::Instant,
+    deterministic_aperture: bool,
+    author_cache: Option<AuthorFallbackCache>,
+    tweet_cache: Option<TweetFallbackCache>,
+    metadata: Option<&MetadataMap>,
+) -> (ProdSources, Arc<SafetyLabelSource>) {
     let tes_client = Arc::new(
         init_client_with_retry("tes", init_deadline, || async move {
             let strato = build_xds_strato(
@@ -133,6 +229,7 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
                     client_id: S2S_CLIENT_ID.clone(),
                     retry_config: Some(RetryConfig::for_idempotent()),
                     max_batch_size: TESRpcConstants::max_batch_size(),
+                    metadata: metadata.cloned(),
                 },
                 deterministic_aperture,
             )
@@ -161,6 +258,7 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
                         client_id,
                         retry_config: None,
                         max_batch_size: GizmoduckRpcConstants::max_batch_size(),
+                        metadata: metadata.cloned(),
                     },
                     deterministic_aperture,
                 )
@@ -187,34 +285,40 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
                     &S2S_CRT_PATH,
                     &S2S_KEY_PATH,
                     deterministic_aperture,
+                    metadata.cloned(),
                 )
             })
             .await
             .expect("Failed to initialize SocialGraph client"),
         );
 
-    let about_this_account_client = Arc::new(ProdAboutThisAccountClient::new(
-        init_client_with_retry("strato_about_this_account", init_deadline, || {
-            let config = xai_strato::StratoGrpcConfig {
-                ca_cert_path: S2S_CHAIN_PATH.clone(),
-                client_cert_path: S2S_CRT_PATH.clone(),
-                client_key_path: S2S_KEY_PATH.clone(),
-                aperture_size: Some(STRATO_APERTURE_SIZE),
-                deterministic_aperture,
-                connect_timeout_ms: u64::try_from(STRATO_CONNECT_TIMEOUT.as_millis())
-                    .unwrap_or(u64::MAX),
-                request_timeout_ms: u64::try_from(STRATO_REQUEST_TIMEOUT.as_millis())
-                    .unwrap_or(u64::MAX),
-                client_id: Some(S2S_CLIENT_ID.clone()),
-                service_url: format!("stratostore.stratoserver.prod.{datacenter}.s2s.twttr.net"),
-                zone: datacenter.to_string(),
-                ..Default::default()
-            };
-            async move { StratoGrpc::new(config).await }
-        })
-        .await
-        .expect("Failed to initialize Strato about_this_account client"),
-    ));
+    let stratoserver = init_client_with_retry("stratoserver", init_deadline, || {
+        let config = xai_strato::StratoGrpcConfig {
+            ca_cert_path: S2S_CHAIN_PATH.clone(),
+            client_cert_path: S2S_CRT_PATH.clone(),
+            client_key_path: S2S_KEY_PATH.clone(),
+            aperture_size: Some(STRATO_APERTURE_SIZE),
+            deterministic_aperture,
+            connect_timeout_ms: u64::try_from(STRATO_CONNECT_TIMEOUT.as_millis())
+                .unwrap_or(u64::MAX),
+            request_timeout_ms: u64::try_from(STRATO_REQUEST_TIMEOUT.as_millis())
+                .unwrap_or(u64::MAX),
+            client_id: Some(S2S_CLIENT_ID.clone()),
+            service_url: format!("stratostore.stratoserver.prod.{datacenter}.s2s.twttr.net"),
+            zone: datacenter.to_string(),
+            ..Default::default()
+        };
+        async move { anyhow::Ok(with_metadata(StratoGrpc::new(config).await?, metadata)) }
+    })
+    .await
+    .expect("Failed to initialize the stratoserver client");
+    let communities = CommunitySource {
+        grpc_client: stratoserver.clone(),
+    };
+    let about_this_account_client = Arc::new(ProdAboutThisAccountClient::new(stratoserver.clone()));
+    let trusted_friends_client = Arc::new(ProdTrustedFriendsClient::new(stratoserver.clone()));
+    let user_location_client = Arc::new(ProdUserLocationClient::new(stratoserver.clone()));
+    let article_client = Arc::new(ProdArticleClient::new(stratoserver));
 
     let wingman_client = Arc::new(
         init_client_with_retry("wingman", init_deadline, || {
@@ -276,7 +380,8 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
     warm_cache(&twemcache).await;
     warm_manhattan(mh_label_client.as_ref()).await;
 
-    let cache_warmer = build_cache_warmer(datacenter, init_deadline, deterministic_aperture).await;
+    let cache_warmer =
+        build_cache_warmer(datacenter, init_deadline, deterministic_aperture, metadata).await;
 
     let twemcache_source = Arc::new(TwemcacheSource::new(twemcache));
     let manhattan_source = Arc::new(ManhattanSource::new(mh_label_client));
@@ -285,10 +390,13 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
         remote = remote.with_warmer(warmer);
     }
     let remote = Arc::new(remote);
-    let safety_label_source = Arc::new(SafetyLabelSource::new(remote));
+    let safety_label_source = Arc::new(SafetyLabelSource::new(
+        remote,
+        crate::config::safety_label_cache_capacity(),
+    ));
 
     let tweet_source = TweetSource {
-        grpc_client: tes_client.grpc_client.clone(),
+        grpc_client: Arc::clone(&tes_client.grpc_client),
     };
     let sources = ProdSources::new(
         tes_client,
@@ -297,50 +405,15 @@ pub async fn build_prod_server(datacenter: &str) -> VFServer {
         sg_client,
         about_this_account_client,
         wingman_client,
-        safety_label_source.clone(),
-        fallback_cache,
-        pure_core_fallback_cache,
+        article_client,
+        trusted_friends_client,
+        user_location_client,
+        Arc::clone(&safety_label_source),
+        communities,
+        author_cache,
+        tweet_cache,
     );
-    let stats = xai_stats_receiver::global_stats_receiver();
-    let mut switch_files = crate::params::SwitchFiles::beside(&crate::config::fs_path());
-    let feature_switches = Arc::new(arc_swap::ArcSwap::from_pointee(
-        switch_files
-            .load(stats.as_deref())
-            .expect("files that each built an engine build one together"),
-    ));
-    let country_lists = Arc::new(crate::params::CountryLists::starting_at_default());
-    country_lists.refresh(&feature_switches.load());
-    let client_switches = crate::params::ClientSwitches::new(Arc::clone(&feature_switches));
-    crate::params::spawn_refresh(
-        switch_files,
-        feature_switches,
-        Arc::clone(&country_lists),
-        copy_drift,
-        stats,
-    );
-    let rule_engine = crate::rules::RuleEngine::with_country_lists(country_lists);
-    let (home_rule_count, recommendations_rule_count) = rule_engine.rule_counts();
-    let filter_tweets = Arc::new(FilterTweets::new(Arc::new(sources), rule_engine));
-
-    warm_filter_tweets(&filter_tweets).await;
-    let reference_compare =
-        crate::reference::build(datacenter, init_deadline, &filter_tweets, &client_switches).await;
-
-    info!(
-        hydrator_count = 5,
-        fallback_cache_enabled,
-        author_id_fallback_enabled,
-        author_id_fallback_capacity,
-        home_rule_count,
-        recommendations_rule_count,
-        "VFServer initialized with prod clients"
-    );
-
-    VFServer::from_endpoints(
-        EvaluateTweetsEndpoint::new(filter_tweets.clone(), client_switches, limited_actions_copy),
-        FilterTweetsEndpoint::new(filter_tweets, reference_compare),
-        GetSafetyLabelsEndpoint::new(safety_label_source),
-    )
+    (sources, safety_label_source)
 }
 
 const CACHE_WARM_REQUEST_TIMEOUT_MS: u64 = 500;
@@ -353,6 +426,7 @@ async fn build_cache_warmer(
     datacenter: &str,
     init_deadline: tokio::time::Instant,
     deterministic_aperture: bool,
+    metadata: Option<&MetadataMap>,
 ) -> Option<Arc<dyn Warmer>> {
     if !crate::config::cache_warm_enabled() {
         return None;
@@ -376,7 +450,7 @@ async fn build_cache_warmer(
             zone: datacenter.to_string(),
             ..Default::default()
         };
-        async move { StratoGrpc::new(config).await.map_err(|e| e.to_string()) }
+        async move { anyhow::Ok(with_metadata(StratoGrpc::new(config).await?, metadata)) }
     })
     .await
     .expect("Failed to initialize Strato cache-warm client");
@@ -397,6 +471,7 @@ struct XdsStratoParams {
     client_id: String,
     retry_config: Option<RetryConfig>,
     max_batch_size: usize,
+    metadata: Option<MetadataMap>,
 }
 
 async fn build_xds_strato(
@@ -435,7 +510,7 @@ async fn build_xds_strato(
 
     Ok(StratoGrpc::from_load_balanced_channel(
         channel,
-        None,
+        params.metadata,
         Some(params.client_id),
         params.retry_config,
         params.max_batch_size,
@@ -499,7 +574,13 @@ fn filter_tweets_response_is_warm(response: &FilterResponse) -> bool {
     response
         .outcomes
         .iter()
-        .all(|outcome| outcome.status != EvaluationStatus::UnresolvedAuthor)
+        .all(|outcome| match outcome.evaluation {
+            Evaluation::NotFound(lookup) | Evaluation::Failed(lookup) => match lookup {
+                Lookup::Tweet => false,
+                Lookup::Author | Lookup::SharedTweet | Lookup::SharedAuthor => true,
+            },
+            Evaluation::Complete { .. } | Evaluation::Partial { .. } => true,
+        })
 }
 
 async fn warm_filter_tweets(filter_tweets: &FilterTweets) {

@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-09-30T16:00:40Z
+// mirrored from config feature-switch defaults; last sync 2026-10-07T16:00:42Z
 use xai_feature_switches::param;
 
 param!(
@@ -71,6 +71,12 @@ param!(
     "Experiment1Fou"
 );
 param!(
+    EnablePhoenixOonReplies,
+    bool,
+    "rust_home_mixer_enable_phoenix_oon_replies",
+    false
+);
+param!(
     ShadowTrafficPhoenixClustersList,
     Vec<String>,
     "rust_home_mixer_shadow_traffic_phoenix_clusters_list",
@@ -116,7 +122,7 @@ param!(
     RetrievalCandidatesKafkaMaxCandidates,
     u32,
     "rust_home_mixer_retrieval_candidates_kafka_max_candidates",
-    200
+    100000
 );
 param!(
     EnableResponseDiversityStatsExperimentBucket,
@@ -269,6 +275,12 @@ param!(
     false
 );
 param!(RerankerHeadTag, i64, "rust_home_mixer_reranker_head_tag", 0);
+param!(
+    EnableHomeExcursionScores,
+    bool,
+    "rust_home_mixer_enable_home_excursion_scores",
+    false
+);
 
 // These weights reflect a combination of how much an action is
 // valued in ranking and typical propensities of these actions
@@ -372,7 +384,7 @@ param!(
     PostUnexploredWeight,
     f64,
     "rust_home_mixer_post_unexplored_weight",
-    0.02
+    0.015
 );
 param!(
     ContDwellTimeWeight,
@@ -442,7 +454,7 @@ param!(
     VMRankerClusterId,
     String,
     "rust_home_mixer_vm_ranker_cluster_id",
-    "Experiment6"
+    "Experiment1"
 );
 param!(
     PhoenixExperimentOverrides,
@@ -454,6 +466,12 @@ param!(
     VMRankerSendDebiasInputs,
     bool,
     "rust_home_mixer_vm_ranker_send_debias_inputs",
+    false
+);
+param!(
+    VMRankerSendPacingInputs,
+    bool,
+    "rust_home_mixer_vm_ranker_send_pacing_inputs",
     false
 );
 param!(
@@ -544,6 +562,12 @@ param!(
     true
 );
 param!(
+    EnableUnderTheHood,
+    bool,
+    "rust_home_mixer_enable_under_the_hood",
+    false
+);
+param!(
     MaxPostsToCache,
     usize,
     "rust_home_mixer_max_posts_to_cache",
@@ -600,6 +624,36 @@ param!(
     i32,
     "rust_home_mixer_simclusters_max_candidate_age_hours",
     48
+);
+param!(
+    EnableSidSource,
+    bool,
+    "rust_home_mixer_enable_sid_source",
+    false
+);
+param!(
+    SidSourceMaxResults,
+    u32,
+    "rust_home_mixer_sid_source_max_results",
+    800
+);
+param!(
+    SidSourceMaxSeeds,
+    usize,
+    "rust_home_mixer_sid_source_max_seeds",
+    50
+);
+param!(
+    SidSourceMaxPerSeed,
+    u32,
+    "rust_home_mixer_sid_source_max_per_seed",
+    100
+);
+param!(
+    SidSourceMinPrefixDepth,
+    u32,
+    "rust_home_mixer_sid_source_min_prefix_depth",
+    3
 );
 
 param!(
@@ -735,6 +789,13 @@ param!(
     EnableAdsBrandSafetyVerdictV2,
     bool,
     "rust_home_mixer_ads_bs_v2_exp_enabled",
+    true
+);
+
+param!(
+    EnableAdsAuthorBrandSafetyFallback,
+    bool,
+    "rust_home_mixer_ads_bs_author_fallback_enabled",
     false
 );
 param!(
@@ -879,6 +940,18 @@ param!(
     "rust_home_mixer_author_served_metrics_author_ids",
     vec![]
 );
+param!(
+    EnablePopularPostsSource,
+    bool,
+    "rust_home_mixer_enable_popular_posts_source",
+    true
+);
+param!(
+    PopularPostsMaxResults,
+    u32,
+    "rust_home_mixer_popular_posts_max_results",
+    500
+);
 
 param!(
     EnablePublishSeenIdsToKafka,
@@ -963,6 +1036,25 @@ param!(
     u32,
     "rust_home_mixer_feed_survey_fatigue_minutes",
     1440
+);
+
+param!(
+    EnableVideoCarousel,
+    bool,
+    "rust_home_mixer_enable_video_carousel",
+    false
+);
+param!(
+    VideoCarouselFatigueMinutes,
+    u32,
+    "rust_home_mixer_video_carousel_fatigue_minutes",
+    60
+);
+param!(
+    VideoCarouselPosition,
+    u32,
+    "rust_home_mixer_video_carousel_position",
+    6
 );
 
 param!(

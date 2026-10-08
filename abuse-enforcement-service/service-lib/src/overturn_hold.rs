@@ -2164,7 +2164,7 @@ impl HoldStore for FakeHoldStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -2222,7 +2222,7 @@ mod tests {
         GatedAction::Label { name: name.into() }
     }
 
-                    static METRICS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+                    pub(crate) static METRICS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 
     #[test]
@@ -2551,7 +2551,7 @@ mod tests {
         let gate = HoldGate::new(Some(store.clone()));
         let c = HoldGateConfig {
             mode: GateMode::Shadow,
-            on_probe_error: OnProbeError::Skip, 
+            on_probe_error: OnProbeError::Skip,
             ..HoldGateConfig::default()
         };
         let before = counter("shadow", "probe_error_open");
@@ -2933,11 +2933,11 @@ mod tests {
         let c = cfg(GateMode::Enforce);
 
         store.set_fail(true);
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         store.set_fail_query(true);
         for _ in 0..4 {
-            gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
+            gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         }
         assert!(!gate.breaker_open(), "SQL errors never open the breaker");
         assert_eq!(
@@ -2946,8 +2946,8 @@ mod tests {
             "one short of the backoff"
         );
         store.set_fail(true);
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         assert!(!gate.breaker_open(), "count was reset by the SQL error");
         assert_eq!(
             gate.backoff_snapshot(),
@@ -2955,10 +2955,10 @@ mod tests {
             "a failure resets the reachable run"
         );
         store.set_fail(false);
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         store.set_fail(true);
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         assert!(!gate.breaker_open(), "count was reset by the success");
         assert_eq!(store.calls(), 11, "every call reached the store");
         assert_eq!(BREAKER_FAILURES, 5);
@@ -3055,7 +3055,7 @@ mod tests {
         let gate = HoldGate::with_breaker(Some(store.clone()), 100, Duration::from_secs(60));
         let c = cfg(GateMode::Enforce);
         metrics::HOLD_GATE_DB_CONNECTED.set(0);
-        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await; 
+        gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;
         assert_eq!(metrics::HOLD_GATE_DB_CONNECTED.get(), 1);
         store.set_failure(FakeFailure::Unreachable);
         gate.evaluate(&c, 2, TOPIC, &[TEMP]).await;
@@ -3092,7 +3092,7 @@ mod tests {
             "bad_url leaves it"
         );
         store.set_failure(FakeFailure::None);
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         metrics::HOLD_GATE_DB_CONNECTED.set(0);
         let out = gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         assert_eq!(out.info["overturn_hold_probe_ms"], "0", "cache hit");
@@ -3264,7 +3264,7 @@ mod tests {
 
         store.set_failure(FakeFailure::None);
         clock.advance(past_backoff);
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         assert_eq!(gate.probe_failures(), 0);
         store.set_failure(FakeFailure::NotFound);
         for _ in 0..N {
@@ -3471,7 +3471,7 @@ mod tests {
         );
         assert_eq!(generation2, generation, "stale failure did not re-arm");
 
-        clock.advance(PAST_OPEN); 
+        clock.advance(PAST_OPEN);
         store.set_hang_only(Some(3));
         store.set_hang(true);
         store.set_fail(false);
@@ -3588,7 +3588,7 @@ mod tests {
         let (gate, clock) = breaker_gate(store.clone(), 2, DEFAULT_BREAKER_OPEN);
         let c = cfg(GateMode::Enforce);
         store.set_fail(true);
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         store.set_failure(FakeFailure::Decode);
         for _ in 0..5 {
             let out = gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
@@ -3596,7 +3596,7 @@ mod tests {
         }
         assert!(!gate.breaker_open(), "decode errors never open");
         store.set_fail(true);
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         assert!(gate.breaker_open(), "count survived the decode errors");
         assert_eq!(store.calls(), 7);
 
@@ -3756,7 +3756,7 @@ mod tests {
             #[tokio::test]
     async fn empty_case_group_list_holds_every_shape() {
         let _serial = METRICS_LOCK.lock().await;
-        let store = FakeHoldStore::new(vec![hold(1, 10, 30)]); 
+        let store = FakeHoldStore::new(vec![hold(1, 10, 30)]);
         let gate = HoldGate::new(Some(store.clone()));
         let c = cfg(GateMode::Enforce);
         assert!(c.perm_suspend_case_groups.is_empty());
@@ -3798,7 +3798,7 @@ mod tests {
                 #[tokio::test]
     async fn unlisted_case_group_is_ignored_for_a_perm_suspend() {
         let _serial = METRICS_LOCK.lock().await;
-        let store = FakeHoldStore::new(vec![hold(1, 10, 30)]); 
+        let store = FakeHoldStore::new(vec![hold(1, 10, 30)]);
         let gate = HoldGate::new(Some(store.clone()));
         let c = perm_policy(&[54]);
         let before_ignored = counter("enforce", "held_ignored_policy");
@@ -3840,7 +3840,7 @@ mod tests {
                 #[tokio::test]
     async fn policy_filters_before_longest_wins_and_cache_keeps_all_holds() {
         let _serial = METRICS_LOCK.lock().await;
-        let long_spam = hold(5, 50, 80); 
+        let long_spam = hold(5, 50, 80);
         let mut short_cse = hold(5, 51, 5);
         short_cse.case_group_id = Some(54);
         let store = FakeHoldStore::new(vec![long_spam, short_cse]);
@@ -4145,9 +4145,9 @@ mod tests {
     async fn holds_are_kind_matched() {
         let _serial = METRICS_LOCK.lock().await;
         let store = FakeHoldStore::new(vec![
-            hold(1, 10, 30),                
-            label_hold_row(2, 20, 30, SHR), 
-            hold(3, 30, 30),                
+            hold(1, 10, 30),
+            label_hold_row(2, 20, 30, SHR),
+            hold(3, 30, 30),
             label_hold_row(3, 31, 60, SHR),
         ]);
         let gate = HoldGate::new(Some(store.clone()));
@@ -4360,7 +4360,7 @@ mod tests {
         assert_eq!(store.calls(), 3);
         assert_eq!(gate.cached_len(), 0, "negatives are still never cached");
         store.set_holds(vec![hold(1, 10, 30), label_hold_row(1, 11, 30, SHR)]);
-        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await; 
+        gate.evaluate(&c, 1, TOPIC, &[TEMP]).await;
         assert_eq!(gate.cached_len(), 1);
         let out = gate.evaluate(&c, 1, TOPIC, &[label_action(SHR)]).await;
         assert_eq!(out.strip_labels, vec![SHR.to_owned()]);

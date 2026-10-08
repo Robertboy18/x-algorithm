@@ -132,8 +132,8 @@ use crate::feature_config::categorical_feature::{
 use crate::feature_config::constants::{
     ADS_PRODUCT_KEY_HASH_BIAS, ADS_PRODUCT_KEY_HASH_BIAS_2, ADS_PRODUCT_KEY_HASH_MODULUS,
     ADS_PRODUCT_KEY_HASH_SCALE, ADS_PRODUCT_KEY_HASH_SCALE_2, ADS_PRODUCT_KEY_TABLE_SIZE,
-    STALE_POST_14D_TTL_SEC,
 };
+use crate::feature_config::constants::{STALE_POST_14D_TTL_SEC, STALE_POST_30D_TTL_SEC};
 use crate::feature_config::float_feature::MATCHED_WORD_FRACTION_SEQ;
 use crate::feature_config::int64_feature::{
     FAV_COUNT_SEQ, FAV_COUNT_SEQ_COLUMN, QUOTE_COUNT_SEQ, QUOTE_COUNT_SEQ_COLUMN, REPLY_COUNT_SEQ,
@@ -595,6 +595,11 @@ impl InputBuffer {
         let mut candidate_bool_features = vec![false; candidate_seq_len * n_post_bool];
 
         let stale_post_enabled = model_config.hash_table.enable_stale_post;
+        let stale_post_ttl_sec = if model_config.hash_table.enable_stale_post_30d {
+            STALE_POST_30D_TTL_SEC
+        } else {
+            STALE_POST_14D_TTL_SEC
+        };
         for (j, candidate) in candidate_set
             .candidates
             .iter()
@@ -604,7 +609,7 @@ impl InputBuffer {
             let creation_valid = candidate_post_creation_ts_sec[j] > 0;
             let original_age_sec = now_sec as i64 - candidate_post_creation_ts_sec[j] as i64;
             let is_stale =
-                stale_post_enabled && creation_valid && original_age_sec > STALE_POST_14D_TTL_SEC;
+                stale_post_enabled && creation_valid && original_age_sec > stale_post_ttl_sec;
             candidate_is_stale_post[j] = is_stale;
             if is_stale {
                 stamp_engagement_counts(
@@ -1805,6 +1810,7 @@ mod tests {
                 num_post_float_features: 0,
                 num_post_int64_features: 0,
                 enable_stale_post: false,
+                enable_stale_post_30d: false,
             },
             history_seq_len: 4,
             candidate_seq_len: 3,
@@ -2592,6 +2598,11 @@ mod tests {
         assert_eq!(1, cand.int64_features[base1 + FAV_COUNT_SEQ]);
         assert_eq!(5, cand.int64_features[base1 + VIEW_COUNT_SEQ]);
         assert!(!cand.bool_features[n_post_bool + IS_STALE_POST14D]);
+
+        model_config.hash_table.enable_stale_post_30d = true;
+        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
+        assert_eq!(7, cand.int64_features[FAV_COUNT_SEQ]);
+        assert!(!cand.bool_features[IS_STALE_POST14D]);
     }
 
     #[test]

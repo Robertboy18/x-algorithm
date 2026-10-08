@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +33,10 @@ pub(crate) struct TwemcacheSource {
     cache: Arc<dyn CacheRead>,
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "KVCacheError belongs to the shared xai-cache client; only its timeout and backpressure errors get their own FallbackReason, and every other error counts as Other, including any the client adds"
+)]
 fn fallback_reason(e: &KVCacheError) -> FallbackReason {
     match e {
         KVCacheError::Timeout(_) => FallbackReason::Timeout,
@@ -73,8 +78,8 @@ impl TwemcacheSource {
 
 #[async_trait]
 impl TwemcacheLookup for TwemcacheSource {
-    async fn get(&self, ids: &[u64]) -> HashMap<u64, TwemcacheOutcome> {
-        let mut results = HashMap::with_capacity(ids.len());
+    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {
+        let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         if ids.is_empty() {
             return results;
         }
@@ -211,7 +216,7 @@ mod tests {
         }
     }
 
-    async fn get_with_cache(cache: Arc<dyn CacheRead>) -> HashMap<u64, TwemcacheOutcome> {
+    async fn get_with_cache(cache: Arc<dyn CacheRead>) -> FxHashMap<u64, TwemcacheOutcome> {
         TwemcacheSource::with_cache(cache).get(&[42]).await
     }
 

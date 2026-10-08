@@ -31,11 +31,7 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "exclusive_retweet",
-            post: {
-                let mut retweet = exclusive_candidate(candidate());
-                retweet.tweet_features.source_tweet_id = Some(2);
-                retweet
-            },
+            post: exclusive_candidate(candidate().retweet_of(2)),
             expect: vec![(
                 TimelineHome,
                 Role::Author,

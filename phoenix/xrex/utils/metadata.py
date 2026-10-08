@@ -21,11 +21,12 @@ from typing import Any, Optional, Protocol, runtime_checkable
 from serde import serde
 from serde.json import from_dict, from_json, to_json
 
-from xrex.utils.checkpoint_cloud import ORBAX_TMP_DIR_SUFFIX
 from xrex.utils.launch_env import CHECKPOINT_DIR, XAI_USER
 
 logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
+
+ORBAX_TMP_DIR_SUFFIX = ".orbax-checkpoint-tmp-"
 
 
 _ELAPSED_SAMPLES = "elapsed_samples"
@@ -292,8 +293,7 @@ class MetadataProvider(ABC):
     def get_run_info(self, checkpoint: CheckpointMeta) -> Run: ...
 
     @abstractmethod
-    def record_run(self, run: Run, config: Jsonable):
-        pass
+    def record_run(self, run: Run, config: Jsonable): ...
 
     @abstractmethod
     def record_checkpoint(

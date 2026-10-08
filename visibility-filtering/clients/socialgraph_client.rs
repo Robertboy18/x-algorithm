@@ -1,6 +1,7 @@
 use anyhow::Context;
 use std::collections::HashSet;
 use tonic::async_trait;
+use tonic::metadata::MetadataMap;
 use tracing::warn;
 use xai_flock_client::{FlockClient, FlockClientConfig, FlockTlsConfig};
 use xai_flock_proto::{
@@ -13,7 +14,7 @@ const REVERSE_EDGE_CHUNK_SIZE: usize = 500;
 
 const FLOCK_APERTURE_SIZE: usize = 12;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr, strum::VariantArray)]
 #[strum(serialize_all = "snake_case")]
 pub enum Graph {
     Follows = 1,
@@ -23,7 +24,7 @@ pub enum Graph {
     SuperFollows = 55,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::VariantArray)]
 pub enum EdgeDirection {
     Forward,
     Reverse,
@@ -143,6 +144,7 @@ fn decode_edge_sets(counts: &[usize], results: Vec<Results>) -> Vec<Option<HashS
 
 pub struct ProdSocialgraphClient {
     flock_client: FlockClient,
+    metadata: Option<MetadataMap>,
 }
 
 impl ProdSocialgraphClient {
@@ -152,6 +154,7 @@ impl ProdSocialgraphClient {
         client_cert_path: &str,
         client_key_path: &str,
         deterministic_aperture: bool,
+        metadata: Option<MetadataMap>,
     ) -> anyhow::Result<Self> {
         let wilyns = xai_wily::WilyNs::new(xai_wily::WilyConfig {
             zone: datacenter.to_string(),
@@ -172,7 +175,10 @@ impl ProdSocialgraphClient {
             ..Default::default()
         };
         let flock_client = FlockClient::with_config(wilyns, config).await?;
-        Ok(Self { flock_client })
+        Ok(Self {
+            flock_client,
+            metadata,
+        })
     }
 }
 
@@ -185,6 +191,9 @@ impl SocialgraphClient for ProdSocialgraphClient {
     ) -> Option<Vec<Option<HashSet<u64>>>> {
         let (request, counts) = select_request(viewer_id, queries);
         let mut request = tonic::Request::new(request);
+        if let Some(metadata) = &self.metadata {
+            *request.metadata_mut() = metadata.clone();
+        }
         xai_x_rpc::apply_call_deadline(&mut request);
         match self.flock_client.inner().clone().select(request).await {
             Ok(resp) => Some(decode_edge_sets(&counts, resp.into_inner().results)),

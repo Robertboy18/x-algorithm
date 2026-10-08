@@ -668,6 +668,7 @@ mod tests {
 mod rust_vf_tests {
     use super::*;
     use crate::models::Action;
+    use crate::test_support::RecordingReceiver;
     use std::net::SocketAddr;
     use tokio::sync::Mutex;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -906,41 +907,6 @@ mod rust_vf_tests {
         let metrics = FilterTweetsClientMetrics::default();
         assert!(metrics.error_codes.is_empty());
         assert_eq!(metrics.failed_ids, 0);
-    }
-
-    #[derive(Default)]
-    struct RecordingReceiver {
-        counters: std::sync::Mutex<HashMap<String, u64>>,
-    }
-
-    impl RecordingReceiver {
-        fn counter(&self, key: &str) -> u64 {
-            *self.counters.lock().unwrap().get(key).unwrap_or(&0)
-        }
-    }
-
-    impl xai_stats_receiver::StatsReceiverExt for RecordingReceiver {
-        fn incr(&self, name: &str, scopes: &[(&str, &str)], value: u64) {
-            let mut key = name.to_string();
-            for (k, v) in scopes {
-                key.push('|');
-                key.push_str(k);
-                key.push('=');
-                key.push_str(v);
-            }
-            *self.counters.lock().unwrap().entry(key).or_default() += value;
-        }
-        fn observe(
-            &self,
-            _: &str,
-            _: &[(&str, &str)],
-            _: f64,
-            _: xai_stats_receiver::HistogramBuckets,
-        ) {
-        }
-        fn observe_expo(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn observe_vm(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn gauge(&self, _: &str, _: &[(&str, &str)], _: f64) {}
     }
 
     fn request_guard_with(receiver: Arc<RecordingReceiver>) -> FilterTweetsRequestMetricsGuard {

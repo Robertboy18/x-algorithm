@@ -1,22 +1,25 @@
 use crate::limited_actions_copy::{Prompt, PromptKind, LEARN_MORE_PLACEHOLDER};
 use crate::models::{
-    Decided, DropReason, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
-    MediaRestriction, NsfwViewerDropReason, TombstoneReason, Verdict, Withholding,
+    Decided, DropReason, FosnrReason, LimitedEngagement, LimitedEngagementReason,
+    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, TombstoneReason, Verdict,
+    Withholding,
 };
 use crate::params::{LimitedActionType, LimitedActionsPolicies};
 use crate::rules::SafetyLevel;
 use xai_visibility_filtering::models::FilteredReason;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::action::{
-    self, Action, AgeVerificationOption, AnyInterstitial, BasicLimitedActionPrompt,
-    BlurredImageInterstitial, ComposedMediaVisibilityActions, CtaLimitedActionPrompt, Interstitial,
+    self, Action, AgeVerificationOption, AnyInterstitial, Appealable, AppealablePolicy,
+    AppealableReason, Avoid, BasicLimitedActionPrompt, BlurredImageInterstitial,
+    BrandSafetyRiskLevel, ComposedMediaVisibilityActions, CtaLimitedActionPrompt, Interstitial,
     InterstitialAction, InterstitialReason, LimitedAction, LimitedActionCtaType,
     LimitedActionPrompt, LimitedActionsPolicy, LimitedEngagements, LocalizedMessage,
     LocalizedMessageLimitedActionPrompt, MediaInterstitial as ThriftMediaInterstitial, MessageLink,
-    Tombstone, TweetInterstitial,
+    SoftIntervention as ThriftSoftIntervention, SoftInterventionDisplayType,
+    SoftInterventionReason, Tombstone, TweetInterstitial,
 };
 use xai_x_thrift::safety_result::{
-    FilteredReason as ThriftFilteredReason, SafetyResult as ThriftSafetyResult,
+    FilteredReason as ThriftFilteredReason, SafetyResult as ThriftSafetyResult, SafetyResultReason,
 };
 use xai_x_thrift::tweet_service::{
     TweetFieldsResultFiltered, TweetFieldsResultFound, TweetFieldsResultState,
@@ -37,14 +40,46 @@ pub(crate) fn thrift_action(
             ..
         }) => Action::Tombstone(Tombstone::new(Some(tombstone_reason(*reason)), None)),
         Verdict::Shown {
+            notice:
+                Some(Decided {
+                    value: Notice::SoftIntervention(reason),
+                    ..
+                }),
+            ..
+        } => Action::TweetInterstitial(TweetInterstitial {
+            soft_intervention: Some(soft_intervention(reason)),
+            avoid: Some(normal_avoid()),
+            ..TweetInterstitial::default()
+        }),
+        Verdict::Shown {
+            notice:
+                Some(Decided {
+                    value:
+                        Notice::Appealable {
+                            reason,
+                            limited_actions,
+                        },
+                    ..
+                }),
+            ..
+        } => Action::TweetInterstitial(TweetInterstitial {
+            limited_engagements: Some(fosnr_limited_engagements(reason, limited_actions)),
+            avoid: Some(normal_avoid()),
+            appealable: Some(Appealable::new(appealable_reason(reason), None)),
+            ..TweetInterstitial::default()
+        }),
+        Verdict::Shown {
+            notice: None,
             media: None,
             engagement: None,
         } => Action::Allow(action::Allow::new()),
         Verdict::Shown {
+            notice: None,
             media: None,
             engagement: Some(Decided { value, .. }),
         } => Action::LimitedEngagements(limited_engagements(value, policies)),
         Verdict::Shown {
+            notice: None,
             media: Some(Decided { value, .. }),
             engagement: None,
         } => match value {
@@ -54,6 +89,7 @@ pub(crate) fn thrift_action(
             MediaRestriction::NsfwInterstitial => Action::Interstitial(nsfw_interstitial()),
         },
         Verdict::Shown {
+            notice: None,
             media: Some(media),
             engagement: Some(limit),
         } => {
@@ -79,9 +115,20 @@ pub(crate) fn thrift_result_state(
     level: SafetyLevel,
     policies: &LimitedActionsPolicies,
 ) -> TweetFieldsResultState {
+    let reason = match verdict {
+        Verdict::Shown {
+            notice:
+                Some(Decided {
+                    value: Notice::Appealable { reason, .. },
+                    ..
+                }),
+            ..
+        } => Some(fosnr_safety_result_reason(reason)),
+        Verdict::Withheld(_) | Verdict::Shown { .. } => None,
+    };
     let safety_result = || {
         ThriftFilteredReason::SafetyResult(ThriftSafetyResult::new(
-            None,
+            reason,
             thrift_action(verdict, level, policies),
         ))
     };
@@ -95,10 +142,12 @@ pub(crate) fn thrift_result_state(
         }) => filtered(legacy_drop_reason(reason).unwrap_or_else(safety_result)),
         Verdict::Withheld(_) => filtered(safety_result()),
         Verdict::Shown {
+            notice: None,
             media: None,
             engagement: None,
         } => found(None),
         Verdict::Shown {
+            notice: None,
             media:
                 Some(Decided {
                     value: MediaRestriction::NsfwInterstitial,
@@ -117,8 +166,75 @@ fn legacy_drop_reason(reason: &FilteredReason) -> Option<ThriftFilteredReason> {
         FilteredReason::AuthorBlockViewer => T::AuthorBlockViewer(true),
         FilteredReason::AuthorIsProtected => T::AuthorIsProtected(true),
         FilteredReason::AuthorIsSuspended => T::AuthorIsSuspended(true),
-        _ => return None,
+        FilteredReason::ContainNsfwMedia
+        | FilteredReason::PossiblyUndesirable
+        | FilteredReason::UnspecifiedReason
+        | FilteredReason::AuthorAccountIsInactive
+        | FilteredReason::AuthorIsUnsafe
+        | FilteredReason::ReportedTweet
+        | FilteredReason::TweetMatchesViewerMutedKeyword(_)
+        | FilteredReason::SafetyResult(_)
+        | FilteredReason::AuthorIsDeactivated
+        | FilteredReason::ViewerMutesAuthor
+        | FilteredReason::TweetIsNullcast
+        | FilteredReason::ExclusiveTweet
+        | FilteredReason::ViewerBlocksAuthor => return None,
     })
+}
+
+fn normal_avoid() -> Avoid {
+    Avoid::new(None, Some(BrandSafetyRiskLevel::NORMAL), None)
+}
+
+fn appealable_reason(reason: &FosnrReason) -> AppealableReason {
+    AppealableReason::new(
+        reason.level,
+        Box::new(reason.policy),
+        reason.proactive,
+        reason.appeal_submitted,
+    )
+}
+
+fn fosnr_safety_result_reason(reason: &FosnrReason) -> SafetyResultReason {
+    match reason.policy {
+        AppealablePolicy::HATEFUL_CONDUCT => SafetyResultReason::FOSNR_HATEFUL_CONDUCT,
+        AppealablePolicy::ABUSE => SafetyResultReason::FOSNR_ABUSE,
+        AppealablePolicy::VIOLENT_SPEECH => SafetyResultReason::FOSNR_VIOLENT_SPEECH,
+        AppealablePolicy::CIVIC_INTEGRITY => SafetyResultReason::FOSNR_CIVIC_INTEGRITY,
+        AppealablePolicy::SYNTHETIC_AND_MANIPULATED_MEDIA => {
+            SafetyResultReason::FOSNR_SYNTHETIC_AND_MANIPULATED_MEDIA
+        }
+        _ => SafetyResultReason::FOSNR_UNSPECIFIED,
+    }
+}
+
+fn fosnr_limited_engagements(
+    reason: &FosnrReason,
+    limited_actions: &[LimitedActionType],
+) -> LimitedEngagements {
+    LimitedEngagements::new(
+        action::LimitedEngagementReason::FosnrReason(appealable_reason(reason)),
+        LimitedActionsPolicy::new(
+            limited_actions
+                .iter()
+                .map(|&action_type| LimitedAction::new(limited_action_type(action_type), None))
+                .collect(),
+        ),
+        (reason.level != 1).then(|| "freedom_of_speech_not_reach".to_string()),
+    )
+}
+
+fn soft_intervention(reason: &FosnrReason) -> ThriftSoftIntervention {
+    ThriftSoftIntervention {
+        soft_intervention_reason: Some(SoftInterventionReason::Fosnr(Box::new(appealable_reason(
+            reason,
+        )))),
+        engagement_nudge: Some(false),
+        suppress_autoplay: Some(true),
+        warning: None,
+        details_url: None,
+        display_type: Some(SoftInterventionDisplayType::FOSNR),
+    }
 }
 
 fn nsfw_interstitial() -> Interstitial {
@@ -251,7 +367,7 @@ fn drop_reason(reason: &DropReason, level: SafetyLevel) -> Option<action::DropRe
         FilteredReason::ViewerBlocksAuthor => action::DropReason::ViewerBlocksAuthor(true),
         FilteredReason::ViewerMutesAuthor => action::DropReason::ViewerMutesAuthor(true),
         FilteredReason::ExclusiveTweet => action::DropReason::ExclusiveTweet(true),
-        FilteredReason::UnspecifiedReason if level == SafetyLevel::FilterAll => {
+        FilteredReason::UnspecifiedReason if level.spec().unspecified_drop_is_exact => {
             action::DropReason::Unspecified(true)
         }
         FilteredReason::UnspecifiedReason
@@ -298,6 +414,39 @@ fn limited_engagement_reason(reason: LimitedEngagementReason) -> action::Limited
         LimitedEngagementReason::StaleTweet => {
             action::LimitedEngagementReason::StaleTweet(action::StaleTweet::new())
         }
+        LimitedEngagementReason::CommunityTweetHidden => {
+            action::LimitedEngagementReason::CommunityTweetHidden(
+                action::CommunityTweetHidden::new(),
+            )
+        }
+        LimitedEngagementReason::CommunityTweetMemberRemoved => {
+            action::LimitedEngagementReason::CommunityTweetMemberRemoved(
+                action::CommunityTweetMemberRemoved::new(),
+            )
+        }
+        LimitedEngagementReason::CommunityTweetCommunityNotFound => {
+            action::LimitedEngagementReason::CommunityTweetCommunityNotFound(
+                action::CommunityTweetCommunityNotFound::new(),
+            )
+        }
+        LimitedEngagementReason::CommunityTweetCommunityDeleted => {
+            action::LimitedEngagementReason::CommunityTweetCommunityDeleted(
+                action::CommunityTweetCommunityDeleted::new(),
+            )
+        }
+        LimitedEngagementReason::CommunityTweetCommunitySuspended => {
+            action::LimitedEngagementReason::CommunityTweetCommunitySuspended(
+                action::CommunityTweetCommunitySuspended::new(),
+            )
+        }
+        LimitedEngagementReason::CommunityTweetViewerRemoved => {
+            action::LimitedEngagementReason::CommunityTweetViewerRemoved(
+                action::CommunityTweetViewerRemoved::new(),
+            )
+        }
+        LimitedEngagementReason::LocalTweet => {
+            action::LimitedEngagementReason::LocalTweet(action::LocalTweet::new())
+        }
     }
 }
 
@@ -318,6 +467,7 @@ pub(crate) fn proto_action(verdict: Verdict) -> (vf_pb::Action, Option<vf_pb::Fi
             Some(FilteredReason::UnspecifiedReason.into()),
         ),
         Verdict::Shown {
+            notice: None | Some(_),
             media: Some(Decided { value, .. }),
             engagement: None | Some(_),
         } => (
@@ -325,6 +475,7 @@ pub(crate) fn proto_action(verdict: Verdict) -> (vf_pb::Action, Option<vf_pb::Fi
             Some(value.legacy().clone().into()),
         ),
         Verdict::Shown {
+            notice: None | Some(_),
             media: None,
             engagement: None | Some(_),
         } => (vf_pb::action::Kind::Allow(true), None),
@@ -343,43 +494,65 @@ pub(crate) fn metric_label(verdict: &Verdict) -> &'static str {
             ..
         }) => "tombstone",
         Verdict::Shown {
+            notice: Some(notice),
+            ..
+        } => notice_label(&notice.value),
+        Verdict::Shown {
+            notice: None,
             media: None,
             engagement: None,
         } => "allow",
         Verdict::Shown {
+            notice: None,
             media: Some(_),
             engagement: None,
         } => "interstitial",
         Verdict::Shown {
+            notice: None,
             media: None,
             engagement: Some(_),
         } => "limited_engagement",
         Verdict::Shown {
+            notice: None,
             media: Some(_),
             engagement: Some(_),
         } => "tweet_interstitial",
     }
 }
 
+const fn notice_label(notice: &Notice) -> &'static str {
+    match notice {
+        Notice::SoftIntervention(_) => "soft_intervention",
+        Notice::Appealable { .. } => "appealable",
+    }
+}
+
 pub(crate) fn decided_rows(
     verdict: &Verdict,
 ) -> impl Iterator<Item = (&'static str, &'static str)> {
-    let (first, second) = match verdict {
-        Verdict::Withheld(decided) => (Some((decided.by, metric_label(verdict))), None),
-        Verdict::Shown { media, engagement } => (
+    let (notice, first, second) = match verdict {
+        Verdict::Withheld(decided) => (None, Some((decided.by, metric_label(verdict))), None),
+        Verdict::Shown {
+            notice,
+            media,
+            engagement,
+        } => (
+            notice
+                .as_ref()
+                .map(|notice| (notice.by, notice_label(&notice.value))),
             media.as_ref().map(|blur| (blur.by, "interstitial")),
             engagement
                 .as_ref()
                 .map(|limit| (limit.by, "limited_engagement")),
         ),
     };
-    first.into_iter().chain(second)
+    notice.into_iter().chain(first).chain(second)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules::fixtures::limited_for;
+    use crate::rules::fixtures::{appealed, limited_for, noticed};
     use crate::rules::metrics::Rpc;
     use vf_pb::action::Kind;
     use xai_visibility_filtering::graphql_results::resolve_blurred_image_interstitial;
@@ -486,7 +659,11 @@ mod tests {
         media: Option<Decided<MediaRestriction>>,
         engagement: Option<Decided<LimitedEngagement>>,
     ) -> Verdict {
-        Verdict::Shown { media, engagement }
+        Verdict::Shown {
+            notice: None,
+            media,
+            engagement,
+        }
     }
 
     fn thrift_drop(reason: Option<action::DropReason>) -> Action {
@@ -501,7 +678,8 @@ mod tests {
         rows: &'static [(&'static str, &'static str)],
     }
 
-    fn verdict_cases() -> [(Verdict, Projected); 15] {
+    fn verdict_cases() -> [(Verdict, Projected); 18] {
+        use action::LimitedActionType as T;
         let proto_drop = Kind::Drop(vf_pb::DropReason {});
         let tombstone = |reason, code| {
             (
@@ -659,7 +837,88 @@ mod tests {
                     ],
                 },
             ),
+            (
+                noticed(true, false, "fosnr_rule"),
+                Projected {
+                    thrift: Action::TweetInterstitial(TweetInterstitial {
+                        soft_intervention: Some(ThriftSoftIntervention {
+                            soft_intervention_reason: Some(SoftInterventionReason::Fosnr(
+                                Box::new(AppealableReason::new(
+                                    1,
+                                    Box::new(action::AppealablePolicy::ABUSE),
+                                    true,
+                                    false,
+                                )),
+                            )),
+                            engagement_nudge: Some(false),
+                            suppress_autoplay: Some(true),
+                            warning: None,
+                            details_url: None,
+                            display_type: Some(SoftInterventionDisplayType::FOSNR),
+                        }),
+                        avoid: Some(Avoid::new(None, Some(BrandSafetyRiskLevel::NORMAL), None)),
+                        ..TweetInterstitial::default()
+                    }),
+                    proto: Kind::Allow(true),
+                    reason: None,
+                    label: "soft_intervention",
+                    rows: &[("fosnr_rule", "soft_intervention")],
+                },
+            ),
+            appeal(
+                AppealablePolicy::VIOLENT_SPEECH,
+                3,
+                &[
+                    T::LIKE,
+                    T::REPLY,
+                    T::RETWEET,
+                    T::QUOTE_TWEET,
+                    T::SHARE_TWEET_VIA,
+                    T::ADD_TO_BOOKMARKS,
+                    T::PIN_TO_PROFILE,
+                    T::COPY_LINK,
+                    T::SEND_VIA_DM,
+                    T::EDIT_TWEET,
+                    T::HIGHLIGHT,
+                    T::EMBED,
+                    T::LISTS_ADD_REMOVE,
+                ],
+                Some("freedom_of_speech_not_reach"),
+            ),
+            appeal(AppealablePolicy::ABUSE, 1, &[T::EDIT_TWEET], None),
         ]
+    }
+
+    fn appeal(
+        policy: AppealablePolicy,
+        level: i8,
+        limited: &[action::LimitedActionType],
+        legacy_limited_actions: Option<&str>,
+    ) -> (Verdict, Projected) {
+        let reason = AppealableReason::new(level, Box::new(policy), false, true);
+        let limited = limited
+            .iter()
+            .map(|&action_type| LimitedAction::new(action_type, None))
+            .collect();
+        (
+            appealed(policy, level, false, true, "fosnr_author"),
+            Projected {
+                thrift: Action::TweetInterstitial(TweetInterstitial {
+                    limited_engagements: Some(LimitedEngagements::new(
+                        action::LimitedEngagementReason::FosnrReason(reason.clone()),
+                        LimitedActionsPolicy::new(limited),
+                        legacy_limited_actions.map(str::to_string),
+                    )),
+                    avoid: Some(Avoid::new(None, Some(BrandSafetyRiskLevel::NORMAL), None)),
+                    appealable: Some(Appealable::new(reason, None)),
+                    ..TweetInterstitial::default()
+                }),
+                proto: Kind::Allow(true),
+                reason: None,
+                label: "appealable",
+                rows: &[("fosnr_author", "appealable")],
+            },
+        )
     }
 
     #[test]
@@ -713,6 +972,84 @@ mod tests {
             decided_rows(&verdict).collect::<Vec<_>>(),
             [("limit_rule", "limited_engagement")]
         );
+    }
+
+    #[test]
+    fn each_limited_engagement_reason_sends_its_thrift_arm_and_legacy_string() {
+        use action::LimitedEngagementReason as T;
+        use LimitedEngagementReason as R;
+        for (reason, arm, legacy) in [
+            (
+                R::ConversationControl,
+                T::ConversationControl(action::ConversationControl::new()),
+                "limited_replies",
+            ),
+            (
+                R::ReadonlyViewer,
+                T::ReadonlyViewer(action::ReadonlyViewer::new()),
+                "readonly_viewer",
+            ),
+            (
+                R::BlockedViewer,
+                T::BlockedViewer(action::BlockedViewer::new()),
+                "blocked_viewer",
+            ),
+            (
+                R::RootAuthorBlockedViewer,
+                T::RootAuthorBlockedViewer(action::RootAuthorBlockedViewer::new()),
+                "root_author_blocked_viewer",
+            ),
+            (
+                R::StaleTweet,
+                T::StaleTweet(action::StaleTweet::new()),
+                "stale_tweet",
+            ),
+            (
+                R::CommunityTweetHidden,
+                T::CommunityTweetHidden(action::CommunityTweetHidden::new()),
+                "community_tweet_hidden",
+            ),
+            (
+                R::CommunityTweetMemberRemoved,
+                T::CommunityTweetMemberRemoved(action::CommunityTweetMemberRemoved::new()),
+                "community_tweet_member_removed",
+            ),
+            (
+                R::CommunityTweetCommunityNotFound,
+                T::CommunityTweetCommunityNotFound(action::CommunityTweetCommunityNotFound::new()),
+                "community_tweet_community_not_found",
+            ),
+            (
+                R::CommunityTweetCommunityDeleted,
+                T::CommunityTweetCommunityDeleted(action::CommunityTweetCommunityDeleted::new()),
+                "community_tweet_community_deleted",
+            ),
+            (
+                R::CommunityTweetCommunitySuspended,
+                T::CommunityTweetCommunitySuspended(action::CommunityTweetCommunitySuspended::new()),
+                "community_tweet_community_suspended",
+            ),
+            (
+                R::CommunityTweetViewerRemoved,
+                T::CommunityTweetViewerRemoved(action::CommunityTweetViewerRemoved::new()),
+                "community_tweet_viewer_removed",
+            ),
+            (
+                R::LocalTweet,
+                T::LocalTweet(action::LocalTweet::new()),
+                "local_tweet",
+            ),
+        ] {
+            assert_eq!(
+                thrift_action(
+                    &limited_for(&[reason], "limit_rule"),
+                    TimelineHome,
+                    &LimitedActionsPolicies::default(),
+                ),
+                thrift_limit_for(arm, None, legacy),
+                "{reason:?}"
+            );
+        }
     }
 
     #[test]
@@ -793,13 +1130,18 @@ mod tests {
         let found = |reason| TweetFieldsResultState::Found(TweetFieldsResultFound::new(reason));
         let filtered =
             |reason| TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(reason));
-        let safety_result = |verdict: &Verdict| {
+        let safety_result_with = |reason, verdict: &Verdict| {
             T::SafetyResult(ThriftSafetyResult::new(
-                None,
+                reason,
                 thrift_action(verdict, TimelineHome, &policies()),
             ))
         };
-        let shown = |media, engagement| Verdict::Shown { media, engagement };
+        let safety_result = |verdict: &Verdict| safety_result_with(None, verdict);
+        let shown = |media, engagement| Verdict::Shown {
+            notice: None,
+            media,
+            engagement,
+        };
         let limited = Decided {
             value: LimitedEngagement::new(LimitedEngagementReason::ConversationControl),
             by: "limit_rule",
@@ -845,8 +1187,28 @@ mod tests {
         for verdict in [
             shown(None, Some(limited.clone())),
             shown(Some(nsfw), Some(limited)),
+            noticed(true, false, "fosnr_rule"),
         ] {
             cases.push((verdict.clone(), found(Some(safety_result(&verdict)))));
+        }
+        for (policy, reason) in [
+            (
+                AppealablePolicy::HATEFUL_CONDUCT,
+                SafetyResultReason::FOSNR_HATEFUL_CONDUCT,
+            ),
+            (AppealablePolicy::ABUSE, SafetyResultReason::FOSNR_ABUSE),
+            (
+                AppealablePolicy::VIOLENT_SPEECH,
+                SafetyResultReason::FOSNR_VIOLENT_SPEECH,
+            ),
+            (
+                AppealablePolicy::CIVIC_INTEGRITY,
+                SafetyResultReason::FOSNR_CIVIC_INTEGRITY,
+            ),
+        ] {
+            let verdict = appealed(policy, 3, true, false, "fosnr_author");
+            let expected = found(Some(safety_result_with(Some(reason), &verdict)));
+            cases.push((verdict, expected));
         }
         for (verdict, expected) in cases {
             assert_eq!(

@@ -2,7 +2,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use xai_feature_switches::{FeatureSwitches, Params, RecipientBuilder, SimpleRecipient};
+use xai_feature_switches::{
+    AuthorRulesEvaluator, FeatureSwitches, Params, RecipientBuilder, SimpleRecipient,
+};
 use xai_vm_ranker_proto::ViewerContext;
 
 const TWEPOCH_MS: i64 = 1_288_834_974_657;
@@ -13,6 +15,7 @@ const MS_PER_MINUTE: i64 = 60_000;
 
 pub struct RankingConfig {
     feature_switches: Arc<FeatureSwitches>,
+    author_rules: AuthorRulesEvaluator,
 }
 
 impl RankingConfig {
@@ -31,13 +34,22 @@ impl RankingConfig {
             builder = builder.kafka_impressor_enabled(true).datacenter(datacenter);
         }
         let feature_switches = builder.build().await.context("building feature switches")?;
-        Ok(Self { feature_switches })
+        Ok(Self::new(feature_switches))
     }
 
     pub fn from_yaml(yaml: &str) -> Result<Self> {
-        Ok(Self {
-            feature_switches: Arc::new(FeatureSwitches::load_string(yaml)?),
-        })
+        Ok(Self::new(Arc::new(FeatureSwitches::load_string(yaml)?)))
+    }
+
+    pub fn new(feature_switches: Arc<FeatureSwitches>) -> Self {
+        Self {
+            author_rules: AuthorRulesEvaluator::new(Arc::clone(&feature_switches)),
+            feature_switches,
+        }
+    }
+
+    pub fn author_rules(&self) -> &AuthorRulesEvaluator {
+        &self.author_rules
     }
 
     pub fn resolve(&self, viewer: &ViewerContext) -> Params {

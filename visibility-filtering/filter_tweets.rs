@@ -1,7 +1,6 @@
 use crate::caller_identity::{self, Endpoint};
 use crate::filter::{FilterOutcome, FilterRequest, FilterTweets};
 use crate::models::{ClientCapability, RawCandidate, TweetId};
-use crate::reference::ReferenceComparator;
 use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard, Rpc};
 use crate::rules::SafetyLevel;
 use crate::treatment;
@@ -11,19 +10,31 @@ use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 use xai_visibility_filtering_proto as vf_pb;
 
+pub(crate) type FinishComparison = Box<dyn FnOnce(&[FilterOutcome]) + Send>;
+
+pub(crate) trait Comparator: Send + Sync {
+    fn begin(
+        &self,
+        viewer_id: Option<u64>,
+        country_code: Option<String>,
+        safety_level: SafetyLevel,
+        tweet_ids: Vec<u64>,
+    ) -> Option<FinishComparison>;
+}
+
 pub struct FilterTweetsEndpoint {
     filter_tweets: Arc<FilterTweets>,
-    reference_compare: Option<ReferenceComparator>,
+    comparator: Option<Box<dyn Comparator>>,
 }
 
 impl FilterTweetsEndpoint {
     pub(crate) fn new(
         filter_tweets: Arc<FilterTweets>,
-        reference_compare: Option<ReferenceComparator>,
+        comparator: Option<Box<dyn Comparator>>,
     ) -> Self {
         Self {
             filter_tweets,
-            reference_compare,
+            comparator,
         }
     }
 
@@ -34,22 +45,17 @@ impl FilterTweetsEndpoint {
         let entered = tokio::time::Instant::now();
         let request_metrics = RequestMetricsGuard::new();
         let grpc_timeout = parse_grpc_timeout(request.metadata());
-        caller_identity::record(Endpoint::FilterTweets, &request);
+        let caller = caller_identity::record(Endpoint::FilterTweets, &request);
         let context = crate::hydration::request_context(entered, grpc_timeout);
         let req = request.into_inner();
         ft_metrics::record_batch_size(ft_metrics::BATCH_SIZE, req.tweets.len());
         let viewer_id = normalize_viewer_id(req.viewer_id);
         ft_metrics::record_viewer_state(req.viewer_id, viewer_id);
 
-        let safety_level = match req.safety_level() {
-            vf_pb::SafetyLevel::FilterAll => SafetyLevel::FilterAll,
-            vf_pb::SafetyLevel::TimelineHome => SafetyLevel::TimelineHome,
-            vf_pb::SafetyLevel::TimelineHomeRecommendations => {
-                SafetyLevel::TimelineHomeRecommendations
-            }
-            vf_pb::SafetyLevel::ImmersiveExpandedRecommendations => {
-                SafetyLevel::ImmersiveExpandedRecommendations
-            }
+        let Some(safety_level) = SafetyLevel::from_proto(req.safety_level()) else {
+            request_metrics.mark_failure();
+            caller.mark_failure();
+            return Err(Status::unimplemented("safety level has no Rust policy"));
         };
         let candidates: Vec<RawCandidate> = req
             .tweets
@@ -60,8 +66,8 @@ impl FilterTweetsEndpoint {
             })
             .collect();
 
-        let reference_compare = self.reference_compare.as_ref().and_then(|harness| {
-            harness.begin_compare(
+        let finish_comparison = self.comparator.as_ref().and_then(|comparator| {
+            comparator.begin(
                 viewer_id,
                 req.country_code.clone(),
                 safety_level,
@@ -82,16 +88,27 @@ impl FilterTweetsEndpoint {
         ft_metrics::record_verdicts(
             Rpc::FilterTweets,
             safety_level,
-            response.outcomes.iter().map(|outcome| &outcome.verdict),
+            response
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.evaluation.verdict()),
         );
-        ft_metrics::record_rested_on(
+        ft_metrics::record_unresolved(
             Rpc::FilterTweets,
             safety_level,
-            response.outcomes.iter().map(|outcome| outcome.rested_on),
+            response.outcomes.iter().map(|outcome| &outcome.evaluation),
+        );
+        ft_metrics::record_fail_open_defaults(
+            Rpc::FilterTweets,
+            safety_level,
+            response
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.evaluation.fail_open_defaults()),
         );
 
-        if let Some(verdicts) = reference_compare {
-            verdicts.send(&response.outcomes);
+        if let Some(finish_comparison) = finish_comparison {
+            finish_comparison(&response.outcomes);
         }
 
         let results = response
@@ -102,6 +119,7 @@ impl FilterTweetsEndpoint {
 
         request_metrics.record_deadline(grpc_timeout);
         request_metrics.mark_success();
+        caller.mark_success();
         Ok(Response::new(vf_pb::VisibilityFilterResponse { results }))
     }
 }
@@ -130,7 +148,7 @@ pub(crate) fn parse_grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
 }
 
 fn to_visibility_result(outcome: FilterOutcome) -> vf_pb::TweetVisibilityResult {
-    let (action, filtered_reason) = treatment::proto_action(outcome.verdict);
+    let (action, filtered_reason) = treatment::proto_action(outcome.evaluation.into_verdict());
     vf_pb::TweetVisibilityResult {
         tweet_id: outcome.tweet_id.0,
         action: Some(action),
@@ -144,13 +162,16 @@ mod tests {
     use super::*;
     use crate::hydration::plan::Source;
     use crate::hydration::sources::InMemorySources;
-    use crate::reference_compare::tests::{fake_harness, FakeReply};
     use crate::rules::RuleEngine;
+    use std::sync::Mutex;
 
     async fn gizmoduck_calls(viewer_id: Option<u64>) -> usize {
         let sources = Arc::new(InMemorySources::default());
         let endpoint = FilterTweetsEndpoint::new(
-            Arc::new(FilterTweets::new(sources.clone(), RuleEngine::for_tests())),
+            Arc::new(FilterTweets::new(
+                Arc::<InMemorySources>::clone(&sources),
+                RuleEngine::for_tests(),
+            )),
             None,
         );
         let response = endpoint
@@ -181,15 +202,32 @@ mod tests {
         assert_eq!(gizmoduck_calls(Some(42)).await, logged_out + 1);
     }
 
+    #[derive(Default)]
+    struct ViewerIds(Arc<Mutex<Vec<Option<u64>>>>);
+
+    impl Comparator for ViewerIds {
+        fn begin(
+            &self,
+            viewer_id: Option<u64>,
+            _country_code: Option<String>,
+            _safety_level: SafetyLevel,
+            _tweet_ids: Vec<u64>,
+        ) -> Option<FinishComparison> {
+            self.0.lock().unwrap().push(viewer_id);
+            None
+        }
+    }
+
     #[tokio::test]
-    async fn reference_compare_sees_the_normalized_viewer_id() {
-        let (harness, reference) = fake_harness(FakeReply::Immediate);
+    async fn comparator_sees_the_normalized_viewer_id() {
+        let viewer_ids = ViewerIds::default();
+        let seen = Arc::clone(&viewer_ids.0);
         let endpoint = FilterTweetsEndpoint::new(
             Arc::new(FilterTweets::new(
                 Arc::new(InMemorySources::default()),
                 RuleEngine::for_tests(),
             )),
-            Some(harness.into()),
+            Some(Box::new(viewer_ids)),
         );
         for viewer_id in [Some(0), Some(42)] {
             endpoint
@@ -205,17 +243,58 @@ mod tests {
                 .await
                 .unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(1), reference.called.notified())
+        assert_eq!(*seen.lock().unwrap(), vec![None, Some(42)]);
+    }
+
+    #[derive(Default)]
+    struct FinishedResults(Arc<Mutex<Vec<Vec<vf_pb::TweetVisibilityResult>>>>);
+
+    impl Comparator for FinishedResults {
+        fn begin(
+            &self,
+            _viewer_id: Option<u64>,
+            _country_code: Option<String>,
+            _safety_level: SafetyLevel,
+            _tweet_ids: Vec<u64>,
+        ) -> Option<FinishComparison> {
+            let finished = Arc::clone(&self.0);
+            Some(Box::new(move |outcomes: &[FilterOutcome]| {
+                finished
+                    .lock()
+                    .unwrap()
+                    .push(outcomes.iter().cloned().map(to_visibility_result).collect());
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn comparator_finishes_with_the_served_outcomes() {
+        let comparator = FinishedResults::default();
+        let finished = Arc::clone(&comparator.0);
+        let endpoint = FilterTweetsEndpoint::new(
+            Arc::new(FilterTweets::new(
+                Arc::new(InMemorySources::default()),
+                RuleEngine::for_tests(),
+            )),
+            Some(Box::new(comparator)),
+        );
+        let served = endpoint
+            .handle(Request::new(vf_pb::VisibilityFilterRequest {
+                safety_level: vf_pb::SafetyLevel::TimelineHome.into(),
+                tweets: [(2, 20), (3, 30)]
+                    .map(|(tweet_id, author_id)| vf_pb::TweetInput {
+                        tweet_id,
+                        author_id: Some(author_id),
+                    })
+                    .into(),
+                viewer_id: Some(42),
+                country_code: None,
+            }))
             .await
-            .unwrap();
-        let compared_viewer_ids: Vec<u64> = reference
-            .calls
-            .lock()
             .unwrap()
-            .iter()
-            .map(|(_, _, viewer_id, _)| *viewer_id)
-            .collect();
-        assert_eq!(compared_viewer_ids, vec![42]);
+            .into_inner()
+            .results;
+        assert_eq!(*finished.lock().unwrap(), vec![served]);
     }
 
     #[test]

@@ -696,6 +696,51 @@ for config in configs:
             logq_correction_scale=mparams.get(
                 "logq_correction_scale", RecsysTwoTowerModelConfig.logq_correction_scale
             ),
+            fixed_temperature=mparams.get(
+                "fixed_temperature", RecsysTwoTowerModelConfig.fixed_temperature
+            ),
+            own_negative_logit_offset=mparams.get(
+                "own_negative_logit_offset", RecsysTwoTowerModelConfig.own_negative_logit_offset
+            ),
+            positive_count_user_weight_power=mparams.get(
+                "positive_count_user_weight_power",
+                RecsysTwoTowerModelConfig.positive_count_user_weight_power,
+            ),
+            mask_in_batch_false_negatives=mparams.get(
+                "mask_in_batch_false_negatives",
+                RecsysTwoTowerModelConfig.mask_in_batch_false_negatives,
+            ),
+            user_query_heads=mparams.get(
+                "user_query_heads", RecsysTwoTowerModelConfig.user_query_heads
+            ),
+            user_query_head_init_std=mparams.get(
+                "user_query_head_init_std", RecsysTwoTowerModelConfig.user_query_head_init_std
+            ),
+            mol_item_components=mparams.get(
+                "mol_item_components", RecsysTwoTowerModelConfig.mol_item_components
+            ),
+            mol_item_adapter_rank=mparams.get(
+                "mol_item_adapter_rank", RecsysTwoTowerModelConfig.mol_item_adapter_rank
+            ),
+            mol_gate_hidden=mparams.get(
+                "mol_gate_hidden", RecsysTwoTowerModelConfig.mol_gate_hidden
+            ),
+            mol_conditioned_gate=mparams.get(
+                "mol_conditioned_gate", RecsysTwoTowerModelConfig.mol_conditioned_gate
+            ),
+            mol_train_user_chunk=mparams.get(
+                "mol_train_user_chunk", RecsysTwoTowerModelConfig.mol_train_user_chunk
+            ),
+            mol_eval_user_chunk=mparams.get(
+                "mol_eval_user_chunk", RecsysTwoTowerModelConfig.mol_eval_user_chunk
+            ),
+            mol_serving_kernel=mparams.get(
+                "mol_serving_kernel", RecsysTwoTowerModelConfig.mol_serving_kernel
+            ),
+            mol_side_table_in_checkpoint=mparams.get(
+                "mol_side_table_in_checkpoint",
+                RecsysTwoTowerModelConfig.mol_side_table_in_checkpoint,
+            ),
             user_features=user_features_config,
             checkpoint_dataset_names=checkpoint_dataset_names,
             split_home_checkpoint=mparams.get("split_home_checkpoint", False),

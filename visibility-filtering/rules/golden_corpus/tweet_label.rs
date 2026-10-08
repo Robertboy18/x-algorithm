@@ -1,11 +1,12 @@
 use super::builders::labeled;
 use super::{Role, Row};
 use crate::models::SafetyLabelType;
-use crate::rules::fixtures::{allow, candidate, dropped};
+use crate::rules::fixtures::{allow, appealed, candidate, dropped};
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use xai_visibility_filtering::models::{
     Action, DropReason, FilteredReason, SafetyResult, SafetyResultReason,
 };
+use xai_x_thrift::action::AppealablePolicy;
 
 pub(super) fn rows() -> Vec<Row> {
     vec![
@@ -138,6 +139,17 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (TimelineHome, Role::Author, allow()),
+                (
+                    TimelineHomeHydration,
+                    Role::Author,
+                    appealed(
+                        AppealablePolicy::HATEFUL_CONDUCT,
+                        3,
+                        true,
+                        false,
+                        "fosnr_author/appealable",
+                    ),
+                ),
             ],
         },
         Row {
@@ -161,6 +173,17 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (TimelineHome, Role::Author, allow()),
+                (
+                    TimelineHomeHydration,
+                    Role::Author,
+                    appealed(
+                        AppealablePolicy::VIOLENT_SPEECH,
+                        3,
+                        true,
+                        false,
+                        "fosnr_author/appealable",
+                    ),
+                ),
             ],
         },
         Row {
@@ -184,6 +207,17 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (TimelineHome, Role::Author, allow()),
+                (
+                    TimelineHomeHydration,
+                    Role::Author,
+                    appealed(
+                        AppealablePolicy::ABUSE,
+                        3,
+                        true,
+                        false,
+                        "fosnr_author/appealable",
+                    ),
+                ),
             ],
         },
         Row {
@@ -207,6 +241,46 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
                 (TimelineHome, Role::Author, allow()),
+                (
+                    TimelineHomeHydration,
+                    Role::Author,
+                    appealed(
+                        AppealablePolicy::CIVIC_INTEGRITY,
+                        3,
+                        true,
+                        false,
+                        "fosnr_author/appealable",
+                    ),
+                ),
+            ],
+        },
+        Row {
+            name: "fosnr_level_3_and_level_1_labels",
+            post: candidate()
+                .with_label(SafetyLabelType::FOSNR_VIOLENT_SPEECH)
+                .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
+                .with_agent_label(SafetyLabelType::FOSNR_CIVIC_INTEGRITY)
+                .build(),
+            expect: vec![
+                (
+                    TimelineHomeHydration,
+                    Role::Author,
+                    appealed(
+                        AppealablePolicy::CIVIC_INTEGRITY,
+                        3,
+                        false,
+                        false,
+                        "fosnr_author/appealable",
+                    ),
+                ),
+                (
+                    TimelineHomeHydration,
+                    Role::NonFollower,
+                    dropped(
+                        FilteredReason::PossiblyUndesirable,
+                        "fosnr_violent_speech/drop/undesirable",
+                    ),
+                ),
             ],
         },
         Row {

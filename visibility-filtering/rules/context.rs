@@ -1,7 +1,8 @@
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    tweet_timestamp_ms, AuthorFeatures, AuthorLabelSet, ClientCapability, HydratedTweetCandidate,
-    SafetyLabelMap, TweetFeatures, Viewer, ViewerFeatures, ViewerProfile,
+    tweet_timestamp_ms, ArticleLifecycle, AuthorFeatures, AuthorLabelSet, ClientCapability,
+    CommunityModeration, HydratedTweetCandidate, SafetyLabelMap, TweetFeatures, Viewer,
+    ViewerFeatures, ViewerProfile,
 };
 use crate::params::{CountryList, CountryLists};
 use xai_core_entities::entities::ConversationControl;
@@ -64,6 +65,11 @@ impl<'a> RuleContext<'a> {
     }
 
     #[inline]
+    pub(super) fn source_tweet_id(&self) -> Option<u64> {
+        self.reads(Hydrator::PureCore).source_tweet_id
+    }
+
+    #[inline]
     pub(super) fn tweet_features(&self) -> &'a TweetFeatures {
         &self.reads(Hydrator::Tweet).tweet_features
     }
@@ -105,6 +111,29 @@ impl<'a> RuleContext<'a> {
             .conversation_control
             .as_ref();
         features.and_then(|features| features.viewer_country.as_deref())
+    }
+
+    #[inline]
+    pub(super) fn community_moderation(&self) -> CommunityModeration {
+        self.reads(Hydrator::CommunityModeration)
+            .community_moderation
+    }
+
+    #[inline]
+    pub(super) fn viewer_is_community_moderator(&self) -> Option<bool> {
+        self.reads(Hydrator::CommunityModerator)
+            .viewer_is_community_moderator
+    }
+
+    #[inline]
+    pub(super) fn viewer_is_removed_from_community(&self) -> bool {
+        self.reads(Hydrator::CommunityViewerRemoved)
+            .viewer_is_removed_from_community
+    }
+
+    #[inline]
+    pub(super) fn article_lifecycle(&self) -> Option<ArticleLifecycle> {
+        self.reads(Hydrator::ArticleLifecycle).article_lifecycle
     }
 
     #[inline]

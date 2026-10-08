@@ -9,10 +9,11 @@ pub mod viewer;
 pub use author::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
 pub use conversation_control::ConversationControlFeatures;
 pub use safety_labels::{SafetyLabelMap, SafetyLabelType};
-pub use tweet::{MediaFeature, NsfwFeature, TweetFeatures};
+pub use tweet::{ArticleLifecycle, CommunityModeration, MediaFeature, NsfwFeature, TweetFeatures};
 pub use verdict::{
-    Decided, DropReason, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
-    MediaRestriction, NsfwViewerDropReason, TombstoneReason, Verdict, Withholding,
+    Decided, DropReason, Evaluation, FosnrReason, LimitedEngagement, LimitedEngagementReason,
+    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, TombstoneReason, Verdict,
+    Withholding,
 };
 pub use viewer::{
     ClientCapability, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
@@ -56,11 +57,16 @@ pub struct RawCandidate {
 pub struct HydratedTweetCandidate {
     pub tweet_id: u64,
     pub author_id: u64,
+    pub source_tweet_id: Option<u64>,
     pub tweet_features: TweetFeatures,
     pub author_features: AuthorFeatures,
     pub author_labels: AuthorLabelSet,
     pub safety_labels: SafetyLabelMap,
     pub edges: Hydrators,
     pub conversation_control: Option<ConversationControlFeatures>,
+    pub community_moderation: CommunityModeration,
+    pub viewer_is_community_moderator: Option<bool>,
+    pub viewer_is_removed_from_community: bool,
+    pub article_lifecycle: Option<ArticleLifecycle>,
     pub failed: Hydrators,
 }

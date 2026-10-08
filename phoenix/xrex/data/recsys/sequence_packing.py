@@ -156,6 +156,7 @@ class SequencePackedLayout:
     padding_mask: np.ndarray
     positions: np.ndarray
     block_sparse: object | None = None
+    cand_slot_lens: np.ndarray | None = None
 
 
 def compact_candidate_layout(
@@ -232,6 +233,7 @@ def compact_candidate_layout(
         candidate_positions=candidate_positions,
         padding_mask=seg != 0,
         positions=positions,
+        cand_slot_lens=cand_slot,
     )
 
 

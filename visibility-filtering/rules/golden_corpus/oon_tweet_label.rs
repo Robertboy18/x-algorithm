@@ -1,15 +1,18 @@
-use super::builders::{labeled, viewer_in_country};
+use super::builders::{controlled_root, labeled, on_client, viewer_in_country};
 use super::{Role, Row};
 use crate::hydration::Hydrator;
 use crate::models::{ClientCapability, SafetyLabelType, ViewerFeatures, ViewerProfile};
 use crate::rules::fixtures::{
-    allow, candidate, dropped, viewer, viewer_with_profile, AUTHOR_ID, VIEWER_ID,
+    allow, appealed, blurred, candidate, dropped, noticed, viewer, viewer_with_profile, AUTHOR_ID,
+    VIEWER_ID,
 };
 use crate::rules::SafetyLevel::{
     ImmersiveExpandedRecommendations, TimelineHome, TimelineHomeHydration,
     TimelineHomeRecommendations,
 };
+use xai_core_entities::entities::ConversationControlArm;
 use xai_visibility_filtering::models::FilteredReason;
+use xai_x_thrift::action::{AppealablePolicy, InterstitialReason};
 
 pub(super) fn rows() -> Vec<Row> {
     vec![
@@ -223,7 +226,26 @@ pub(super) fn rows() -> Vec<Row> {
                         "fosnr_abuse_insults_non_follower/drop/undesirable",
                     ),
                 ),
-                (TimelineHomeHydration, Role::Follower, allow()),
+                (
+                    TimelineHomeHydration,
+                    Role::Follower,
+                    noticed(
+                        true,
+                        false,
+                        "fosnr_abuse_insults_follower/soft_intervention/abuse",
+                    ),
+                ),
+                (
+                    TimelineHomeHydration,
+                    Role::Author,
+                    appealed(
+                        AppealablePolicy::ABUSE,
+                        1,
+                        true,
+                        false,
+                        "fosnr_author/appealable",
+                    ),
+                ),
                 (
                     TimelineHomeHydration,
                     Role::As("client_without_fosnr", client_without_fosnr(VIEWER_ID)),
@@ -244,6 +266,71 @@ pub(super) fn rows() -> Vec<Row> {
                     ),
                 ),
             ],
+        },
+        Row {
+            name: "fosnr_abuse_insults_by_agent_under_appeal",
+            post: candidate()
+                .with_agent_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
+                .with_label(SafetyLabelType::FOSNR_APPEAL_SUBMITTED)
+                .build(),
+            expect: vec![
+                (
+                    TimelineHomeHydration,
+                    Role::Follower,
+                    noticed(
+                        false,
+                        true,
+                        "fosnr_abuse_insults_follower/soft_intervention/abuse",
+                    ),
+                ),
+                (
+                    TimelineHomeHydration,
+                    Role::Author,
+                    appealed(
+                        AppealablePolicy::ABUSE,
+                        1,
+                        false,
+                        true,
+                        "fosnr_author/appealable",
+                    ),
+                ),
+            ],
+        },
+        Row {
+            name: "fosnr_abuse_insults_on_nsfw_media",
+            post: candidate()
+                .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
+                .with_label(SafetyLabelType::NSFW_HIGH_PRECISION)
+                .with_media()
+                .with_edge(Hydrator::Follows)
+                .build(),
+            expect: vec![(
+                TimelineHomeHydration,
+                Role::As(
+                    "web_follower_in_us",
+                    on_client("web", "us", viewer(VIEWER_ID)),
+                ),
+                blurred(
+                    InterstitialReason::Sensitive(true),
+                    "nsfw_high_precision/blur/sensitive",
+                ),
+            )],
+        },
+        Row {
+            name: "fosnr_abuse_insults_in_by_invitation_conversation",
+            post: candidate()
+                .with_label(SafetyLabelType::FOSNR_ABUSE_INSULTS)
+                .with_conversation_control(controlled_root(ConversationControlArm::ByInvitation))
+                .build(),
+            expect: vec![(
+                TimelineHomeHydration,
+                Role::Follower,
+                noticed(
+                    true,
+                    false,
+                    "fosnr_abuse_insults_follower/soft_intervention/abuse",
+                ),
+            )],
         },
     ]
 }

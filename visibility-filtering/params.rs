@@ -3,6 +3,8 @@ mod limited_actions_policy;
 
 use crate::limited_actions_copy::DriftCheck;
 use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,8 +15,9 @@ use xai_stats_receiver::StatsReceiverExt;
 pub(crate) use client_switches::ClientSwitches;
 pub(crate) use limited_actions_policy::{LimitedActionType, LimitedActionsPolicies};
 
-const SCALA_FILES: [&str; 5] = [
+const SCALA_FILES: [&str; 6] = [
     "age_verification.yml",
+    "community_tweet.yml",
     "country_specific_nsfw_content_gating.yml",
     "freedom_of_speech_not_reach.yml",
     "media_visibility_treatments.yml",
@@ -26,7 +29,10 @@ const LIMITED_ACTIONS_POLICY_FILE: &str =
 
 const LOAD_FAILURE_COUNTER: &str = "feature_switch_load_failures";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::VariantArray)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, strum::VariantArray,
+)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum CountryList {
     NsfwGating,
     AgeVerification,
@@ -87,6 +93,30 @@ impl CountryLists {
         )]
         let codes = &self.lists.load()[list as usize];
         codes.iter().any(|c| c == country_code)
+    }
+
+    pub(crate) fn codes(&self) -> BTreeMap<CountryList, Vec<String>> {
+        CountryList::VARIANTS
+            .iter()
+            .copied()
+            .zip(self.lists.load().iter().cloned())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_codes(codes: &BTreeMap<CountryList, Vec<String>>) -> anyhow::Result<Self> {
+        let lists = CountryList::VARIANTS
+            .iter()
+            .map(|list| {
+                codes
+                    .get(list)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("country_lists lacks {list:?}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self {
+            lists: ArcSwap::from_pointee(lists),
+        })
     }
 
     pub fn refresh(&self, feature_switches: &FeatureSwitches) {
@@ -353,6 +383,7 @@ country_specific_nsfw_content_gating:
             stats.take(),
             [
                 failed("rust_vf.yml"),
+                failed("community_tweet.yml"),
                 failed("freedom_of_speech_not_reach.yml"),
                 failed("media_visibility_treatments.yml"),
                 failed("stale_tweet.yml"),
@@ -366,6 +397,10 @@ country_specific_nsfw_content_gating:
             "media_visibility_treatments:\n  parameters: {}\n",
         );
         write("stale_tweet.yml", "stale_tweet:\n  parameters: {}\n");
+        write(
+            "community_tweet.yml",
+            "community_tweet:\n  parameters: {}\n",
+        );
         write(
             "freedom_of_speech_not_reach.yml",
             "freedom_of_speech_not_reach:\n  parameters: {}\n",

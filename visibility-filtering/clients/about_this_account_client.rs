@@ -1,5 +1,6 @@
+use crate::clients::read_fields;
 use anyhow::bail;
-use thrift::protocol::{TFieldIdentifier, TInputProtocol, TOutputProtocol, TSerializable, TType};
+use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
 use tonic::async_trait;
 use xai_strato::strato_thrift::{strato_decode, StratoResult};
 use xai_strato::StratoGrpc;
@@ -48,24 +49,6 @@ struct UserTfeTopCountry {
 const WEIGHTED_TOP_COUNTRY: i16 = 2;
 const COUNTRY_ID: i16 = 1;
 
-fn read_fields(
-    i_prot: &mut dyn TInputProtocol,
-    mut read_field: impl FnMut(&mut dyn TInputProtocol, &TFieldIdentifier) -> thrift::Result<bool>,
-) -> thrift::Result<()> {
-    i_prot.read_struct_begin()?;
-    loop {
-        let field = i_prot.read_field_begin()?;
-        if field.field_type == TType::Stop {
-            break;
-        }
-        if !read_field(i_prot, &field)? {
-            i_prot.skip(field.field_type)?;
-        }
-        i_prot.read_field_end()?;
-    }
-    i_prot.read_struct_end()
-}
-
 impl TSerializable for UserTfeTopCountry {
     fn read_from_in_protocol(i_prot: &mut dyn TInputProtocol) -> thrift::Result<Self> {
         let mut weighted_top_country = None;
@@ -98,7 +81,9 @@ impl TSerializable for UserTfeTopCountry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol, TStructIdentifier};
+    use thrift::protocol::{
+        TBinaryInputProtocol, TBinaryOutputProtocol, TFieldIdentifier, TStructIdentifier,
+    };
 
     fn country_details(
         o_prot: &mut TBinaryOutputProtocol<&mut Vec<u8>>,

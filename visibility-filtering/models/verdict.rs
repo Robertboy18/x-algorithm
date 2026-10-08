@@ -1,13 +1,33 @@
+use crate::hydration::{Hydrators, Lookup};
+use crate::params::LimitedActionType;
 use xai_visibility_filtering::models::FilteredReason;
-use xai_x_thrift::action::{InterstitialAction, InterstitialReason};
+use xai_x_thrift::action::{AppealablePolicy, InterstitialAction, InterstitialReason};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Verdict {
     Withheld(Decided<Withholding>),
     Shown {
+        notice: Option<Decided<Notice>>,
         media: Option<Decided<MediaRestriction>>,
         engagement: Option<Decided<LimitedEngagement>>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notice {
+    SoftIntervention(FosnrReason),
+    Appealable {
+        reason: FosnrReason,
+        limited_actions: &'static [LimitedActionType],
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FosnrReason {
+    pub policy: AppealablePolicy,
+    pub level: i8,
+    pub proactive: bool,
+    pub appeal_submitted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -113,6 +133,13 @@ pub enum LimitedEngagementReason {
     BlockedViewer,
     RootAuthorBlockedViewer,
     StaleTweet,
+    CommunityTweetHidden,
+    CommunityTweetMemberRemoved,
+    CommunityTweetCommunityNotFound,
+    CommunityTweetCommunityDeleted,
+    CommunityTweetCommunitySuspended,
+    CommunityTweetViewerRemoved,
+    LocalTweet,
 }
 
 impl LimitedEngagementReason {
@@ -123,15 +150,72 @@ impl LimitedEngagementReason {
             Self::BlockedViewer => "blocked_viewer",
             Self::RootAuthorBlockedViewer => "root_author_blocked_viewer",
             Self::StaleTweet => "stale_tweet",
+            Self::CommunityTweetHidden => "community_tweet_hidden",
+            Self::CommunityTweetMemberRemoved => "community_tweet_member_removed",
+            Self::CommunityTweetCommunityNotFound => "community_tweet_community_not_found",
+            Self::CommunityTweetCommunityDeleted => "community_tweet_community_deleted",
+            Self::CommunityTweetCommunitySuspended => "community_tweet_community_suspended",
+            Self::CommunityTweetViewerRemoved => "community_tweet_viewer_removed",
+            Self::LocalTweet => "local_tweet",
         }
     }
 }
 
 impl Verdict {
-    pub fn unresolved_author() -> Self {
+    pub const fn not_found() -> Self {
         Self::Withheld(Decided {
             value: Withholding::Drop(DropReason::Legacy(FilteredReason::UnspecifiedReason)),
-            by: "unresolved_author_id",
+            by: "not_found",
         })
+    }
+
+    pub const fn lookup_failed() -> Self {
+        Self::Withheld(Decided {
+            value: Withholding::Drop(DropReason::Legacy(FilteredReason::UnspecifiedReason)),
+            by: "lookup_failed",
+        })
+    }
+}
+
+static NOT_FOUND: Verdict = Verdict::not_found();
+static LOOKUP_FAILED: Verdict = Verdict::lookup_failed();
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Evaluation {
+    Complete {
+        verdict: Verdict,
+    },
+    Partial {
+        verdict: Verdict,
+        fail_open_defaults: Hydrators,
+    },
+    NotFound(Lookup),
+    Failed(Lookup),
+}
+
+impl Evaluation {
+    pub fn verdict(&self) -> &Verdict {
+        match self {
+            Self::Complete { verdict } | Self::Partial { verdict, .. } => verdict,
+            Self::NotFound(_) => &NOT_FOUND,
+            Self::Failed(_) => &LOOKUP_FAILED,
+        }
+    }
+
+    pub fn into_verdict(self) -> Verdict {
+        match self {
+            Self::Complete { verdict } | Self::Partial { verdict, .. } => verdict,
+            Self::NotFound(_) => Verdict::not_found(),
+            Self::Failed(_) => Verdict::lookup_failed(),
+        }
+    }
+
+    pub fn fail_open_defaults(&self) -> Hydrators {
+        match self {
+            Self::Partial {
+                fail_open_defaults, ..
+            } => *fail_open_defaults,
+            Self::Complete { .. } | Self::NotFound(_) | Self::Failed(_) => Hydrators::empty(),
+        }
     }
 }

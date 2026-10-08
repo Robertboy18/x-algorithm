@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "mol_epilogue_kernel.hpp"
 #include "top_k_by_key_async_kernel.hpp"
 #include "top_k_by_key_kernel.hpp"
 #include "top_k_by_key_radix_select_kernel.hpp"
@@ -48,6 +49,24 @@ XLA_FFI_DEFINE_HANDLER(
         .Ret<ffi::Buffer<ffi::DataType::S32>>()
 );
 
+XLA_FFI_DEFINE_HANDLER(
+    kXrexMolEpilogue,
+    mol_epilogue,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::DataType::BF16>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Ret<ffi::Buffer<ffi::DataType::F32>>()
+        .Attr<int64_t>("num_users")
+        .Attr<int64_t>("num_components")
+);
+
 }
 
 XAI_TOPK_FFI_EXPORT int32_t xai_topk_ffi_api_version(void) {
@@ -66,6 +85,10 @@ XAI_TOPK_FFI_EXPORT XLA_FFI_Error* xai_topk_ffi_top_k_by_key_radix_select(
     XLA_FFI_CallFrame* call_frame
 ) {
   return kTopKByKeyRadixSelect(call_frame);
+}
+
+XAI_TOPK_FFI_EXPORT XLA_FFI_Error* xai_topk_ffi_xrex_mol_epilogue(XLA_FFI_CallFrame* call_frame) {
+  return kXrexMolEpilogue(call_frame);
 }
 
 static_assert(

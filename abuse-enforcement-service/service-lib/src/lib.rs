@@ -52,6 +52,7 @@ use xai_kafka::{
 };
 use xai_service_runner::{ServerBuilder, ServerInfo};
 
+#[allow(deprecated)]
 use xai_strato::{Strato, StratoClientConfig};
 
 use crate::config::Config;
@@ -154,6 +155,7 @@ impl Ord for RetryEntry {
 }
 
 #[derive(Clone)]
+#[allow(deprecated)]
 struct EnforcementCtx {
     ais_client: ais_client::AisClient,
     gd: gizmoduck::GizmoduckCoreClient,
@@ -253,6 +255,27 @@ fn decision_outcome(
 
 const REQUESTED_ACTIONS_DENIED: &str = "requested_actions_denied";
 
+const ALREADY_SUSPENDED: &str = "already_suspended";
+
+const ALREADY_SUSPENDED_STRIPPED: &str = "already_suspended_stripped";
+
+fn strip_redundant_suspends(
+    specs: &mut Vec<decision::ActionSpec>,
+    user: &crate::facts::GizmoduckFacts,
+) -> Vec<decision::ActionSpec> {
+    let is_suspend =
+        |s: &decision::ActionSpec| matches!(s, decision::ActionSpec::SuspendUser { .. });
+    let has_perm = specs
+        .iter()
+        .any(|s| matches!(s, decision::ActionSpec::SuspendUser { perm: true, .. }));
+    if !user.suspended || has_perm || !specs.iter().any(is_suspend) {
+        return Vec::new();
+    }
+    let (stripped, kept) = std::mem::take(specs).into_iter().partition(is_suspend);
+    *specs = kept;
+    stripped
+}
+
 #[derive(Debug, PartialEq)]
 enum ExpandedDecision {
     Skip(String),
@@ -294,7 +317,7 @@ async fn run_enforcement_inner(
 
     let gated_user_id = match entity_type {
         EntityType::User => entity_id,
-        EntityType::Post => user_id, 
+        EntityType::Post => user_id,
     };
     if test_user::is_test_user_id(gated_user_id) {
         info!(
@@ -370,7 +393,7 @@ async fn run_enforcement_inner(
             }
         }
         EntityType::Post => {
-            let author_id = user_id; 
+            let author_id = user_id;
             let (post_allowlist, author_allowlist) = tokio::join!(
                 fetch_entity_allowlist(ctx.allowlist.as_ref(), EntityType::Post, entity_id),
                 fetch_user_allowlist(ctx.allowlist.as_ref(), author_id),
@@ -473,6 +496,54 @@ async fn run_enforcement_inner(
             Ok(outcome)
         }
         ExpandedDecision::Act(mut specs) => {
+            let stripped = strip_redundant_suspends(&mut specs, facts.user());
+            let mut already_suspended_stripped = None;
+            if !stripped.is_empty() {
+                let names: Vec<&'static str> = stripped
+                    .iter()
+                    .map(|spec| {
+                        EnforcementAction::from_spec(
+                            spec,
+                            facts.entity_id,
+                            facts.user_id,
+                            Vec::new(),
+                        )
+                        .name()
+                    })
+                    .collect();
+                let names = serde_json::to_string(&names).unwrap_or_else(|_| "[]".into());
+                if dry_run {
+                    info!(
+                        user_id = facts.user_id,
+                        actions = %names,
+                        "dry run; would call suspendUser, but the account is already suspended"
+                    );
+                }
+                if specs.is_empty() {
+                    info!(
+                        user_id = facts.user_id,
+                        "suspend target already suspended; skipping decision"
+                    );
+                    let mut outcome =
+                        skip_outcome(ALREADY_SUSPENDED.into(), dry_run, &facts, score);
+                    outcome
+                        .info
+                        .insert(ALREADY_SUSPENDED_STRIPPED.into(), names);
+                    if let Some(json) = requested_actions_skipped.take() {
+                        outcome
+                            .info
+                            .insert("requested_actions_skipped".into(), json);
+                    }
+                    return Ok(outcome);
+                }
+                info!(
+                    user_id = facts.user_id,
+                    stripped = %names,
+                    "suspend target already suspended; dropping the suspend, keeping the other actions"
+                );
+                already_suspended_stripped = Some(names);
+            }
+
             // Overturn-hold gate: skip a suspend, or strip a label, that a
             // human reviewer overturned on appeal while that hold is still active.
             let mut hold_gate_info = BTreeMap::new();
@@ -577,6 +648,9 @@ async fn run_enforcement_inner(
                 additional_info_map.insert("requested_actions_skipped".into(), json);
             }
             additional_info_map.extend(hold_gate_info);
+            if let Some(names) = already_suspended_stripped {
+                additional_info_map.insert(ALREADY_SUSPENDED_STRIPPED.into(), names);
+            }
 
             enforce_actions(
                 &ctx.ais_client,
@@ -1847,10 +1921,12 @@ pub async fn start_kafka_consumers(
     .await
     .context("failed to create gizmoduck get-V2 fed-grpc client")?;
 
+    #[allow(deprecated)]
     let cred_hpr = Arc::new(
         Strato::new(&cfg.high_page_rank_column, StratoClientConfig::default())
             .context("Failed to create high-page-rank Strato client")?,
     );
+    #[allow(deprecated)]
     let cred_grey = Arc::new(
         Strato::new(&cfg.grey_badge_column, StratoClientConfig::default())
             .context("Failed to create grey-badge Strato client")?,
@@ -1865,6 +1941,7 @@ pub async fn start_kafka_consumers(
         "Cred Strato clients initialised"
     );
 
+    #[allow(deprecated)]
     let uas_strato = Arc::new(
         Strato::new(&cfg.uas_column, StratoClientConfig::default())
             .context("Failed to create UAS Strato client")?,
@@ -2710,9 +2787,9 @@ mod kafka_topic_config_tests {
         let certs = S2sCerts::new("/ca.crt", "/tls.crt", "/tls.key");
 
         for (cluster, zone) in [
-            ("not-a-cluster", "atla"), 
-            ("bluebird-1", "atla"),    
-            ("mltraining", "iad"),     
+            ("not-a-cluster", "atla"),
+            ("bluebird-1", "atla"),
+            ("mltraining", "iad"),
         ] {
             assert!(
                 KafkaConsumerConfigBuilder::for_cluster_mtls_zone(
@@ -2752,7 +2829,7 @@ mod dedup_retention_tests {
     fn only_success_holds_full_dedup_window() {
         assert!(outcome_holds_full_dedup("success"));
         for skip in [
-            "dry_run", 
+            "dry_run",
             "dedup_skipped",
             "very_high_follower_count",
             "high_follower_count",
@@ -3290,7 +3367,7 @@ mod generic_dispatch_tests {
                 ..Default::default()
             },
             RequestedActionFacts {
-                kind: "bounce_captcha".into(), 
+                kind: "bounce_captcha".into(),
                 head: "IsCuspHead".into(),
                 ..Default::default()
             },
@@ -3446,7 +3523,370 @@ mod health_tests {
             ERR_DELETE,
             true,
         );
-        assert!(!ready); 
-        assert!(!del); 
+        assert!(!ready);
+        assert!(!del);
+    }
+}
+
+#[cfg(test)]
+mod already_suspended_gate_tests {
+    use std::collections::HashMap;
+
+    use xai_core_entities::entities::{GizmoduckUser, GizmoduckUserResult, PCFLabel, Safety};
+    use xai_core_entities::gizmoduck_client::{
+        GizmoduckClient, MockGizmoduckClient, QueryFields, UserFields, ViewerData,
+    };
+
+    use super::*;
+    use crate::decision::ActionSpec;
+    use crate::facts::GizmoduckFacts;
+    use crate::overturn_hold::{FakeHoldStore, HOLD_KIND_SUSPEND, Hold, HoldGate};
+
+    const UID: i64 = 1_700_000_042;
+
+    fn suspend(perm: bool) -> ActionSpec {
+        ActionSpec::SuspendUser {
+            perm,
+            policy: "PlatformManipulation".into(),
+        }
+    }
+
+    fn label() -> ActionSpec {
+        ActionSpec::AddLabelsV2 {
+            labels: vec!["SpamHighRecall".into()],
+            ttl_msec: Some(86_400_000),
+        }
+    }
+
+    fn gizmoduck(suspended: bool) -> GizmoduckFacts {
+        GizmoduckFacts {
+            present: true,
+            suspended,
+            ..Default::default()
+        }
+    }
+
+    fn strip(specs: &[ActionSpec], user: &GizmoduckFacts) -> (Vec<ActionSpec>, Vec<ActionSpec>) {
+        let mut kept = specs.to_vec();
+        let stripped = strip_redundant_suspends(&mut kept, user);
+        (kept, stripped)
+    }
+
+    #[test]
+    fn temporary_suspend_of_a_suspended_account_is_removed() {
+        let suspended = gizmoduck(true);
+        assert_eq!(
+            strip(&[suspend(false)], &suspended),
+            (vec![], vec![suspend(false)])
+        );
+        assert_eq!(
+            strip(&[suspend(false), suspend(false)], &suspended),
+            (vec![], vec![suspend(false), suspend(false)])
+        );
+    }
+
+    #[test]
+    fn other_actions_of_the_decision_are_kept_in_order() {
+        let suspended = gizmoduck(true);
+        assert_eq!(
+            strip(
+                &[label(), suspend(false), ActionSpec::SpamLivenessCheck],
+                &suspended
+            ),
+            (
+                vec![label(), ActionSpec::SpamLivenessCheck],
+                vec![suspend(false)]
+            )
+        );
+    }
+
+    #[test]
+    fn active_account_keeps_every_action() {
+        let active = gizmoduck(false);
+        for specs in [
+            vec![suspend(false)],
+            vec![suspend(true)],
+            vec![label(), suspend(false)],
+        ] {
+            assert_eq!(strip(&specs, &active), (specs.clone(), vec![]));
+        }
+    }
+
+    #[test]
+    fn a_permanent_suspend_keeps_the_decision_whole() {
+        let suspended = gizmoduck(true);
+        for specs in [
+            vec![suspend(true)],
+            vec![suspend(false), suspend(true)],
+            vec![suspend(true), label(), suspend(false)],
+        ] {
+            assert_eq!(strip(&specs, &suspended), (specs.clone(), vec![]));
+        }
+    }
+
+    #[test]
+    fn decisions_without_a_suspend_are_untouched() {
+        let suspended = gizmoduck(true);
+        for specs in [
+            vec![label()],
+            vec![ActionSpec::Arkose, ActionSpec::Captcha],
+            vec![],
+        ] {
+            assert_eq!(strip(&specs, &suspended), (specs.clone(), vec![]));
+        }
+    }
+
+
+            const RULES_YAML: &str = r#"
+for_entity: user
+rules:
+  - id: act_head_suspend
+    when: 'score.model_version == "head_v1"'
+    then: { kind: act_suspend_user, perm: false, policy: "PlatformManipulation" }
+  - id: act_head_suspend_and_label
+    when: 'score.model_version == "head_v2"'
+    then:
+      kind: act_all
+      actions:
+        - { kind: act_suspend_user, perm: false, policy: "PlatformManipulation" }
+        - { kind: act_add_labels_v2, labels: ["SpamHighRecall"], ttl_msec: 86400000 }
+  - id: already_suspended
+    when: user.suspended
+    then: { kind: skip, reason: already_suspended }
+  - id: terminal
+    when: "true"
+    then: { kind: skip, reason: no_match }
+"#;
+
+        fn suspend_hold() -> Hold {
+        Hold {
+            user_id: UID,
+            hold_id: 7,
+            head: Some("FollowBot".into()),
+            expires_at: chrono::Utc::now() + chrono::Duration::days(30),
+            case_group_id: Some(63),
+            reason: "appeal_overturned".into(),
+            action_kind: HOLD_KIND_SUSPEND.into(),
+            label: None,
+        }
+    }
+
+    fn gizmoduck_user(suspended: bool) -> Arc<MockGizmoduckClient> {
+        let user = GizmoduckUser {
+            user_id: UID as u64,
+            safety: Safety {
+                suspended,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        Arc::new(MockGizmoduckClient {
+            users: HashMap::from([(
+                UID,
+                Some(GizmoduckUserResult {
+                    user: Some(user),
+                    response_state: None,
+                }),
+            )]),
+            ..Default::default()
+        })
+    }
+
+        struct FailingGizmoduck;
+
+    #[async_trait::async_trait]
+    impl GizmoduckClient for FailingGizmoduck {
+        async fn get_users(
+            &self,
+            user_ids: Vec<i64>,
+        ) -> HashMap<i64, anyhow::Result<Option<GizmoduckUserResult>>> {
+            user_ids
+                .into_iter()
+                .map(|id| (id, Err(anyhow::anyhow!("gizmoduck unavailable"))))
+                .collect()
+        }
+        async fn get_users_with_perspective(
+            &self,
+            _viewer_id: i64,
+            user_ids: Vec<i64>,
+        ) -> HashMap<i64, anyhow::Result<Option<GizmoduckUserResult>>> {
+            self.get_users(user_ids).await
+        }
+        async fn get_viewer_roles(&self, _user_id: u64) -> anyhow::Result<Vec<String>> {
+            unimplemented!()
+        }
+        async fn get_viewer_data(&self, _user_id: u64) -> anyhow::Result<ViewerData> {
+            unimplemented!()
+        }
+        async fn get_viewer_data_with_fields(
+            &self,
+            _user_id: u64,
+            _query_fields: &[QueryFields],
+        ) -> anyhow::Result<ViewerData> {
+            unimplemented!()
+        }
+        async fn get_pcf_labels(
+            &self,
+            _user_ids: Vec<i64>,
+        ) -> HashMap<i64, anyhow::Result<PCFLabel>> {
+            unimplemented!()
+        }
+        async fn get_profile_description_languages(
+            &self,
+            _user_ids: Vec<i64>,
+        ) -> HashMap<i64, anyhow::Result<Option<String>>> {
+            unimplemented!()
+        }
+        async fn get_user_fields(
+            &self,
+            _user_ids: Vec<i64>,
+        ) -> HashMap<i64, anyhow::Result<UserFields>> {
+            unimplemented!()
+        }
+        async fn get_by_screen_name(
+            &self,
+            _screen_name: &str,
+        ) -> anyhow::Result<Option<GizmoduckUserResult>> {
+            unimplemented!()
+        }
+    }
+
+    struct Harness {
+        ctx: EnforcementCtx,
+        holds: Arc<FakeHoldStore>,
+        gizmoduck_calls: Option<Arc<MockGizmoduckClient>>,
+        _strato: wiremock::MockServer,
+    }
+
+                    async fn harness(gd: Arc<dyn GizmoduckClient + Send + Sync>, dry_run: bool) -> Harness {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({"v": null})),
+            )
+            .mount(&server)
+            .await;
+        #[allow(deprecated)]
+        let column = |name: &str| {
+            Arc::new(Strato::with_client(
+                name,
+                server.uri(),
+                Strato::build_default_client(&Default::default()).unwrap(),
+            ))
+        };
+        let dynamic_config = DynamicConfig::new(None, None, dry_run, 1_000, 1_000, None, None)
+            .await
+            .unwrap();
+        dynamic_config.set_snapshot_for_test(crate::growthbook::ConfigSnapshot {
+            config: Some(serde_json::json!({
+                "dry_run": dry_run,
+                "overturn_hold_gate": {"mode": "enforce"},
+            })),
+            rules_user: Some(Arc::from(RULES_YAML)),
+            rules_post: None,
+        });
+        let holds = FakeHoldStore::new(vec![suspend_hold()]);
+        let ctx = EnforcementCtx {
+            ais_client: ais_client::AisClient::unconnected(),
+            gd: gizmoduck::GizmoduckCoreClient::from_client(gd),
+            cred_clients: strato::CredClients {
+                high_page_rank: column("hpr"),
+                grey_badge: column("grey"),
+            },
+            uas_strato: column("uas"),
+            dynamic_config,
+            rules_cache: Arc::new(rules::RulesCache::new()),
+            allowlist: None,
+            kafka_producer_decisions: None,
+            kafka_producer_decisions_json: None,
+            hold_gate: Arc::new(HoldGate::new(Some(holds.clone()))),
+        };
+        Harness {
+            ctx,
+            holds,
+            gizmoduck_calls: None,
+            _strato: server,
+        }
+    }
+
+    async fn harness_for(suspended: bool, dry_run: bool) -> Harness {
+        let gd = gizmoduck_user(suspended);
+        let mut h = harness(gd.clone(), dry_run).await;
+        h.gizmoduck_calls = Some(gd);
+        h
+    }
+
+    fn score(model_version: &str) -> abuse_proto::ScoreResult {
+        assert!(!test_user::is_test_user_id(UID));
+        abuse_proto::ScoreResult {
+            user_id: UID,
+            model_version: model_version.into(),
+            ..Default::default()
+        }
+    }
+
+            #[tokio::test]
+    async fn control_active_account_reaches_the_hold_gate() {
+        let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+        let h = harness_for(false, false).await;
+        let out = run_enforcement_inner(&h.ctx, &score("head_v1"), "t")
+            .await
+            .unwrap();
+        assert_eq!(out.status, overturn_hold::STATUS_HOLD_OVERTURNED);
+        assert_eq!(h.holds.calls(), 1);
+    }
+
+                #[tokio::test]
+    async fn suspended_account_is_skipped_before_the_hold_gate() {
+        let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+        let h = harness_for(true, false).await;
+        let out = run_enforcement_inner(&h.ctx, &score("head_v1"), "t")
+            .await
+            .unwrap();
+        assert_eq!(out.status, ALREADY_SUSPENDED);
+        assert!(!out.dry_run);
+        assert_eq!(out.info[ALREADY_SUSPENDED_STRIPPED], r#"["suspendUser"]"#);
+        assert_eq!(out.info["gizmoduck_suspended"], "true");
+        assert!(!out.info.contains_key("acted_class"));
+        assert_eq!(h.holds.calls(), 0);
+        assert_eq!(h.gizmoduck_calls.as_ref().unwrap().call_count(), 1);
+        assert_eq!(dedup_retention_for(&out.status), DedupRetention::Skip);
+    }
+
+    #[tokio::test]
+    async fn logging_only_mode_records_the_same_skip() {
+        let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+        let h = harness_for(true, true).await;
+        let out = run_enforcement_inner(&h.ctx, &score("head_v1"), "t")
+            .await
+            .unwrap();
+        assert_eq!(out.status, ALREADY_SUSPENDED);
+        assert!(out.dry_run);
+        assert_eq!(h.holds.calls(), 0);
+        assert_eq!(dedup_retention_for(&out.status), DedupRetention::Skip);
+    }
+
+                    #[tokio::test]
+    async fn suspend_plus_label_keeps_the_label() {
+        let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+        let h = harness_for(true, true).await;
+        let out = run_enforcement_inner(&h.ctx, &score("head_v2"), "t")
+            .await
+            .unwrap();
+        assert_eq!(out.status, "dry_run");
+        assert_eq!(out.info["action_kinds"], r#"["addLabelsV2"]"#);
+        assert_eq!(out.info[ALREADY_SUSPENDED_STRIPPED], r#"["suspendUser"]"#);
+        assert_eq!(h.holds.calls(), 0);
+    }
+
+            #[tokio::test]
+    async fn gizmoduck_read_error_is_retried() {
+        let _serial = overturn_hold::tests::METRICS_LOCK.lock().await;
+        let h = harness(Arc::new(FailingGizmoduck), false).await;
+        let err = run_enforcement_inner(&h.ctx, &score("head_v1"), "t")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("gizmoduck"), "{err:#}");
+        assert_eq!(h.holds.calls(), 0);
     }
 }

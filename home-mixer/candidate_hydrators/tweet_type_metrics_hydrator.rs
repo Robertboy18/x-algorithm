@@ -301,9 +301,9 @@ mod tests {
     #[test]
     fn test_bitset_to_bytes_multiple_bytes() {
         let mut bits = HashSet::new();
-        bits.insert(0); 
-        bits.insert(8); 
-        bits.insert(15); 
+        bits.insert(0);
+        bits.insert(8);
+        bits.insert(15);
         let bytes = TweetTypeMetricsHydrator::bitset_to_bytes(&bits);
         assert_eq!(bytes, vec![0b00000001, 0b10000001]);
     }
@@ -311,10 +311,10 @@ mod tests {
     #[test]
     fn test_bitset_to_bytes_large_bit_index() {
         let mut bits = HashSet::new();
-        bits.insert(314); 
+        bits.insert(314);
         let bytes = TweetTypeMetricsHydrator::bitset_to_bytes(&bits);
         assert_eq!(bytes.len(), 40);
-        assert_eq!(bytes[39], 0b00000100); 
+        assert_eq!(bytes[39], 0b00000100);
     }
 
     #[tokio::test]

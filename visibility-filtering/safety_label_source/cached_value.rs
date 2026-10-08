@@ -125,9 +125,6 @@ pub(crate) mod tests {
             )]),
         };
 
-        match decode(&blob) {
-            CacheLookup::Hit(proto) => assert_eq!(proto, expected),
-            _ => panic!("expected Hit"),
-        }
+        assert_eq!(decode(&blob), CacheLookup::Hit(expected));
     }
 }

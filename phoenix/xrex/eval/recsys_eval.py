@@ -254,6 +254,8 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                 _user_emb_fn = kwargs.get("user_emb_fn", None)
                 assert _user_emb_fn is not None, "user_emb_fn required for in-batch recall"
                 _user_emb = _user_emb_fn(jax_batch)
+                if _user_emb.ndim == 3:
+                    _user_emb = _user_emb[:, 0]
                 _local_start = jax.process_index() * local_batch_size
                 _user_local = np.asarray(
                     jax.device_get(_user_emb[_local_start : _local_start + local_batch_size])

@@ -1,19 +1,20 @@
 use super::{
-    ENV_REFERENCE, ENV_TWEETYPIE_CLIENT_ID, ENV_TWEETYPIE_TLS_DOMAIN, ENV_TWEETYPIE_XDS_LISTENER,
+    ENV_IMAGE, ENV_TWEETYPIE_CLIENT_ID, ENV_TWEETYPIE_TLS_DOMAIN, ENV_TWEETYPIE_XDS_LISTENER,
 };
-use crate::config::ENV_IMAGE;
-use crate::filter::{EvaluationStatus, FilterOutcome, FilterRequest, FilterTweets};
+use crate::config::ENV_REFERENCE;
+use crate::filter::{FilterOutcome, FilterRequest, FilterTweets};
 use crate::hydration::{HYDRATION_TIMEOUT, request_context};
-use crate::models::{RawCandidate, TweetId, Verdict};
+use crate::models::{Evaluation, RawCandidate, TweetId, Verdict};
 use crate::params::{ClientSwitches, LimitedActionsPolicies};
-use crate::reference_compare::resolve_build_sha;
 use crate::retweet;
 use crate::rules::SafetyLevel;
 use crate::rules::metrics::Rpc;
 use crate::server_deps::init_client_with_retry;
+use crate::staging::reference_compare::resolve_build_sha;
 use crate::treatment;
 use anyhow::Context;
 use futures::future::join;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -23,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::spawn;
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout};
+use tonic::metadata::MetadataMap;
 use tracing::warn;
 use xai_build_version::current_build_information;
 use xai_stats_receiver::global_stats_receiver;
@@ -52,12 +54,11 @@ const BATCHES: &str = "vf_tweetypie_reference_batches";
 const RECORD_LINE_MARKER: &str = "vf_tweetypie_reference_record";
 const SAFETY_LEVEL: SafetyLevel = SafetyLevel::TimelineHomeHydration;
 const RECORD_CAP_PER_MINUTE: u32 = 20;
-const WEB_CLIENT_APPLICATION_ID: i64 = 3_033_300;
 const NONE: &str = "none";
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-enum Class {
+pub(crate) enum Class {
     Allow,
     BareDrop,
     Drop,
@@ -87,7 +88,7 @@ enum BatchOutcome {
     Busy,
 }
 
-type Label = (String, String);
+pub(crate) type Label = (String, String);
 
 fn label(class: Class, reason: impl Into<String>) -> Label {
     (<&str>::from(class).to_string(), reason.into())
@@ -118,16 +119,15 @@ fn snake(ident: &str) -> String {
 fn debug_label(value: &impl Debug) -> Label {
     let debug = format!("{value:?}");
     let class = snake(ident(&debug).0);
-    let Some(start) = debug.find("reason: Some(") else {
+    let Some((_, mut rest)) = debug.split_once("reason: Some(") else {
         return (class, NONE.to_string());
     };
-    let mut rest = &debug[start + "reason: Some(".len()..];
     let reason = loop {
         let (name, after) = ident(rest);
         if let Some(inner) = after.strip_prefix(" {")
-            && let Some(i) = inner.find("Some(")
+            && let Some((_, nested)) = inner.split_once("Some(")
         {
-            rest = &inner[i + "Some(".len()..];
+            rest = nested;
             continue;
         }
         let number = after
@@ -143,8 +143,8 @@ fn debug_label(value: &impl Debug) -> Label {
     (class, reason)
 }
 
-struct TpResult {
-    label: Label,
+pub(crate) struct TpResult {
+    pub(crate) label: Label,
     result: Option<String>,
     strato_error: Option<String>,
 }
@@ -178,22 +178,40 @@ impl Bucket {
     }
 }
 
-#[expect(
-    clippy::expect_used,
-    reason = "startup fail-fast: init failure is fatal"
-)]
 pub(super) async fn build(
     init_deadline: Instant,
     filter_tweets: &Arc<FilterTweets>,
     client_switches: ClientSwitches,
+    metadata: Option<&MetadataMap>,
 ) -> Arc<TweetypieReference> {
+    let tweetypie = connect(init_deadline, metadata).await;
+    warn!("reference comparator: tweetypie enabled");
+    Arc::new(TweetypieReference {
+        tweetypie,
+        filter_tweets: Arc::clone(filter_tweets),
+        client_switches,
+        permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        sampler: Mutex::default(),
+        build_sha: resolve_build_sha(
+            &current_build_information().git_commit_sha,
+            env::var(ENV_IMAGE).ok().as_deref(),
+        ),
+        pod: env::var("HOSTNAME").ok(),
+    })
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "startup fail-fast: init failure is fatal"
+)]
+pub(crate) async fn connect(init_deadline: Instant, metadata: Option<&MetadataMap>) -> StratoGrpc {
     let [xds_listener, tls_domain, client_id] = &[
         ENV_TWEETYPIE_XDS_LISTENER,
         ENV_TWEETYPIE_TLS_DOMAIN,
         ENV_TWEETYPIE_CLIENT_ID,
     ]
     .map(required_env);
-    let tweetypie = init_client_with_retry("tweetypie_reference", init_deadline, || async move {
+    init_client_with_retry("tweetypie_reference", init_deadline, || async move {
         let channel = ChannelBuilder::new("tweetypie-xds")
             .tls(
                 TlsMode::mtls_from_env()
@@ -214,27 +232,14 @@ pub(super) async fn build(
             .context("failed to build xDS LoadBalancedChannel for tweetypie-xds")?;
         anyhow::Ok(StratoGrpc::from_load_balanced_channel(
             channel,
-            None,
+            metadata.cloned(),
             Some(client_id.clone()),
             Some(RetryConfig::for_idempotent()),
             TWEETYPIE_MAX_BATCH_SIZE,
         ))
     })
     .await
-    .expect("Failed to initialize Tweetypie client (reference comparator)");
-    warn!("reference comparator: tweetypie enabled");
-    Arc::new(TweetypieReference {
-        tweetypie,
-        filter_tweets: Arc::clone(filter_tweets),
-        client_switches,
-        permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
-        sampler: Mutex::default(),
-        build_sha: resolve_build_sha(
-            &current_build_information().git_commit_sha,
-            env::var(ENV_IMAGE).ok().as_deref(),
-        ),
-        pod: env::var("HOSTNAME").ok(),
-    })
+    .expect("Failed to initialize Tweetypie client (reference comparator)")
 }
 
 #[expect(clippy::panic, reason = "startup fail-fast on misconfiguration")]
@@ -245,12 +250,74 @@ fn required_env(name: &str) -> String {
         .unwrap_or_else(|| panic!("{name} must be set when {ENV_REFERENCE}=tweetypie"))
 }
 
-fn web_client(viewer_id: u64, country_code: Option<&str>) -> TwitterContextViewer {
-    TwitterContextViewer {
-        user_id: viewer_id.cast_signed(),
-        client_application_id: WEB_CLIENT_APPLICATION_ID,
-        request_country_code: country_code.unwrap_or_default().to_string(),
-        ..Default::default()
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::VariantArray,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Client {
+    #[default]
+    Web,
+    IosCurrent,
+    IosOutdated,
+    AndroidCurrent,
+    AndroidOutdated,
+    AndroidWithoutFosnr,
+    MacApp,
+}
+
+impl Client {
+            const fn app(self) -> (i64, Option<&'static str>) {
+        match self {
+            Self::Web => (3_033_300, None),
+            Self::IosCurrent => (
+                129_032,
+                Some("Twitter-iPhone/11.11.5 iOS/17.0 (Apple;iPhone15,2;;;;;1;2022)"),
+            ),
+            Self::IosOutdated => (
+                129_032,
+                Some("Twitter-iPhone/11.11.4 iOS/17.0 (Apple;iPhone15,2;;;;;1;2022)"),
+            ),
+            Self::AndroidCurrent => (
+                258_901,
+                Some(
+                    "TwitterAndroid/11.11.0-release.00 (311110000-r-0) Pixel 7/14 \
+                     (Google;panther;google;panther;0;;1;2022)",
+                ),
+            ),
+            Self::AndroidOutdated => (
+                258_901,
+                Some(
+                    "TwitterAndroid/11.10.9-release.00 (311109000-r-0) Pixel 7/14 \
+                     (Google;panther;google;panther;0;;1;2022)",
+                ),
+            ),
+            Self::AndroidWithoutFosnr => (
+                258_901,
+                Some(
+                    "TwitterAndroid/9.82.0-release.00 (29820000-r-0) Pixel 7/14 \
+                     (Google;panther;google;panther;0;;1;2022)",
+                ),
+            ),
+            Self::MacApp => (
+                557_701,
+                Some("Twitter-Mac/11.11.5 macOS/14.0 (Apple;Mac14,2)"),
+            ),
+        }
+    }
+
+    pub(crate) fn context(
+        self,
+        viewer_id: Option<u64>,
+        country_code: Option<&str>,
+    ) -> TwitterContextViewer {
+        let (client_application_id, user_agent) = self.app();
+        TwitterContextViewer {
+            user_id: viewer_id.map_or(0, u64::cast_signed),
+            client_application_id,
+            user_agent: user_agent.unwrap_or_default().to_string(),
+            request_country_code: country_code.unwrap_or_default().to_string(),
+            ..Default::default()
+        }
     }
 }
 
@@ -275,17 +342,18 @@ impl TweetypieReference {
         let Some(viewer_id) = viewer_id else {
             return;
         };
-        if !matches!(
-            safety_level,
-            SafetyLevel::TimelineHome | SafetyLevel::TimelineHomeRecommendations
-        ) {
-            return;
+        match safety_level {
+            SafetyLevel::TimelineHome | SafetyLevel::TimelineHomeRecommendations => {}
+            SafetyLevel::FilterAll
+            | SafetyLevel::TimelineHomeHydration
+            | SafetyLevel::ImmersiveExpandedRecommendations => return,
         }
         let tweet_ids: Vec<TweetId> = outcomes
             .iter()
-            .filter(|outcome| {
-                outcome.status == EvaluationStatus::Evaluated
-                    && !matches!(outcome.verdict, Verdict::Withheld(_))
+            .filter(|outcome| match &outcome.evaluation {
+                Evaluation::Complete { verdict } => !matches!(verdict, Verdict::Withheld(_)),
+                Evaluation::NotFound(_) => true,
+                Evaluation::Partial { .. } | Evaluation::Failed(_) => false,
             })
             .map(|outcome| outcome.tweet_id)
             .collect();
@@ -317,7 +385,7 @@ impl TweetypieReference {
                 request_author_id: None,
             })
             .collect();
-        let client = web_client(viewer_id, country_code.as_deref());
+        let client = Client::Web.context(Some(viewer_id), country_code.as_deref());
         let client_capability =
             self.client_switches
                 .resolve(Some(&client), Some(viewer_id), country_code.as_deref());
@@ -332,41 +400,14 @@ impl TweetypieReference {
                 rpc: Rpc::EvaluateTweets,
             },
         ));
-        let view = GetTweetFieldsOptions {
-            for_user_id: Some(viewer_id.cast_signed()),
-            language_tag: Some("en"),
-            safety_level: ThriftSafetyLevel::TIMELINE_HOME_HYDRATION,
-            visibility_policy: VISIBILITY_POLICY_USER_VISIBLE,
-            ..Default::default()
-        };
-        let calls = tweet_ids
-            .iter()
-            .map(|id| {
-                (
-                    COLUMN.to_string(),
-                    "fetch".to_string(),
-                    vec![encode(&(id.0.cast_signed(), view))],
-                )
-            })
-            .collect();
         let tp = timeout(
             TWEETYPIE_TIMEOUT,
-            self.tweetypie.batch_call(calls, Some(&client)),
+            get_tweet_fields(&self.tweetypie, &client, &tweet_ids),
         );
         let (rust, tp) = join(rust, tp).await;
         let Ok(tp) = tp else {
             return BatchOutcome::TweetypieTimeout;
         };
-        let tp: Vec<TpResult> = tp
-            .into_iter()
-            .map(|result| match result {
-                Ok(bytes) => match strato_decode::<GetTweetFieldsResult>(&bytes) {
-                    Ok(result) => tp_result(result),
-                    Err(_) => tp_failed(Failure::DecodeError),
-                },
-                Err(_) => tp_failed(Failure::RpcError),
-            })
-            .collect();
         let vf: HashMap<TweetId, &FilterOutcome> = rust
             .iter()
             .map(|outcome| (outcome.tweet_id, outcome))
@@ -425,6 +466,42 @@ impl TweetypieReference {
     }
 }
 
+pub(crate) async fn get_tweet_fields(
+    tweetypie: &StratoGrpc,
+    client: &TwitterContextViewer,
+    tweet_ids: &[TweetId],
+) -> Vec<TpResult> {
+    let view = GetTweetFieldsOptions {
+        for_user_id: Some(client.user_id).filter(|&user_id| user_id != 0),
+        language_tag: Some("en"),
+        safety_level: ThriftSafetyLevel::TIMELINE_HOME_HYDRATION,
+        visibility_policy: VISIBILITY_POLICY_USER_VISIBLE,
+        ..Default::default()
+    };
+    let calls = tweet_ids
+        .iter()
+        .map(|id| {
+            (
+                COLUMN.to_string(),
+                "fetch".to_string(),
+                vec![encode(&(id.0.cast_signed(), view))],
+            )
+        })
+        .collect();
+    tweetypie
+        .batch_call(calls, Some(client))
+        .await
+        .into_iter()
+        .map(|result| match result {
+            Ok(bytes) => match strato_decode::<GetTweetFieldsResult>(&bytes) {
+                Ok(result) => tp_result(result),
+                Err(_) => tp_failed(Failure::DecodeError),
+            },
+            Err(_) => tp_failed(Failure::RpcError),
+        })
+        .collect()
+}
+
 struct Compared<'a> {
     tweet_id: TweetId,
     viewer_id: u64,
@@ -446,7 +523,7 @@ impl Compared<'_> {
         };
         let vf_rule = self
             .vf
-            .and_then(|outcome| treatment::decided_rows(&outcome.verdict).next())
+            .and_then(|outcome| treatment::decided_rows(outcome.evaluation.verdict()).next())
             .map_or(NONE, |(rule, _)| rule);
         Bucket { tp, vf, vf_rule }
     }
@@ -455,7 +532,7 @@ impl Compared<'_> {
         let vf_rules: Vec<String> = self
             .vf
             .into_iter()
-            .flat_map(|outcome| treatment::decided_rows(&outcome.verdict))
+            .flat_map(|outcome| treatment::decided_rows(outcome.evaluation.verdict()))
             .map(|(rule, kind)| format!("{rule}:{kind}"))
             .collect();
         let labels: BTreeMap<i32, Option<i64>> = self
@@ -478,7 +555,7 @@ impl Compared<'_> {
             "tp_result": self.tp.result,
             "tp_strato_error": self.tp.strato_error,
             "vf": [&bucket.vf.0, &bucket.vf.1],
-            "vf_status": self.vf.map(|outcome| format!("{:?}", outcome.status)),
+            "vf_status": self.vf.map(|outcome| vf_status(&outcome.evaluation)),
             "vf_rules": vf_rules,
             "labels": labels,
         })
@@ -506,18 +583,32 @@ fn tp_result(result: StratoResult<GetTweetFieldsResult>) -> TpResult {
     }
 }
 
-fn vf_label(outcome: &FilterOutcome) -> Label {
-    if outcome.status != EvaluationStatus::Evaluated {
-        return label(Class::Failed, NONE);
+fn vf_status(evaluation: &Evaluation) -> &'static str {
+    match evaluation {
+        Evaluation::Complete { .. } => "Evaluated",
+        Evaluation::Partial { .. } => "Failed",
+        Evaluation::NotFound(_) => "NotFound",
+        Evaluation::Failed(_) => "LookupFailed",
     }
-    tp_label(&treatment::thrift_result_state(
-        &outcome.verdict,
-        SAFETY_LEVEL,
-        &LimitedActionsPolicies::default(),
-    ))
+}
+
+pub(crate) fn vf_label(outcome: &FilterOutcome) -> Label {
+    match &outcome.evaluation {
+        Evaluation::Complete { verdict } => tp_label(&treatment::thrift_result_state(
+            verdict,
+            SAFETY_LEVEL,
+            &LimitedActionsPolicies::default(),
+        )),
+        Evaluation::NotFound(_) => label(Class::NotFound, NONE),
+        Evaluation::Partial { .. } | Evaluation::Failed(_) => label(Class::Failed, NONE),
+    }
 }
 
 fn tp_label(state: &TweetFieldsResultState) -> Label {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "FilteredReason is a generated Thrift union; every variant but SafetyResult labels by its Debug name, including any the IDL adds"
+    )]
     let reason = |reason: &FilteredReason| match reason {
         FilteredReason::SafetyResult(result) => debug_label(result).1,
         other => debug_label(other).0,
@@ -530,18 +621,25 @@ fn tp_label(state: &TweetFieldsResultState) -> Label {
             }
             Some(suppress) => label(Class::Suppressed, reason(suppress)),
         },
-        TweetFieldsResultState::Filtered(filtered) => match &filtered.reason {
-            FilteredReason::SafetyResult(result)
-                if result.reason.is_none()
-                    && matches!(&result.action, Action::Drop(drop) if drop.reason.is_none()) =>
-            {
-                label(Class::BareDrop, NONE)
-            }
-            filtered @ FilteredReason::SafetyResult(result) => {
-                (debug_label(&result.action).0, reason(filtered))
-            }
-            filtered => label(Class::Drop, reason(filtered)),
-        },
+        TweetFieldsResultState::Filtered(filtered) => {
+            #[expect(
+                clippy::wildcard_enum_match_arm,
+                reason = "FilteredReason is a generated Thrift union; every variant but SafetyResult is a plain drop, including any the IDL adds"
+            )]
+            let drop_label = match &filtered.reason {
+                FilteredReason::SafetyResult(result)
+                    if result.reason.is_none()
+                        && matches!(&result.action, Action::Drop(drop) if drop.reason.is_none()) =>
+                {
+                    label(Class::BareDrop, NONE)
+                }
+                filtered @ FilteredReason::SafetyResult(result) => {
+                    (debug_label(&result.action).0, reason(filtered))
+                }
+                filtered => label(Class::Drop, reason(filtered)),
+            };
+            drop_label
+        }
         TweetFieldsResultState::NotFound(not_found) => label(
             Class::NotFound,
             not_found
@@ -559,13 +657,16 @@ fn tp_label(state: &TweetFieldsResultState) -> Label {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hydration::Hydrators;
+    use crate::hydration::{Hydrators, Lookup};
     use crate::models::{Decided, DropReason, Withholding};
+    use crate::rules::fixtures::CLIENT_CLASSES;
     use std::fs;
     use std::path::Path;
+    use strum::VariantArray;
     use xai_visibility_filtering::models::FilteredReason as VfFilteredReason;
     use xai_x_thrift::action::{
-        BlockedViewer, Drop as ThriftDrop, LimitedEngagementReason, LimitedEngagements,
+        AnyInterstitial, BlockedViewer, Drop as ThriftDrop, Interstitial, InterstitialReason,
+        LimitedEngagementReason, LimitedEngagements, LocalizedMessage, TweetInterstitial,
     };
     use xai_x_thrift::get_tweet_fields::TweetFieldsResultFound;
     use xai_x_thrift::safety_result::SafetyResult;
@@ -579,15 +680,14 @@ mod tests {
         FilterOutcome {
             tweet_id: TweetId(1),
             source_tweet_id: None,
-            verdict,
-            rested_on: Hydrators::empty(),
-            status: EvaluationStatus::Evaluated,
+            evaluation: Evaluation::Complete { verdict },
             safety_labels: None,
         }
     }
 
     fn shown() -> Verdict {
         Verdict::Shown {
+            notice: None,
             media: None,
             engagement: None,
         }
@@ -605,6 +705,25 @@ mod tests {
             tp,
             vf,
         }
+    }
+
+    #[test]
+    fn the_record_names_each_evaluation() {
+        assert_eq!(
+            [
+                Evaluation::Complete { verdict: shown() },
+                Evaluation::Partial {
+                    verdict: shown(),
+                    fail_open_defaults: Hydrators::empty(),
+                },
+                Evaluation::NotFound(Lookup::Tweet),
+                Evaluation::Failed(Lookup::Author),
+            ]
+            .iter()
+            .map(vf_status)
+            .collect::<Vec<_>>(),
+            ["Evaluated", "Failed", "NotFound", "LookupFailed"]
+        );
     }
 
     #[test]
@@ -684,6 +803,70 @@ mod tests {
         assert_eq!(
             (bucket.vf, bucket.vf_rule),
             (pair("drop", "author_is_suspended"), "suspended_author/drop")
+        );
+        let not_found = TpResult {
+            label: pair("not_found", NONE),
+            result: None,
+            strato_error: None,
+        };
+        let deleted = FilterOutcome {
+            evaluation: Evaluation::NotFound(Lookup::Tweet),
+            ..shown
+        };
+        let bucket = compared(&not_found, Some(&deleted)).bucket();
+        assert_eq!(
+            (bucket.tp, bucket.vf, bucket.vf_rule),
+            (
+                pair("not_found", NONE),
+                pair("not_found", NONE),
+                "not_found"
+            )
+        );
+    }
+
+    #[test]
+    fn each_client_resolves_its_fixture_class_capability() {
+        let switches = ClientSwitches::for_tests();
+        for &client in Client::VARIANTS {
+            let name = serde_json::to_value(client).unwrap();
+            let class = CLIENT_CLASSES
+                .iter()
+                .find(|class| name == class.name)
+                .unwrap_or_else(|| panic!("no client class named {name}"));
+            assert_eq!(
+                switches.resolve(
+                    Some(&client.context(Some(1), Some("fr"))),
+                    Some(1),
+                    Some("fr")
+                ),
+                class.capability,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reason_after_multi_byte_text_keeps_its_label() {
+        let message =
+            LocalizedMessage::new("Contenu réservé ✓".to_string(), "fr".to_string(), None);
+        let action = Action::TweetInterstitial(TweetInterstitial {
+            interstitial: Some(AnyInterstitial::Interstitial(Interstitial::new(
+                None::<InterstitialReason>,
+                message,
+            ))),
+            limited_engagements: Some(LimitedEngagements::new(
+                LimitedEngagementReason::BlockedViewer(BlockedViewer::default()),
+                None,
+                None,
+            )),
+            ..TweetInterstitial::default()
+        });
+        let state = TweetFieldsResultState::Found(TweetFieldsResultFound::new(Some(
+            FilteredReason::SafetyResult(SafetyResult::new(None, action)),
+        )));
+        assert_eq!(
+            tp_label(&state),
+            pair("tweet_interstitial", "blocked_viewer")
         );
     }
 

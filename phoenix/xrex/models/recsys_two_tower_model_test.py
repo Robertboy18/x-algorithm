@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from xrex.cuda.top_k_by_key import gather_selected_validity, top_k_by_key
-from xrex.models.recsys_two_tower_model import RecsysTwoTowerModel
+from xrex.models.recsys_two_tower_model import RecsysTwoTowerModel, RecsysTwoTowerModelConfig
 from xrex.models.sharding_context import ShardingContext
 from xrex.models.topic_categories import NUM_TOPIC_INT32S
 
@@ -46,7 +46,8 @@ class RetrievalValidityTest(unittest.TestCase):
         @hk.without_apply_rng
         @hk.transform
         def retrieve(users, posts, ranges):
-            model = FixedUserModel(None, None, None, self.context)
+            config = RecsysTwoTowerModelConfig(user_tower_config=None, candidate_tower_config=None)
+            model = FixedUserModel(config, None, None, self.context)
             return model.forward(
                 users,
                 None,

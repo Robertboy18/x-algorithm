@@ -101,7 +101,7 @@ lazy_static! {
         register_histogram_vec!(
             "abuse_enforcement_gizmoduck_core_latency_seconds",
             "Gizmoduck get-V2 fed-grpc fetch latency.",
-            &["status"], 
+            &["status"],
             exponential_buckets(0.01, 2.0, 12).unwrap())
             .unwrap();
 
@@ -119,7 +119,7 @@ lazy_static! {
         register_histogram_vec!(
             "abuse_enforcement_retry_attempts",
             "Number of attempts before a retry sequence terminates.",
-            &["status"],  
+            &["status"],
             vec![1.0, 2.0, 3.0, 4.0, 5.0])
             .unwrap();
 
@@ -134,28 +134,28 @@ lazy_static! {
         register_int_counter_vec!(
             "abuse_enforcement_limiter_decisions_total",
             "Outcome of Limiter IncrementFeature calls for the global cap.",
-            &["outcome"])  
+            &["outcome"])
             .unwrap();
 
                         pub static ref RATE_LIMIT_REMAINING: IntGaugeVec =
         register_int_gauge_vec!(
             "abuse_enforcement_rate_limit_remaining",
             "Remaining enforcement cap in the current window, per entity_type (-1 if unavailable).",
-            &["entity_type"])  
+            &["entity_type"])
             .unwrap();
 
                         pub static ref CONFIG_RESTART_PENDING: IntGaugeVec =
         register_int_gauge_vec!(
             "abuse_enforcement_config_restart_pending",
             "1 while a restart-requiring config change is pending, by whether it validates.",
-            &["valid"])  
+            &["valid"])
             .unwrap();
 
                                                 pub static ref LIMITER_COUNTER_RESET_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "abuse_enforcement_limiter_counter_reset_total",
             "Detected Limiter cumulative-counter resets (backwards steps), per entity_type.",
-            &["entity_type"])  
+            &["entity_type"])
             .unwrap();
 
 
@@ -170,7 +170,7 @@ lazy_static! {
         register_int_counter_vec!(
             "abuse_enforcement_kafka_self_delete_total",
             "Self-inflicted pod deletions due to unreachable Kafka brokers.",
-            &["reason"])  
+            &["reason"])
             .unwrap();
 
 
@@ -178,7 +178,7 @@ lazy_static! {
         register_int_counter_vec!(
             "abuse_enforcement_kafka_consumer_start_total",
             "Per-topic consumer startup outcomes at boot.",
-            &["topic", "cluster", "result"])  
+            &["topic", "cluster", "result"])
             .unwrap();
 
 
@@ -186,7 +186,7 @@ lazy_static! {
         register_int_counter_vec!(
             "abuse_enforcement_rules_yaml_compiled_total",
             "GrowthBook rules-YAML compile attempts, by entity_type and result (success keeps/updates last-good; fail keeps last-good).",
-            &["entity_type", "result"])  
+            &["entity_type", "result"])
             .unwrap();
 
 

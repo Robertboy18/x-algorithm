@@ -38,6 +38,10 @@ POST_IDS_KEY = "post_embeddings.post_ids"
 AUTHOR_IDS_KEY = "post_embeddings.author_ids"
 POST_SCALES_KEY = "post_embeddings.scales"
 DATASET_RANGES_KEY = "post_embeddings.dataset_ranges"
+TOPIC_BITMAPS_KEY = "post_embeddings.topic_bitmaps"
+MOL_SIDE_TABLE_KEY = "post_embeddings.mol_side_table"
+TOPIC_QUERY_KEY = "topic_query"
+TOPIC_FILTER_MODES = 6
 
 _RETRIEVAL_RUNNER_ATTRS = (
     "large_k",
@@ -158,6 +162,8 @@ class RetrievalExport:
     rows_from: tuple[tuple[int, ...], ...] | None = None
     max_age_seconds: tuple[float | None, ...] | None = None
     optional_targets: tuple[bool, ...] | None = None
+    topic_filter: bool = False
+    mol_side_table_shape: tuple[int, int] | None = None
 
     @property
     def output_names(self) -> list[str]:
@@ -167,8 +173,9 @@ class RetrievalExport:
             names.append(f"scores_{name}")
         return names
 
-    @property
-    def program_inputs(self) -> list[tuple[str, str, Any, str]]:
+    def program_inputs(self, bs: int) -> list[tuple[str, str, Any, str]]:
+        from xrex.models.topic_categories import NUM_TOPIC_INT32S
+
         rows = self.post_table_shape[0]
         table_dtype = np.dtype(np.int8 if self.int8_post_table else self.post_table_dtype)
         inputs = [
@@ -192,7 +199,19 @@ class RetrievalExport:
         if self.dataset_capacities is not None:
             ranges = jax.ShapeDtypeStruct((len(self.target_dataset_types), 2), np.int32)
             inputs.append(("dataset_ranges", DATASET_RANGES_KEY, ranges, "replicated"))
+        if self.topic_filter:
+            bitmaps = jax.ShapeDtypeStruct((rows, TOPIC_FILTER_MODES * NUM_TOPIC_INT32S), np.int32)
+            query = jax.ShapeDtypeStruct((bs, NUM_TOPIC_INT32S + 1), np.int32)
+            inputs.append(("topic_bitmaps", TOPIC_BITMAPS_KEY, bitmaps, "rows"))
+            inputs.append(("topic_query", TOPIC_QUERY_KEY, query, "replicated"))
+        if self.mol_side_table_shape is not None:
+            side = jax.ShapeDtypeStruct(self.mol_side_table_shape, np.float32)
+            inputs.append(("weight", MOL_SIDE_TABLE_KEY, side, "replicated"))
         return inputs
+
+    @property
+    def derived_kinds(self) -> list[str]:
+        return [kind for kind, _, _, _ in self.program_inputs(1)[2:]]
 
     def manifest_block(self) -> dict[str, Any]:
         block: dict[str, Any] = {
@@ -217,7 +236,27 @@ class RetrievalExport:
         if self.dataset_capacities is not None:
             block["dataset_ranges_key"] = DATASET_RANGES_KEY
             block["dataset_capacities"] = list(self.dataset_capacities)
+        if self.topic_filter:
+            block["topic_filter"] = _topic_filter_manifest_block()
         return block
+
+
+def _topic_filter_manifest_block() -> dict[str, Any]:
+    from xrex.models import topic_categories as tc
+
+    none: frozenset[int] = frozenset()
+    post_bits = {
+        eid: sorted(tc.TOPIC_ID_TO_BITS.get(eid, none) | tc._POST_SIDE_GROUP_MEMBERS.get(eid, none))
+        for eid in sorted(set(tc.TOPIC_ID_TO_BITS) | set(tc._POST_SIDE_GROUP_MEMBERS))
+    }
+    return {
+        "bitmaps_key": TOPIC_BITMAPS_KEY,
+        "query_key": TOPIC_QUERY_KEY,
+        "num_modes": TOPIC_FILTER_MODES,
+        "num_words": tc.NUM_TOPIC_INT32S,
+        "post_bits": [[eid, bits] for eid, bits in post_bits.items()],
+        "query_bits": [[eid, sorted(bits)] for eid, bits in sorted(tc.TOPIC_ID_TO_BITS.items())],
+    }
 
 
 def _target_manifest_entry(
@@ -295,6 +334,19 @@ def ensure_packing_layout_serialization_registered() -> None:
         serialize_auxdata=lambda aux: json.dumps(list(aux)).encode(),
         deserialize_auxdata=lambda data: tuple(json.loads(data)),
     )
+    try:
+        from xrex.cutedsl.ranker_attention_varlen_fa4 import (
+            BlockSparseLayout,
+        )
+    except ImportError:
+        pass
+    else:
+        jax_export.register_pytree_node_serialization(
+            BlockSparseLayout,
+            serialized_name="xrex.cutedsl.ranker_attention_varlen_fa4.BlockSparseLayout",
+            serialize_auxdata=lambda aux: json.dumps(list(aux)).encode(),
+            deserialize_auxdata=lambda data: tuple(json.loads(data)),
+        )
     _packing_layout_serialization_registered = True
 
 
@@ -428,12 +480,14 @@ def _token_feature_config(model_config: Any, *, two_tower: bool) -> Any:
     return model_config.user_tower_config if two_tower else model_config
 
 
-def _batch_template(export_cfg: Any, bs: int, *, packed: bool) -> Any:
+def _batch_template(
+    export_cfg: Any, bs: int, *, packed: bool, packed_seq_len: int | None = None
+) -> Any:
     model_config = export_cfg.model_config
     batch = export_cfg.dataset.example_data(bs)
 
     if packed:
-        from xrex.data.recsys.sequence_packing import pack_batch
+        from xrex.data.recsys.sequence_packing import compact_candidate_layout, pack_batch
 
         batch = pack_batch(
             batch=batch,
@@ -443,7 +497,32 @@ def _batch_template(export_cfg: Any, bs: int, *, packed: bool) -> Any:
             rng=None,
             block_size=export_cfg._seqpack_block_size,
         )
+        layout = batch["packing_layout"]
+        if packed_seq_len is not None and packed_seq_len != int(layout.segment_ids.shape[1]):
+            batch["packing_layout"] = compact_candidate_layout(
+                batch,
+                num_user_prefix_tokens=model_config.num_user_prefix_tokens,
+                block_size=export_cfg._seqpack_block_size,
+                packed_seq_len=packed_seq_len,
+            )
+        if getattr(export_cfg, "using_fa4", False):
+            batch = export_cfg.add_block_sparse_layout(batch)
+        layout = batch["packing_layout"]
+        if layout.cand_slot_lens is not None:
+            batch["packing_layout"] = dataclasses.replace(layout, cand_slot_lens=None)
+    elif packed_seq_len is not None:
+        raise ValueError("packed_seq_len applies to sequence-packed exports only")
     return batch
+
+
+def _packed_seq_len_rungs(trainer: Any, bs: int, packed: bool) -> tuple[int | None, ...]:
+    if not packed or not getattr(trainer, "compact_candidate_slots", False):
+        return (None,)
+    full = int(trainer.full_packed_seq_len(bs))
+    lens = tuple(int(n) for n in trainer.packed_seq_lens(bs))
+    if not lens or lens[-1] != full:
+        raise AssertionError(f"bs={bs}: packed_seq_lens {lens} must end at the full row {full}")
+    return tuple(None if n == full else n for n in lens)
 
 
 def _batch_avals(
@@ -612,7 +691,21 @@ def _make_retrieval_forward_fn(
 
     model_config = export_cfg.model_config
     target_values = tuple(value for _, value in retrieval.target_dataset_types)
-    derived_kinds = [kind for kind, _, _, _ in retrieval.program_inputs[2:]]
+    derived_kinds = retrieval.derived_kinds
+
+    def topic_inputs(by_kind: dict[str, jax.Array]) -> tuple[jax.Array | None, jax.Array | None]:
+        if not retrieval.topic_filter:
+            return None, None
+        import jax.numpy as jnp
+
+        from xrex.models.topic_categories import NUM_TOPIC_INT32S
+
+        query = by_kind["topic_query"]
+        bitmaps = by_kind["topic_bitmaps"]
+        by_mode = bitmaps.reshape(bitmaps.shape[0], TOPIC_FILTER_MODES, NUM_TOPIC_INT32S)
+        mode = jnp.clip(query[0, NUM_TOPIC_INT32S], 0, TOPIC_FILTER_MODES - 1)
+        selected = jax.lax.dynamic_index_in_dim(by_mode, mode, axis=1, keepdims=False)
+        return selected, query[:, :NUM_TOPIC_INT32S]
 
     @hk.transform
     def forward_fn(
@@ -626,7 +719,16 @@ def _make_retrieval_forward_fn(
             merged_embeddings, embedding_slices, packed_geometry
         )
         by_kind = dict(zip(derived_kinds, derived, strict=True))
+        topic_bitmaps, topic_user_bitmasks = topic_inputs(by_kind)
         model = model_config.make(sharding_context=make_legacy_sharding_context(mesh))
+        mol_side_tables = None
+        side_table = by_kind.get("weight")
+        if side_table is not None:
+            components = model_config.mol_item_components
+            mol_side_tables = (
+                jax.numpy.transpose(side_table[:, :components]),
+                jax.numpy.transpose(side_table[:, components:]),
+            )
         results = model.forward(
             batch,
             recsys_embeddings,
@@ -635,13 +737,14 @@ def _make_retrieval_forward_fn(
             retrieval.large_k,
             target_values,
             None,
-            topic_bitmaps=None,
-            topic_user_bitmasks=None,
+            topic_bitmaps=topic_bitmaps,
+            topic_user_bitmasks=topic_user_bitmasks,
             dataset_ranges=by_kind.get("dataset_ranges"),
             use_async_topk=retrieval.use_async_topk,
             use_radix_select_topk=retrieval.use_radix_select_topk,
             post_scales=by_kind.get("post_scales"),
             dataset_capacities=retrieval.dataset_capacities,
+            mol_side_tables=mol_side_tables,
         )
         flat: list[jax.Array] = []
         for indices, scores in results:
@@ -703,7 +806,10 @@ def _retrieval_shardings(
         replicated,
         batch_shardings,
         rows,
-        *(rows if layout == "rows" else replicated for _, _, _, layout in retrieval.program_inputs),
+        *(
+            rows if layout == "rows" else replicated
+            for _, _, _, layout in retrieval.program_inputs(bs)
+        ),
     )
     return in_shardings, (replicated,) * len(retrieval.output_names)
 
@@ -810,15 +916,18 @@ def _retrieval_export(
             "two-tower StableHLO export needs a RetrievalModelRunner (host-side "
             f"export_native_bundle); trainer lacks {missing}"
         )
-    unsupported = [
-        flag for flag in ("enable_bloom_filter", "enable_topic_filter") if getattr(runner, flag)
-    ]
-    if unsupported:
+    if runner.enable_bloom_filter:
         raise NotImplementedError(
-            f"two-tower StableHLO export does not support {unsupported}; the native runtime "
-            "applies no per-post filters"
+            "two-tower StableHLO export does not support enable_bloom_filter; the native "
+            "runtime has no bloom filter"
         )
-    if runner.enable_dataset_slice_topk and dataset_capacities is None:
+    topic_filter = bool(runner.enable_topic_filter)
+    if topic_filter and dataset_capacities is not None:
+        raise ValueError(
+            "enable_topic_filter masks the whole table per dataset; it cannot be combined with "
+            "--dataset_capacities"
+        )
+    if runner.enable_dataset_slice_topk and dataset_capacities is None and not topic_filter:
         logger.warning(
             "enable_dataset_slice_topk=True without dataset capacities: the slice path compiles "
             "the checkpoint's per-dataset post-table ranges into the program, so the exported "
@@ -840,6 +949,11 @@ def _retrieval_export(
         getattr(getattr(runner, "model_config", None), "split_home_checkpoint", False)
     )
     if split_home and any(ds.name == "HOME" for ds in datasets):
+        if topic_filter:
+            raise NotImplementedError(
+                "enable_topic_filter with split_home_checkpoint: the topic path masks stored "
+                "type 1 only, not the cold|hot HOME window"
+            )
         if dataset_capacities is None:
             raise ValueError(
                 "split_home_checkpoint requires --dataset_capacities so HOME is the "
@@ -876,6 +990,15 @@ def _retrieval_export(
             f"{dataset_types_rows}; the retrieval forward needs them to agree, so max_posts "
             "must be a multiple of training_ep"
         )
+    side_table = getattr(post_embeddings, "mol_side_table", None)
+    mol_side_table_shape = None
+    if side_table is not None:
+        mol_side_table_shape = (int(side_table.x.shape[0]), int(side_table.x.shape[1]))
+        if mol_side_table_shape[0] != int(table.shape[0]):
+            raise ValueError(
+                f"MoL side table has {mol_side_table_shape[0]} rows but the post table has "
+                f"{int(table.shape[0])}; the serving forward slices both per shard"
+            )
     return RetrievalExport(
         large_k=large_k,
         target_dataset_types=tuple((ds.name, int(ds.value)) for ds in datasets),
@@ -890,6 +1013,8 @@ def _retrieval_export(
         rows_from=_split_rows_from(runner, datasets) if split_home else None,
         max_age_seconds=_split_max_age(runner, datasets) if split_home else None,
         optional_targets=_split_optional(runner, datasets) if split_home else None,
+        topic_filter=topic_filter,
+        mol_side_table_shape=mol_side_table_shape,
     )
 
 
@@ -955,11 +1080,6 @@ def build_bundle(
             "the two-tower export supports dense batches only (use_seqpack=False): a packed "
             "batch is laid out per device by the packer, which the SPMD retrieval program "
             "does not model"
-        )
-    if trainer.using_seqpack and trainer.using_fa4:
-        raise NotImplementedError(
-            "StableHLO bundle export supports seqpack with pallas_ranker_varlen_attn only; "
-            "FA4 (cutedsl_ranker_varlen_attn) block-sparse layouts are not supported yet"
         )
     if not trainer.checkpoint_config.copy_port:
         raise ValueError("export_stablehlo_bundle requires checkpoint_config.copy_port")
@@ -1033,7 +1153,6 @@ def build_bundle(
     )
     rng_aval = jax.ShapeDtypeStruct((2,), np.uint32)
 
-    retrieval_inputs = retrieval.program_inputs if retrieval is not None else None
     output_names = (
         ("log_probs", "cont_preds", "has_nan") if retrieval is None else retrieval.output_names
     )
@@ -1042,10 +1161,18 @@ def build_bundle(
     programs: dict[str, Any] = {}
     all_custom_call_targets: set[str] = set()
 
-    for bs_per_device in buckets:
+    compact_candidate_slots = packed and bool(getattr(trainer, "compact_candidate_slots", False))
+    rungs = [
+        (bs_per_device, packed_seq_len)
+        for bs_per_device in buckets
+        for packed_seq_len in _packed_seq_len_rungs(trainer, bs_per_device * mesh_devices, packed)
+    ]
+    for bs_per_device, packed_seq_len in rungs:
         start = time.perf_counter()
         bs = bs_per_device * mesh_devices
-        batch_template = _batch_template(export_cfg, bs, packed=packed)
+        batch_template = _batch_template(
+            export_cfg, bs, packed=packed, packed_seq_len=packed_seq_len
+        )
         batch_avals = _batch_avals(
             export_cfg, bs, packed=packed, template=batch_template, two_tower=two_tower
         )
@@ -1060,6 +1187,7 @@ def build_bundle(
             (merged_batch, embedding_slices.user_ip_end, model_config.emb_table_width),
             model_config.embedding_dtype,
         )
+        retrieval_inputs = retrieval.program_inputs(bs) if retrieval is not None else None
         if retrieval is None:
             forward_fn = _make_forward_fn(export_cfg, embedding_slices, mesh, packed_geometry)
             args = (params_avals, rng_aval, batch_avals, merged_aval)
@@ -1141,9 +1269,16 @@ def build_bundle(
                 entry["sharding"] = _sharding_entry(
                     hlo, len(aval.shape), mesh_devices, f"bs={bs} input {entry['key']}"
                 )
+                replicated_kinds = (
+                    "weight",
+                    "rng",
+                    "dataset_types",
+                    "dataset_ranges",
+                    "topic_query",
+                )
                 expected = (
                     SHARDING_REPLICATED
-                    if entry["kind"] in ("weight", "rng", "dataset_types", "dataset_ranges")
+                    if entry["kind"] in replicated_kinds
                     else {"kind": "tiled", "dim": 0}
                 )
                 if mesh_devices > 1 and entry["sharding"] != expected:
@@ -1158,15 +1293,22 @@ def build_bundle(
                     hlo, len(aval.shape), mesh_devices, f"bs={bs} output {entry['name']}"
                 )
 
-        mlir_name = f"{BUNDLE_DIR}/forward_bs{bs}.mlirbc"
-        jax_export_name = f"{BUNDLE_DIR}/forward_bs{bs}.jax_export"
+        program_key = str(bs) if packed_seq_len is None else f"{bs}_len{packed_seq_len}"
+        file_stem = f"forward_bs{program_key}"
+        mlir_name = f"{BUNDLE_DIR}/{file_stem}.mlirbc"
+        jax_export_name = f"{BUNDLE_DIR}/{file_stem}.jax_export"
         mlir_bytes = bytes(exported.mlir_module_serialized)
         jax_export_bytes = bytes(exported.serialize())
         files.append(BundleFile(mlir_name, mlir_bytes))
         files.append(BundleFile(jax_export_name, jax_export_bytes))
         all_custom_call_targets.update(custom_call_targets)
+        row_len = int(batch_template["packing_layout"].segment_ids.shape[1]) if packed else None
+        if packed_seq_len is not None and row_len != packed_seq_len:
+            raise AssertionError(
+                f"bs={bs}: template row {row_len} != packed_seq_len {packed_seq_len}"
+            )
 
-        programs[str(bs)] = {
+        programs[program_key] = {
             "batch_size": bs,
             "mlir_module": {"file": mlir_name, "adler32": zlib.adler32(mlir_bytes)},
             "jax_export": {"file": jax_export_name, "adler32": zlib.adler32(jax_export_bytes)},
@@ -1176,17 +1318,23 @@ def build_bundle(
             "input_spec": spec,
             "output_spec": outputs,
             "seqpack": (
-                {**packed_geometry._asdict(), "merged_slices": embedding_slices._asdict()}
+                {
+                    **packed_geometry._asdict(),
+                    "merged_slices": embedding_slices._asdict(),
+                    "packed_seq_len": row_len,
+                    "compact_candidate_slots": compact_candidate_slots,
+                }
                 if packed_geometry is not None
                 else None
             ),
         }
         logger.info(
-            "Exported StableHLO %s forward bs=%d (%d/device) in %.1fs (%d inputs, %d kept, "
-            "custom_calls=%s)",
+            "Exported StableHLO %s forward bs=%d (%d/device, packed row %s) in %.1fs "
+            "(%d inputs, %d kept, custom_calls=%s)",
             "retrieval" if retrieval is not None else "ranking",
             bs,
             bs_per_device,
+            row_len,
             time.perf_counter() - start,
             len(spec),
             len(exported.module_kept_var_idx),

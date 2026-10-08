@@ -14,6 +14,7 @@ enum ClientSwitch {
     AgeVerification(VerifyBlurSupport),
     ModernBlur,
     StaleTweetLimits,
+    CommunityViewerRemovedLimits,
     GoreBlurIgnoresSettings,
     FosnrRules,
     FosnrFallbackDrops,
@@ -33,6 +34,9 @@ impl ClientSwitch {
             }
             Self::ModernBlur => "media_visibility_treatments_blurred_media_interstitial_enabled",
             Self::StaleTweetLimits => "stale_tweet_limited_actions_rules_enabled",
+            Self::CommunityViewerRemovedLimits => {
+                "community_tweet_viewer_removed_limited_actions_rules_enabled"
+            }
             Self::GoreBlurIgnoresSettings => {
                 "media_visibility_treatments_blurred_media_interstitial_ignore_settings_enabled"
             }
@@ -98,6 +102,7 @@ impl ClientSwitches {
             verify_blur_support: verify_blur_support(on),
             modern_blur: on(ClientSwitch::ModernBlur),
             stale_tweet_limits: on(ClientSwitch::StaleTweetLimits),
+            community_viewer_removed_limits: on(ClientSwitch::CommunityViewerRemovedLimits),
             gore_blur_ignores_settings: on(ClientSwitch::GoreBlurIgnoresSettings),
             fosnr_rules: on(ClientSwitch::FosnrRules),
             fosnr_fallback_drops: on(ClientSwitch::FosnrFallbackDrops),
@@ -224,16 +229,20 @@ mod tests {
                 verify_blur_support: Some(VerifyBlurSupport::Supported),
                 modern_blur: true,
                 stale_tweet_limits: true,
+                community_viewer_removed_limits: false,
                 gore_blur_ignores_settings: false,
                 fosnr_rules: true,
                 fosnr_fallback_drops: false,
             }
         );
-        let ios = CLIENT_CLASSES
-            .iter()
-            .find(|class| class.name == "ios_current")
-            .unwrap()
-            .app_id;
+        let app_id = |name: &str| {
+            CLIENT_CLASSES
+                .iter()
+                .find(|class| class.name == name)
+                .unwrap()
+                .app_id
+        };
+        let ios = app_id("ios_current");
         for (version, stale_tweet_limits) in [("9.19.9", false), ("9.20.0", true)] {
             let client = context(ios, &format!("Twitter-iPhone/{version} iOS/17.0"));
             assert_eq!(
@@ -244,6 +253,32 @@ mod tests {
                 "{version}"
             );
         }
+        let android = app_id("android_current");
+        for (user_agent, community_viewer_removed_limits) in [
+            ("Twitter-iPhone/10.15.9 iOS/17.0", false),
+            ("Twitter-iPhone/10.16.0 iOS/17.0", true),
+            ("TwitterAndroid/10.15.9-release.00 (310159000-r-0)", false),
+            ("TwitterAndroid/10.16.0-release.00 (310160000-r-0)", true),
+        ] {
+            let app_id = if user_agent.starts_with("TwitterAndroid") {
+                android
+            } else {
+                ios
+            };
+            assert_eq!(
+                switches
+                    .resolve(Some(&context(app_id, user_agent)), Some(1), None)
+                    .community_viewer_removed_limits,
+                community_viewer_removed_limits,
+                "{user_agent}"
+            );
+        }
+        let web = &CLIENT_CLASSES[0];
+        assert!(
+            !switches
+                .resolve(Some(&context(web.app_id, web.user_agent)), None, None)
+                .community_viewer_removed_limits
+        );
         assert_eq!(
             switches.resolve(None, Some(TEST_USER_ID), None),
             ClientCapability::default()

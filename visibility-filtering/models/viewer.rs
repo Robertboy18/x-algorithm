@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Viewer {
     LoggedIn {
@@ -48,7 +50,9 @@ impl ViewerProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::VariantArray)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::VariantArray,
+)]
 pub enum VerifyBlurSupport {
     #[default]
     Unsupported,
@@ -57,11 +61,12 @@ pub enum VerifyBlurSupport {
     Supported,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientCapability {
     pub verify_blur_support: Option<VerifyBlurSupport>,
     pub modern_blur: bool,
     pub stale_tweet_limits: bool,
+    pub community_viewer_removed_limits: bool,
     pub gore_blur_ignores_settings: bool,
     pub fosnr_rules: bool,
     pub fosnr_fallback_drops: bool,
@@ -73,6 +78,7 @@ impl Default for ClientCapability {
             verify_blur_support: Some(VerifyBlurSupport::default()),
             modern_blur: false,
             stale_tweet_limits: true,
+            community_viewer_removed_limits: false,
             gore_blur_ignores_settings: false,
             fosnr_rules: true,
             fosnr_fallback_drops: false,

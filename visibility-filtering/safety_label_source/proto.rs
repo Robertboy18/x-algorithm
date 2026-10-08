@@ -4,6 +4,10 @@ use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelSource};
 
 pub(crate) fn label_to_proto(label: SafetyLabel) -> vf_pb::SafetyLabel {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "SafetyLabelSource is a generated Thrift union; vf_pb::SafetyLabel carries only the BotMaker, tool and Grok annotation sources, so it omits every other source, including any the IDL adds"
+    )]
     let safety_label_source = label.safety_label_source.and_then(|src| match src {
         SafetyLabelSource::BotMakerAction(a) => {
             Some(vf_pb::safety_label::SafetyLabelSource::BotmakerAction(

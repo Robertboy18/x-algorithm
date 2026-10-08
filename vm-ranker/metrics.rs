@@ -124,7 +124,7 @@ lazy_static! {
             "Average pairwise cosine similarity before/after DPP (lower = more diverse)"
         )
         .buckets(vec![-1.0, -0.5, -0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.7, 1.0]),
-        &["stage"]  
+        &["stage"]
     )
     .unwrap();
                     pub static ref DPP_TERMINAL_CV: HistogramVec = register_histogram_vec!(
@@ -135,7 +135,7 @@ lazy_static! {
         .buckets(vec![
             1e-12, 1e-10, 1e-8, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.05, 0.1, 0.5, 1.0, 2.0,
         ]),
-        &["reason"]  
+        &["reason"]
     )
     .unwrap();
                 pub static ref DPP_POOL_SIZE: HistogramVec = register_histogram_vec!(
@@ -205,6 +205,39 @@ lazy_static! {
             "Rank requests by whether ranking parameters were resolved from the viewer context"
         ),
         &["outcome"]
+    )
+    .unwrap();
+    pub static ref AUTHOR_EXPLORATION_CANDIDATES: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_author_exploration_candidates_total",
+            "Value-model candidates by whether their author has a non-zero exploration bonus"
+        ),
+        &["bonus"]
+    )
+    .unwrap();
+    pub static ref SAMPLED_CANDIDATES: IntCounter = register_int_counter!(
+        "vm_ranker_sampled_candidates_total",
+        "Candidates with Phoenix heads in sampled value-model requests"
+    )
+    .unwrap();
+    pub static ref HEAD_PREDICTION_SUM: CounterVec = register_counter_vec!(
+        Opts::new(
+            "vm_ranker_head_prediction_sum",
+            "Sum of Phoenix head predictions over sampled candidates"
+        ),
+        &["head"]
+    )
+    .unwrap();
+    pub static ref CANDIDATE_SCORE: HistogramVec = register_histogram_vec!(
+        HistogramOpts::new(
+            "vm_ranker_candidate_score",
+            "Per-candidate value-model scores in sampled requests: weighted (offset base) and ranked (after cold start, author diversity and OON, before DPP)"
+        )
+        .buckets(vec![
+            0.0, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2,
+            0.3, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0,
+        ]),
+        &["stage"]
     )
     .unwrap();
 }

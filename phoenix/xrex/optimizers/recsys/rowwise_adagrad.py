@@ -97,23 +97,26 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
         if self._lazy_decay and (state.step is None or state.last_step is None):
             raise ValueError("fused lazy decay needs timestamped state (step/last_step)")
 
-        if 32 % context.shard_width != 0:
+        from xrex.utils import recsys_async_emb
+
+        async_emb = recsys_async_emb.kernel_bindings(context)
+        row_sharded = recsys_async_emb.is_row_sharded(context)
+        if not row_sharded and 32 % context.shard_width != 0:
             raise ValueError(
                 f"the fused rowwise Adagrad update needs a row shard that divides a warp, "
                 f"got shard_width={context.shard_width} (emb_width={context.emb_width})"
             )
 
-        from xrex.cuda.async_emb import async_emb
-
         metrics: dict[str, jax.Array] = {}
 
-        table_spec = P(None, context.table_axis)
+        table_spec = recsys_async_emb.table_spec(context)
+        state_spec = P(context.table_axis) if row_sharded else P()
         if self._lazy_decay:
 
             @shard_map(
                 mesh=context.mesh,
-                in_specs=(table_spec, P(), P(), P(), P(context.data_axis, None)),
-                out_specs=(table_spec, P(), P(), P()),
+                in_specs=(table_spec, state_spec, state_spec, P(), P(context.data_axis, None)),
+                out_specs=(table_spec, state_spec, state_spec, P()),
                 check_vma=False,
             )
             def start_lazy(
@@ -152,8 +155,8 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
 
         @shard_map(
             mesh=context.mesh,
-            in_specs=(table_spec, P(), P(context.data_axis, None)),
-            out_specs=(table_spec, P(), P()),
+            in_specs=(table_spec, state_spec, P(context.data_axis, None)),
+            out_specs=(table_spec, state_spec, P()),
             check_vma=False,
         )
         def start(table: jax.Array, accum: jax.Array, gate: jax.Array) -> tuple[jax.Array, ...]:
@@ -182,7 +185,9 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
         state: RecsysRowwiseAdagradState,
         gate: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array, RecsysRowwiseAdagradState, jax.Array]:
-        from xrex.cuda.async_emb import async_emb
+        from xrex.utils import recsys_async_emb
+
+        async_emb = recsys_async_emb.kernel_bindings(context)
 
         @shard_map(
             mesh=context.mesh, in_specs=(P(),), out_specs=(P(), P(), P(), P()), check_vma=False
