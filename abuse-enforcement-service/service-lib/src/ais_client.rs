@@ -82,6 +82,39 @@ pub struct AisClient {
     seq: Arc<AtomicI32>,
     intake: MethodMeta,
     multi: MethodMeta,
+    #[cfg(test)]
+    recorder: Option<Arc<AisRecorder>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct AisRecorder {
+    pub calls: std::sync::Mutex<Vec<(String, Value)>>,
+}
+
+#[cfg(test)]
+impl AisRecorder {
+    pub(crate) fn take(&self) -> Vec<(String, Value)> {
+        std::mem::take(&mut *self.calls.lock().unwrap())
+    }
+
+    fn answer(&self, method: &str, request: Value) -> Value {
+        let n = request
+            .get("actions")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), request));
+        if n > 0 {
+            let ok: serde_json::Map<String, Value> =
+                (0..n).map(|i| (i.to_string(), json!({}))).collect();
+            json!({ "successesfulActions": ok, "failedActions": {} })
+        } else {
+            json!({ "outcome": { "success": { "actionId": "test" } } })
+        }
+    }
 }
 
 impl AisClient {
@@ -123,6 +156,8 @@ impl AisClient {
             seq: Arc::new(AtomicI32::new(0)),
             intake,
             multi,
+            #[cfg(test)]
+            recorder: None,
         })
     }
 
@@ -139,6 +174,15 @@ impl AisClient {
             seq: Arc::new(AtomicI32::new(0)),
             intake,
             multi,
+            recorder: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recording(recorder: Arc<AisRecorder>) -> Self {
+        Self {
+            recorder: Some(recorder),
+            ..Self::unconnected()
         }
     }
 
@@ -167,6 +211,10 @@ impl AisClient {
         request: Value,
         labels: AisMetricLabels<'_>,
     ) -> Result<Value> {
+        #[cfg(test)]
+        if let Some(recorder) = &self.recorder {
+            return Ok(recorder.answer(&meta.thrift_method_name, request));
+        }
         let start = Instant::now();
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
 

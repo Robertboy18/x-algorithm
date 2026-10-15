@@ -60,6 +60,8 @@ pub struct ScoredPostsQuery {
     #[serde(skip)]
     pub columnar_scoring_sequence: Option<bytes::Bytes>,
     #[serde(skip)]
+    pub immersive_columnar_scoring_sequence: Option<bytes::Bytes>,
+    #[serde(skip)]
     pub retrieval_sequence: Option<xai_recsys_proto::UserActionSequence>,
     #[serde(skip)]
     pub columnar_retrieval_sequence: Option<bytes::Bytes>,
@@ -183,6 +185,7 @@ impl ScoredPostsQuery {
             bloom_filter_entries: vec![],
             scoring_sequence: None,
             columnar_scoring_sequence: None,
+            immersive_columnar_scoring_sequence: None,
             retrieval_sequence: None,
             columnar_retrieval_sequence: None,
             user_features: UserFeatures {

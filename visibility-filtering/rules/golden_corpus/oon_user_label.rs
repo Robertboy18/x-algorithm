@@ -1,5 +1,5 @@
 use super::{Role, Row};
-use crate::models::{AuthorLabel, HydratedTweetCandidate};
+use crate::models::{AuthorLabel, PostCandidate};
 use crate::rules::fixtures::{allow, candidate, dropped};
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeRecommendations};
 use xai_visibility_filtering::models::FilteredReason;
@@ -250,6 +250,6 @@ pub(super) fn rows() -> Vec<Row> {
     ]
 }
 
-fn user_labeled(label: AuthorLabel) -> HydratedTweetCandidate {
+fn user_labeled(label: AuthorLabel) -> PostCandidate {
     candidate().with_author_user_label(label).build()
 }

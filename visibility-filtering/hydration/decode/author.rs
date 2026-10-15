@@ -1,6 +1,5 @@
 use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError, RawHydrationBatch};
 use crate::hydration::fallback_cache::{Column, FallbackCache};
-use crate::hydration::metrics::record_author_labels;
 use crate::models::{AuthorFeatures, AuthorLabel, AuthorLabelSet};
 use strum::VariantArray;
 use xai_core_entities::entities::{GizmoduckUserResult, UserResponseState};
@@ -53,14 +52,13 @@ impl Column for AuthorColumn {
 pub(crate) fn author_batch(
     users: RawHydrationBatch<GizmoduckUserResult>,
 ) -> RawHydrationBatch<DecodedAuthor> {
-    let mut label_counts = LabelCounts::default();
     let authors = users
         .into_hydrated()
         .into_iter()
         .map(|(author, user)| {
             let decoded = match user {
                 Hydrated::Found(result) | Hydrated::Partial(result) => {
-                    evaluable_author_features(result, &mut label_counts)
+                    evaluable_author_features(result)
                 }
                 Hydrated::NotFound => Hydrated::NotFound,
                 Hydrated::Failed(error) => Hydrated::Failed(error),
@@ -68,20 +66,10 @@ pub(crate) fn author_batch(
             (author, decoded)
         })
         .collect();
-    record_author_labels(label_counts.mapped, label_counts.unmapped);
     HydrationBatch::from_hydrated(authors)
 }
 
-#[derive(Default)]
-struct LabelCounts {
-    mapped: usize,
-    unmapped: usize,
-}
-
-fn evaluable_author_features(
-    result: GizmoduckUserResult,
-    counts: &mut LabelCounts,
-) -> Hydrated<DecodedAuthor> {
+fn evaluable_author_features(result: GizmoduckUserResult) -> Hydrated<DecodedAuthor> {
     match result.response_state {
         Some(UserResponseState::Failed | UserResponseState::Filtered) => {
             Hydrated::Failed(HydrationError::Error)
@@ -97,9 +85,7 @@ fn evaluable_author_features(
         {
             Hydrated::NotFound
         }
-        None | Some(UserResponseState::Partial) => {
-            Hydrated::Partial(author_features(result, counts))
-        }
+        None | Some(UserResponseState::Partial) => Hydrated::Partial(author_features(result)),
         Some(
             UserResponseState::Found
             | UserResponseState::DeactivatedUser
@@ -108,22 +94,18 @@ fn evaluable_author_features(
             | UserResponseState::ErasedUser
             | UserResponseState::UnsafeUser
             | UserResponseState::OffboardedUser,
-        ) => Hydrated::Found(author_features(result, counts)),
+        ) => Hydrated::Found(author_features(result)),
     }
 }
 
-fn author_features(user_result: GizmoduckUserResult, counts: &mut LabelCounts) -> DecodedAuthor {
+fn author_features(user_result: GizmoduckUserResult) -> DecodedAuthor {
     user_result
         .user
         .map(|user| {
             let mut user_labels = AuthorLabelSet::default();
             for label in &user.labels.labels {
-                match author_label(LabelValue(label.label_value)) {
-                    Some(modeled) => {
-                        user_labels.insert(modeled);
-                        counts.mapped += 1;
-                    }
-                    None => counts.unmapped += 1,
+                if let Some(modeled) = author_label(LabelValue(label.label_value)) {
+                    user_labels.insert(modeled);
                 }
             }
             let features = AuthorFeatures {
@@ -207,13 +189,10 @@ mod tests {
                 Hydrated::Failed(HydrationError::Error),
             ),
         ] {
-            let author = evaluable_author_features(
-                GizmoduckUserResult {
-                    response_state: state,
-                    ..suspended.clone()
-                },
-                &mut LabelCounts::default(),
-            );
+            let author = evaluable_author_features(GizmoduckUserResult {
+                response_state: state,
+                ..suspended.clone()
+            });
             assert_eq!(shape(&author), expected, "{state:?}");
             if let Some((features, _)) = author.value() {
                 assert!(features.is_suspended, "{state:?}");
@@ -228,13 +207,10 @@ mod tests {
             Some(UserResponseState::Found),
             Some(UserResponseState::Partial),
         ] {
-            let author = evaluable_author_features(
-                GizmoduckUserResult {
-                    response_state: state,
-                    user: None,
-                },
-                &mut LabelCounts::default(),
-            );
+            let author = evaluable_author_features(GizmoduckUserResult {
+                response_state: state,
+                user: None,
+            });
             assert_eq!(shape(&author), Hydrated::NotFound, "{state:?}");
         }
     }
@@ -291,25 +267,21 @@ mod tests {
             ),
             (LabelValue::DO_NOT_AMPLIFY, AuthorLabel::DoNotAmplify),
         ] {
-            let mut counts = LabelCounts::default();
-            let (_, labels) = author_features(user_with_labels(&[thrift.0]), &mut counts);
+            let (_, labels) = author_features(user_with_labels(&[thrift.0]));
             assert!(labels.has_label(variant), "{thrift:?}");
-            assert_eq!((counts.mapped, counts.unmapped), (1, 0), "{thrift:?}");
         }
 
         for unmodelled in [
             LabelValue::EGREGIOUS_NSFW,
             LabelValue::RECOMMENDATIONS_BLACKLIST,
         ] {
-            let mut counts = LabelCounts::default();
-            let (_, labels) = author_features(
-                user_with_labels(&[unmodelled.0, LabelValue::SPAM_HIGH_RECALL.0]),
-                &mut counts,
-            );
+            let (_, labels) = author_features(user_with_labels(&[
+                unmodelled.0,
+                LabelValue::SPAM_HIGH_RECALL.0,
+            ]));
             let mut expected = AuthorLabelSet::default();
             expected.insert(AuthorLabel::SpamHighRecall);
             assert_eq!(labels, expected, "{unmodelled:?}");
-            assert_eq!((counts.mapped, counts.unmapped), (1, 1), "{unmodelled:?}");
         }
     }
 }

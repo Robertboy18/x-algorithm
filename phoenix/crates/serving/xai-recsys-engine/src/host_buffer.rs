@@ -8,7 +8,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::mem_util::madvise_hugepage_internal;
+use crate::mem_util::{madvise_hugepage_internal, mbind_interleave_internal};
 
 pub const AVX_512_ALIGNMENT: usize = 64;
 
@@ -32,6 +32,10 @@ unsafe impl Sync for AlignedHostBuffer {}
 
 impl AlignedHostBuffer {
     pub fn allocate(nbytes: usize) -> io::Result<Self> {
+        Self::allocate_with(nbytes, false)
+    }
+
+    fn allocate_with(nbytes: usize, interleave: bool) -> io::Result<Self> {
         if nbytes == 0 {
             let layout = Layout::from_size_align(AVX_512_ALIGNMENT, AVX_512_ALIGNMENT)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -67,6 +71,9 @@ impl AlignedHostBuffer {
 
         if nbytes >= HUGEPAGE_MIN_BYTES {
             let _ = madvise_hugepage_internal(buf.as_mut_slice());
+            if interleave && let Err(e) = mbind_interleave_internal(buf.as_mut_slice()) {
+                log::warn!("host buffer ({nbytes} bytes): NUMA interleave failed: {e}");
+            }
         }
         fault_in_pages(buf.as_mut_slice(), DEFAULT_INIT_THREADS);
 
@@ -121,7 +128,7 @@ pub fn allocate_emb_table(
         .checked_mul(width)
         .and_then(|x| x.checked_mul(itemsize))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "emb_table size overflow"))?;
-    AlignedHostBuffer::allocate(nbytes)
+    AlignedHostBuffer::allocate_with(nbytes, true)
 }
 
 fn fault_in_pages(slice: &mut [u8], num_threads: usize) {

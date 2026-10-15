@@ -1,12 +1,12 @@
 use crate::filter::{FilterRequest, FilterTweets};
 use crate::hydration::request_context;
 use crate::hydration::sources::Id;
-use crate::models::{ClientCapability, RawCandidate, TweetId};
+use crate::models::ClientCapability;
+use crate::models::viewer::Client;
+use crate::result_label::Label;
 use crate::retweet;
-use crate::rules::SafetyLevel;
-use crate::rules::metrics::Rpc;
 use crate::staging::recording::Recording;
-use crate::staging::reference::tweetypie::{Client, Label, vf_label};
+use crate::staging::reference::tweetypie::vf_label;
 use crate::treatment;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -106,36 +106,18 @@ impl Fixtures {
 
 pub(crate) async fn evaluate(
     filter_tweets: &FilterTweets,
-    viewer_id: Option<u64>,
-    country_code: Option<String>,
-    client_capability: ClientCapability,
-    tweet_ids: &[u64],
+    request: FilterRequest,
 ) -> Vec<Evaluated> {
-    let candidates = tweet_ids
-        .iter()
-        .map(|&tweet_id| RawCandidate {
-            tweet_id: TweetId(tweet_id),
-            request_author_id: None,
-        })
-        .collect();
-    let request = FilterRequest {
-        viewer_id,
-        country_code,
-        client_capability,
-        safety_level: SafetyLevel::TimelineHomeHydration,
-        candidates,
-        rpc: Rpc::EvaluateTweets,
-    };
-    request_context(Instant::now(), None)
-        .scope(retweet::evaluate_merging_sources(filter_tweets, request))
-        .await
+    let level = request.safety_level;
+    let (_, outcomes) = request_context(Instant::now(), None)
+        .scope(retweet::hydrate_and_evaluate(filter_tweets, request))
+        .await;
+    outcomes
         .iter()
         .map(|outcome| Evaluated {
             tweet_id: outcome.tweet_id.0,
-            label: vf_label(outcome),
-            rule: treatment::decided_rows(outcome.evaluation.verdict())
-                .next()
-                .map(|(rule, _)| rule),
+            label: vf_label(outcome, level),
+            rule: treatment::decided_by(outcome.evaluation.verdict()),
         })
         .collect()
 }
@@ -144,9 +126,12 @@ pub(crate) async fn evaluate(
 mod tests {
     use super::*;
     use crate::params::{CountryList, CountryLists};
-    use crate::rules::RuleEngine;
+    use crate::result_label::Class;
+    use crate::rules::metrics::Rpc;
+    use crate::rules::{RuleEngine, SafetyLevel};
+    use crate::scenario::raw;
     use crate::staging::recording::Replay;
-    use crate::staging::reference::tweetypie::Class;
+    use crate::staging::reference::tweetypie::SAFETY_LEVEL;
     use serde::de::DeserializeOwned;
     use std::collections::BTreeMap;
     use std::io::Write;
@@ -295,9 +280,14 @@ mod tests {
         failures: Vec<String>,
                 decided: BTreeSet<&'static str>,
                 diverging: BTreeSet<&'static str>,
+                mismatched: BTreeSet<(String, u64)>,
     }
 
     async fn replay_cases(dir: &Path) -> Replayed {
+        replay_stored(dir, stored(dir)).await
+    }
+
+    async fn replay_stored(dir: &Path, cases: Vec<Stored>) -> Replayed {
         let divergences: Vec<KnownDivergence> = read(&dir.join("known_divergences.json"));
         let shared: Recording = read(&dir.join("shared.json"));
         let shared_lists: BTreeMap<CountryList, Vec<String>> =
@@ -305,11 +295,12 @@ mod tests {
         let mut failures = Vec::new();
         let mut decided = BTreeSet::new();
         let mut diverging = BTreeSet::new();
+        let mut mismatched = BTreeSet::new();
         let mut replayed = Vec::new();
         for Stored {
             case,
             country_lists,
-        } in stored(dir)
+        } in cases
         {
             replayed.extend(case.tweets.iter().map(|t| (case.id.clone(), t.tweet_id)));
             let recording = case.recording.with_shared(&shared);
@@ -326,16 +317,17 @@ mod tests {
             let filter_tweets = FilterTweets::new(
                 Arc::<Replay>::clone(&sources),
                 RuleEngine::with_country_lists(Arc::new(country_lists)),
+                Arc::default(),
             );
-            let tweet_ids: Vec<u64> = case.tweets.iter().map(|t| t.tweet_id).collect();
-            let evaluated = evaluate(
-                &filter_tweets,
-                case.viewer_id,
-                case.country_code,
-                case.client_capability,
-                &tweet_ids,
-            )
-            .await;
+            let request = FilterRequest {
+                viewer_id: case.viewer_id,
+                country_code: case.country_code,
+                client_capability: case.client_capability,
+                safety_level: SAFETY_LEVEL,
+                candidates: case.tweets.iter().map(|t| raw(t.tweet_id, None)).collect(),
+                rpc: Rpc::EvaluateTweets,
+            };
+            let evaluated = evaluate(&filter_tweets, request).await;
             let misses = sources.misses();
             if !misses.is_empty() {
                 failures.push(format!(
@@ -360,16 +352,19 @@ mod tests {
                         "{key}: vf {:?} by {:?}, its known divergence pins {:?} ({})",
                         vf.label, vf.rule, known.vf, known.reason
                     )),
-                    (false, None) => failures.push(format!(
-                        "{key} [{}; {}]: vf {:?} by {:?}, tweetypie {:?} (vf at capture {:?} by {:?})",
-                        case.tags.join(","),
-                        expected.tags.join(","),
-                        vf.label,
-                        vf.rule,
-                        expected.tweetypie,
-                        expected.vf,
-                        expected.vf_rule,
-                    )),
+                    (false, None) => {
+                        failures.push(format!(
+                            "{key} [{}; {}]: vf {:?} by {:?}, tweetypie {:?} (vf at capture {:?} by {:?})",
+                            case.tags.join(","),
+                            expected.tags.join(","),
+                            vf.label,
+                            vf.rule,
+                            expected.tweetypie,
+                            expected.vf,
+                            expected.vf_rule,
+                        ));
+                        mismatched.insert((case.id.clone(), expected.tweet_id));
+                    }
                     (true, Some(known)) => failures.push(format!(
                         "{key}: now matches tweetypie; remove its known divergence ({})",
                         known.reason
@@ -392,6 +387,7 @@ mod tests {
             failures,
             decided,
             diverging,
+            mismatched,
         }
     }
 
@@ -424,6 +420,38 @@ mod tests {
             replayed.failures.is_empty(),
             "\n{}",
             replayed.failures.join("\n")
+        );
+    }
+
+            const UNMATCHABLE: (&str, &str) = ("unmatchable", "no_rule_renders_this");
+
+    #[tokio::test]
+    async fn every_replayed_pair_reaches_the_comparison() {
+        let dir = corpus_dir();
+        let divergences: Vec<KnownDivergence> = read(&dir.join("known_divergences.json"));
+        let mut cases = stored(&dir);
+        let mut unpinned = BTreeSet::new();
+        for stored in &mut cases {
+            for tweet in &mut stored.case.tweets {
+                tweet.tweetypie = (UNMATCHABLE.0.to_owned(), UNMATCHABLE.1.to_owned());
+                let pinned = divergences
+                    .iter()
+                    .any(|d| d.case == stored.case.id && d.tweet_id == tweet.tweet_id);
+                if !pinned {
+                    unpinned.insert((stored.case.id.clone(), tweet.tweet_id));
+                }
+            }
+        }
+
+        let mismatched = replay_stored(&dir, cases).await.mismatched;
+
+        let unreached: Vec<&(String, u64)> = unpinned.difference(&mismatched).collect();
+        assert!(
+            unreached.is_empty(),
+            "{} of {} unpinned pairs went unreported against a label no rule renders, first {:?}",
+            unreached.len(),
+            unpinned.len(),
+            &unreached[..unreached.len().min(5)]
         );
     }
 
@@ -523,7 +551,7 @@ mod tests {
         assert!(strangers.is_empty(), "not in fixtures.json: {strangers:?}");
     }
 
-            const NEVER_ALLOWED: [(&str, &str); 11] = [
+            const NEVER_ALLOWED: [(&str, &str); 12] = [
         (
             "author:deactivated_author",
             "Tweetypie drops a deactivated author's post for every viewer, the author included",
@@ -547,6 +575,10 @@ mod tests {
         (
             "label_gore_and_violence_high_precision",
             "every client gets a media treatment, a tombstone or an interstitial",
+        ),
+        (
+            "label_gore_and_violence_high_precision_image",
+            "as label_gore_and_violence_high_precision, and underage, logged-out and unstated-age NSFW-country viewers drop it",
         ),
         (
             "offboarded_author_text",

@@ -20,7 +20,7 @@ from xrex.data.recsys.feature_config import (
     UserCategoricalFeature,
     UserFloatFeature,
 )
-from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
+from xrex.data.recsys.recsys_batch import PostSeq, RecsysFeaturesBatch
 from xrex.models.layers import get_parameter
 from xrex.models.loss_recsys import cread_log_thresholds
 from xrex.models.recsys_embedding import HashKeys, RecsysEmbeddings
@@ -1138,6 +1138,8 @@ def build_feature_prep_streams(
     output_vocab_size: int = 64,
     is_training: bool = True,
     include_candidates: bool = True,
+    candidate_token_to_slot: jax.typing.ArrayLike | None = None,
+    candidate_slot_to_token: jax.typing.ArrayLike | None = None,
 ) -> FeaturePrepStreams:
     user_tokens: jax.Array | None = None
     user_mask: jax.Array | None = None
@@ -1175,23 +1177,37 @@ def build_feature_prep_streams(
     candidate_tokens: jax.Array | None = None
     candidate_mask: jax.Array | None = None
     if include_candidates:
+        candidate_seq = batch["candidate_seq"]
+        candidate_post = recsys_embeddings.candidate_post_embeddings
+        candidate_author = recsys_embeddings.candidate_author_embeddings
+        if candidate_token_to_slot is not None:
+            assert candidate_slot_to_token is not None
+            token_slots = _cast_jax(candidate_token_to_slot)
+            slot_tokens = _cast_jax(candidate_slot_to_token)
+            candidate_seq = _gather_slots(candidate_seq, token_slots, slot_tokens.shape[1])
+            if candidate_post is not None:
+                candidate_post = _gather_slot_embeddings(candidate_post, token_slots, slot_tokens)
+            candidate_author = _gather_slot_embeddings(candidate_author, token_slots, slot_tokens)
         candidate_tokens, candidate_mask = _build_seq_tokens(
-            recsys_embeddings.candidate_post_embeddings,
-            recsys_embeddings.candidate_author_embeddings,
-            _cast_jax(batch["candidate_seq"]["post_hashes"]),
+            candidate_post,
+            candidate_author,
+            _cast_jax(candidate_seq["post_hashes"]),
             config,
             hash_keys,
             prefix="cand",
         )
         candidate_tokens = _add_context_features(
             candidate_tokens,
-            batch["candidate_seq"],
+            candidate_seq,
             config,
             prefix="cand",
             is_training=is_training,
         )
-        candidate_tokens = _add_sid_features(candidate_tokens, batch["candidate_seq"], config)
-        candidate_tokens = _add_candidate_features(candidate_tokens, batch, config)
+        candidate_tokens = _add_sid_features(candidate_tokens, candidate_seq, config)
+        candidate_batch = typing.cast(
+            RecsysFeaturesBatch, {**batch, "candidate_seq": candidate_seq}
+        )
+        candidate_tokens = _add_candidate_features(candidate_tokens, candidate_batch, config)
         candidate_tokens = candidate_tokens * input_scale
 
     user_tokens = user_tokens * input_scale
@@ -1219,6 +1235,43 @@ def _assemble_unpacked(streams: FeaturePrepStreams) -> tuple[jax.Array, jax.Arra
     return tokens, padding_mask, candidate_start_offset
 
 
+def _gather_slots(seq: PostSeq, token_slots: jax.Array, num_slots: int) -> PostSeq:
+    def gather(v):
+        if v is None or v.ndim < 2 or v.shape[1] != num_slots:
+            return v
+        v = _cast_jax(v)
+        index = token_slots.reshape(token_slots.shape + (1,) * (v.ndim - 2))
+        return jnp.take_along_axis(v, index, 1, mode="fill", fill_value=0)
+
+    return typing.cast(PostSeq, {k: gather(v) for k, v in seq.items()})
+
+
+def _gather_slot_embeddings(
+    emb: jax.Array, token_slots: jax.Array, slot_tokens: jax.Array
+) -> jax.Array:
+    num_devices, _, width = emb.shape
+    per_slot = emb.reshape(num_devices, slot_tokens.shape[1], -1)
+    return _gather_rows(per_slot, token_slots, slot_tokens).reshape(num_devices, -1, width)
+
+
+@jax.custom_vjp
+def _gather_rows(sources: jax.Array, rows: jax.Array, inverse: jax.Array) -> jax.Array:
+    return jnp.take_along_axis(sources, rows[:, :, None], axis=1, mode="fill", fill_value=0)
+
+
+def _gather_rows_fwd(sources, rows, inverse):
+    return _gather_rows(sources, rows, inverse), inverse
+
+
+def _gather_rows_bwd(inverse, d_out):
+    batch = jnp.arange(d_out.shape[0])[:, None]
+    d_sources = d_out.at[batch, inverse].get(mode="fill", fill_value=0)
+    return d_sources, None, None
+
+
+_gather_rows.defvjp(_gather_rows_fwd, _gather_rows_bwd)
+
+
 def _assemble_packed(
     streams: FeaturePrepStreams,
     layout: Any,
@@ -1228,6 +1281,21 @@ def _assemble_packed(
 ) -> tuple[jax.Array, jax.Array, None]:
     D = config.emb_size
     padding_mask = _cast_jax(layout.padding_mask)
+    if layout.token_to_source is not None:
+        assert streams.candidate_tokens is not None
+        sources = jnp.concatenate(
+            [
+                streams.user_tokens.reshape(num_devices, -1, D),
+                jnp.where(streams.history_mask[:, :, None], streams.history_tokens, 0),
+                streams.candidate_tokens,
+                jnp.zeros((num_devices, 1, D), streams.user_tokens.dtype),
+            ],
+            axis=1,
+        )
+        tokens = _gather_rows(
+            sources, _cast_jax(layout.token_to_source), _cast_jax(layout.source_to_token)
+        )
+        return tokens, padding_mask, None
     seq_starts = _cast_jax(layout.cu_seqlens[:, :-1])
     device_idx = jnp.arange(num_devices, dtype=jnp.int32)[:, None]
 
@@ -1286,5 +1354,7 @@ def build_feature_prep_inputs(
         output_vocab_size,
         is_training=is_training,
         include_candidates=include_candidates,
+        candidate_token_to_slot=layout.candidate_token_to_slot,
+        candidate_slot_to_token=layout.candidate_slot_to_token,
     )
     return _assemble_packed(streams, layout, num_devices, bs_per_device, config)

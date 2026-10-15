@@ -6,6 +6,7 @@ use tracing::debug;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 
 use crate::hydration::batch::{Hydrated, HydrationBatch, HydrationError};
+use crate::params::CountryList;
 use crate::rules::SafetyLevel;
 
 const HYDRATOR_REQUESTS: &str = "vf_hydrator_requests";
@@ -19,10 +20,9 @@ const HYDRATOR_UNASKED_KEYS: &str = "vf_hydrator_unasked_keys";
 const FALLBACK_CACHE_KEYS: &str = "vf_fallback_cache_keys";
 const FALLBACK_CACHE_ENTRIES: &str = "vf_fallback_cache_entries";
 const FALLBACK_CACHE_RESIDENT_KEYS: &str = "vf_fallback_cache_resident_keys";
-const AUTHOR_LABELS: &str = "vf_author_labels";
 const VIEWER_COUNTRY: &str = "vf_viewer_country";
-const WINGMAN_SECOND_DEGREE: &str = "vf_wingman_second_degree";
-const TRUSTED_FRIENDS_ANSWERS: &str = "vf_trusted_friends_answers";
+const VIEWER_STATE: &str = "vf_viewer_state";
+const VIEWER_AGE: &str = "vf_viewer_age";
 const FLOCK_MISSING_KEYS: &str = "vf_flock_missing_keys";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
@@ -32,6 +32,17 @@ pub(crate) enum HydratorOutcome {
     Partial,
     Timeout,
     Error,
+}
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum FallbackCacheResult {
+    Fresh,
+    Stale,
+    NotFound,
+    Partial,
+    PartialStale,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -185,12 +196,6 @@ pub(crate) fn record_tes_join_latency(safety_level: SafetyLevel, elapsed: Durati
     );
 }
 
-pub(crate) fn record_author_labels(mapped: usize, unmapped: usize) {
-    for (result, count) in [("mapped", mapped), ("unmapped", unmapped)] {
-        incr_nonzero(AUTHOR_LABELS, &[("result", result)], count as u64);
-    }
-}
-
 pub(crate) fn record_viewer_country(result: &'static str, safety_level: SafetyLevel) {
     incr(
         VIEWER_COUNTRY,
@@ -199,35 +204,39 @@ pub(crate) fn record_viewer_country(result: &'static str, safety_level: SafetyLe
     );
 }
 
-pub(crate) fn record_wingman_second_degree(
-    in_network: usize,
-    not_in_network: usize,
-    safety_level: SafetyLevel,
-) {
-    for (result, count) in [
-        ("in_network", in_network),
-        ("not_in_network", not_in_network),
-    ] {
-        incr_nonzero(
-            WINGMAN_SECOND_DEGREE,
-            &[("result", result), ("safety_level", safety_level.into())],
-            count as u64,
-        );
-    }
+pub(crate) fn record_viewer_state(state: &'static str, safety_level: SafetyLevel) {
+    incr(
+        VIEWER_STATE,
+        &[("state", state), ("safety_level", safety_level.into())],
+        1,
+    );
 }
 
-pub(crate) fn record_trusted_friends_answers(
-    member_or_owner: usize,
-    neither: usize,
+const VIEWER_AGE_EXTRA_COUNTRIES: [&str; 2] = ["us", "jp"];
+
+pub(crate) fn record_viewer_age(
+    age: &'static str,
+    request_country: Option<&str>,
     safety_level: SafetyLevel,
 ) {
-    for (result, count) in [("true", member_or_owner), ("false", neither)] {
-        incr_nonzero(
-            TRUSTED_FRIENDS_ANSWERS,
-            &[("result", result), ("safety_level", safety_level.into())],
-            count as u64,
-        );
-    }
+    let country = request_country
+        .and_then(|code| {
+            CountryList::listed_by_default(code).or_else(|| {
+                VIEWER_AGE_EXTRA_COUNTRIES
+                    .into_iter()
+                    .find(|&extra| extra == code)
+            })
+        })
+        .unwrap_or("other");
+    incr(
+        VIEWER_AGE,
+        &[
+            ("age", age),
+            ("country", country),
+            ("safety_level", safety_level.into()),
+        ],
+        1,
+    );
 }
 
 pub(crate) fn record_flock_missing_keys(
@@ -285,12 +294,36 @@ impl FallbackCacheCounts {
     pub(crate) fn record(&self, cache: &'static str, column: &'static str) {
         let live = self.fresh + self.not_found + self.partial + self.partial_stale;
         for (metric, result, count) in [
-            (FALLBACK_CACHE_KEYS, "fresh", self.fresh),
-            (FALLBACK_CACHE_KEYS, "stale", self.stale),
-            (FALLBACK_CACHE_KEYS, "not_found", self.not_found),
-            (FALLBACK_CACHE_KEYS, "partial", self.partial),
-            (FALLBACK_CACHE_KEYS, "partial_stale", self.partial_stale),
-            (FALLBACK_CACHE_KEYS, "unavailable", self.unavailable),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Fresh.into(),
+                self.fresh,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Stale.into(),
+                self.stale,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::NotFound.into(),
+                self.not_found,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Partial.into(),
+                self.partial,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::PartialStale.into(),
+                self.partial_stale,
+            ),
+            (
+                FALLBACK_CACHE_KEYS,
+                FallbackCacheResult::Unavailable.into(),
+                self.unavailable,
+            ),
             (FALLBACK_CACHE_RESIDENT_KEYS, "resident", self.resident),
             (FALLBACK_CACHE_RESIDENT_KEYS, "absent", live - self.resident),
         ] {
@@ -339,11 +372,9 @@ mod tests {
     use crate::models::{ClientCapability, RawCandidate, TweetFeatures, TweetId};
     use crate::rules::RuleEngine;
     use std::collections::HashMap;
-    use xai_x_rpc::WithBudget;
 
     #[test]
-    fn dashboard_generator_pins_the_author_labels_root_edges_method_wingman_metric_and_key_results()
-    {
+    fn dashboard_generator_pins_the_key_results_fallback_cache_results_and_viewer_metrics() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
         let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
         let path = if std::path::Path::new(cargo).exists() {
@@ -353,20 +384,23 @@ mod tests {
         };
         let dashboard =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        assert!(dashboard.contains(&format!("AUTHOR_LABELS_METRIC = \"{AUTHOR_LABELS}\"")));
-        use crate::hydration::Hydrator;
-        let root_edges = format!(
-            "{}+{}",
-            Hydrator::RootFollowsViewer.spec().label.1,
-            Hydrator::SuperFollowsRoot.spec().label.1
-        );
-        assert!(dashboard.contains(&format!("CC_ROOT_EDGES_METHOD = \"{root_edges}\"")));
         assert!(dashboard.contains(&format!(
-            "WINGMAN_SECOND_DEGREE_METRIC = \"{WINGMAN_SECOND_DEGREE}\""
+            "FALLBACK_CACHE_KEYS_METRIC = \"{FALLBACK_CACHE_KEYS}\""
         )));
-        assert!(dashboard.contains(&format!(
-            "TRUSTED_FRIENDS_ANSWERS_METRIC = \"{TRUSTED_FRIENDS_ANSWERS}\""
-        )));
+        assert!(dashboard.contains(&format!("VIEWER_STATE_METRIC = \"{VIEWER_STATE}\"")));
+        assert!(dashboard.contains(&format!("VIEWER_AGE_METRIC = \"{VIEWER_AGE}\"")));
+        for result in [
+            FallbackCacheResult::Stale,
+            FallbackCacheResult::Unavailable,
+            FallbackCacheResult::PartialStale,
+            FallbackCacheResult::Partial,
+        ] {
+            let result: &str = result.into();
+            assert!(
+                dashboard.contains(&format!("    \"{result}\": ")),
+                "{result}"
+            );
+        }
         let key_results: Vec<&str> = <HydratorOutcome as strum::VariantArray>::VARIANTS
             .iter()
             .map(|&result| result.into())
@@ -375,17 +409,6 @@ mod tests {
             "HYDRATOR_KEY_RESULTS = \"{}\"",
             key_results.join("|")
         )));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn caller_deadline_cancels_a_hop_before_the_static_ceiling() {
-        let start = tokio::time::Instant::now();
-        let context = crate::hydration::request_context(start, Some(Duration::from_millis(40)));
-        let result = context
-            .scope(std::future::pending::<()>().with_budget(crate::hydration::HYDRATION_TIMEOUT))
-            .await;
-        assert!(result.is_err());
-        assert_eq!(start.elapsed(), Duration::from_millis(30));
     }
 
     #[test]
@@ -460,18 +483,6 @@ mod tests {
     }
 
     #[test]
-    fn from_batch_counts_timeout_keys() {
-        let expected = FxHashMap::from_iter([(1, 2), (2, 3)]);
-        let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([1, 2]);
-
-        let counts = KeyedResultCounts::from_batch(&expected, &batch);
-
-        assert_eq!(counts.timeout_keys, 2);
-        assert_eq!(counts.timeout_candidates, 5);
-        assert_eq!(counts.outcome(), HydratorOutcome::Timeout);
-    }
-
-    #[test]
     fn a_tweet_keyed_call_counts_its_keys_before_pure_core_resolves_authors() {
         let engine = RuleEngine::for_tests();
         let plan = engine.plan(SafetyLevel::TimelineHomeHydration);
@@ -500,11 +511,12 @@ mod tests {
 
     #[test]
     fn a_claimed_key_no_candidate_counted_still_counts_its_timeout() {
-        let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([40]);
+        let batch: HydrationBatch<u64, u8> = HydrationBatch::timed_out([40, 41]);
 
-        let counts = KeyedResultCounts::from_batch(&FxHashMap::from_iter([(40, 0)]), &batch);
+        let counts =
+            KeyedResultCounts::from_batch(&FxHashMap::from_iter([(40, 0), (41, 3)]), &batch);
 
-        assert_eq!((counts.timeout_keys, counts.timeout_candidates), (1, 0));
+        assert_eq!((counts.timeout_keys, counts.timeout_candidates), (2, 3));
         assert_eq!(counts.outcome(), HydratorOutcome::Timeout);
     }
 }

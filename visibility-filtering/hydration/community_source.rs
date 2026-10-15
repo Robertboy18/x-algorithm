@@ -1,3 +1,4 @@
+use crate::clients::read_fields;
 use crate::models::CommunityModeration;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -243,24 +244,6 @@ impl TSerializable for IsRemoved {
     }
 }
 
-fn read_fields(
-    proto: &mut dyn TInputProtocol,
-    mut read_field: impl FnMut(&mut dyn TInputProtocol, &TFieldIdentifier) -> thrift::Result<bool>,
-) -> thrift::Result<()> {
-    proto.read_struct_begin()?;
-    loop {
-        let field = proto.read_field_begin()?;
-        if field.field_type == TType::Stop {
-            break;
-        }
-        if !read_field(proto, &field)? {
-            proto.skip(field.field_type)?;
-        }
-        proto.read_field_end()?;
-    }
-    proto.read_struct_end()
-}
-
 fn is(field: &TFieldIdentifier, id: i16, field_type: TType) -> bool {
     field.id == Some(id) && field.field_type == field_type
 }
@@ -275,36 +258,23 @@ fn decode_only(name: &str) -> thrift::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clients::strato_answer::Thrift::{Bool, Struct, I32};
+    use crate::clients::strato_answer::{found, no_row, strato_error};
     use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
 
-    fn fetched(value: Option<&[u8]>) -> Option<Result<Bytes>> {
-        match value {
-            Some(value) => answered(&[&[0x0C, 0x69, 0x14][..], value, &[0x00]].concat()),
-            None => answered(&[0x01, 0x23, 0x58, 0x00]),
-        }
-    }
-
-    fn answered(option: &[u8]) -> Option<Result<Bytes>> {
-        let ok_value = [0x0C, 0x00, 0x04, 0x0C, 0x09, 0xFC, 0x0C, 0x00, 0x76];
-        Some(Ok(Bytes::from(
-            [&ok_value[..], option, &[0x00, 0x00, 0x00]].concat(),
-        )))
-    }
-
-    fn strato_error() -> Option<Result<Bytes>> {
-        let code = [0x08, 0xAD, 0xED, 0x00, 0x00, 0x00, 0x05, 0x00];
-        let err = [0x0C, 0x00, 0x04, 0x0C, 0x11, 0x45];
-        Some(Ok(Bytes::from([&err[..], &code, &[0x00, 0x00]].concat())))
+    fn answered(bytes: Vec<u8>) -> Option<Result<Bytes>> {
+        Some(Ok(Bytes::from(bytes)))
     }
 
     #[test]
     fn a_moderation_state_reads_its_union_arm_and_an_error_answer_fails() {
         let hidden = |arm: UnionArm| arm.0 == Some(HIDDEN);
+        let state = |arm| answered(found(Struct(vec![(arm, Struct(vec![]))])));
         let rows = [
-            (fetched(Some(&[0x0C, 0x00, 0x02, 0x00, 0x00])), Some(true)),
-            (fetched(Some(&[0x0C, 0x00, 0x01, 0x00, 0x00])), Some(false)),
-            (fetched(None), Some(false)),
-            (strato_error(), None),
+            (state(2), Some(true)),
+            (state(1), Some(false)),
+            (answered(no_row()), Some(false)),
+            (answered(strato_error(5, "denied")), None),
             (Some(Err(anyhow!("Strato error (code 5): denied"))), None),
             (Some(Ok(Bytes::from_static(&[0xFF]))), None),
             (None, None),
@@ -316,25 +286,21 @@ mod tests {
 
     #[test]
     fn the_moderator_flag_is_read_from_the_v1_arm() {
-        for (flag, expected) in [(0x01, true), (0x00, false)] {
-            let features = [
-                0x0C, 0x00, 0x01, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x04, flag,
-                0x00, 0x00,
-            ];
-            let is_moderator = read(fetched(Some(&features)), |features: ViewerIsModerator| {
-                features.0
-            });
-            assert_eq!(is_moderator.ok(), Some(expected));
+        for flag in [true, false] {
+            let v1 = Struct(vec![(1, I32(1)), (4, Bool(flag))]);
+            let features = answered(found(Struct(vec![(1, v1)])));
+            let is_moderator = read(features, |features: ViewerIsModerator| features.0);
+            assert_eq!(is_moderator.ok(), Some(flag));
         }
     }
 
     #[test]
     fn the_removal_flag_is_the_column_bool_and_no_row_is_not_removed() {
         for (reply, expected) in [
-            (answered(&[0x02, 0x69, 0x14, 0x01, 0x00]), Some(true)),
-            (answered(&[0x02, 0x69, 0x14, 0x00, 0x00]), Some(false)),
-            (fetched(None), Some(false)),
-            (strato_error(), None),
+            (answered(found(Bool(true))), Some(true)),
+            (answered(found(Bool(false))), Some(false)),
+            (answered(no_row()), Some(false)),
+            (answered(strato_error(5, "denied")), None),
         ] {
             let is_removed = read(reply, |removed: IsRemoved| removed.0);
             assert_eq!(is_removed.ok(), expected);

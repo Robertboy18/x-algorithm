@@ -34,6 +34,7 @@ http-body = { workspace = true }
 http-body-util = { workspace = true }
 lazy_static = { workspace = true }
 log = { workspace = true }
+moka = { workspace = true, features = ["future"] }
 md5 = { workspace = true }
 libc = { workspace = true }
 memmap2 = { workspace = true }
@@ -62,6 +63,7 @@ tonic-reflection = { workspace = true }
 xai-recsys = { workspace = true }
 xai-recsys-proto = { workspace = true }
 xai-recsys-server = { workspace = true }
+xai-recsys-sid-proto = { workspace = true }
 xai-recsys-mm-server = { workspace = true }
 xai-o2 = { workspace = true }
 

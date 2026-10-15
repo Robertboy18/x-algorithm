@@ -157,6 +157,7 @@ OPTIONAL_COLUMNS: list[str] = [
     "valueLabelValidSeq",
     "valueBaselineMeanUsdSeq",
     "conversionKeepBits",
+    "conversionEligibleTypesSeq",
     "conversionDelayMsSeq",
     "conversionDelayMsSeq_KEY",
     "conversionDelayMsSeq_PURCHASE",
@@ -172,6 +173,13 @@ OPTIONAL_COLUMNS: list[str] = [
     "lexicalTextSeq",
     "lexicalQuerySeq",
     "lexicalAuthorSeq",
+    "validPageRecord",
+    "servedSlotSeq",
+    "weightedScoreSeq",
+    "finalScoreSeq",
+    "rewardRerankSlotProbSeq",
+    "pageDecodeSlotProbSeq",
+    "servedTimeMsSeq",
 ]
 
 

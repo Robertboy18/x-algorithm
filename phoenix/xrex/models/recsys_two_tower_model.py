@@ -90,6 +90,36 @@ def _l2_normalize_candidates(embeddings: jax.Array) -> jax.Array:
     return embeddings / norm
 
 
+def score_over_slots(
+    score_slot: typing.Callable[..., jax.Array],
+    posts: jax.Array,
+    side: tuple[jax.Array, jax.Array] | None,
+    slot_weights: tuple[float, ...],
+    full_rows: bool = False,
+) -> jax.Array:
+    if len(slot_weights) == 1:
+        return score_slot(posts, side, 0, posts.shape[-1]) if full_rows else score_slot(posts, side)
+    num_slots = len(slot_weights)
+    width = posts.shape[-1] // num_slots
+    total = None
+    for s, w in enumerate(slot_weights):
+        if w == 0.0:
+            continue
+        slot_side = None
+        if side is not None:
+            norms, ibias = side
+            n, b = norms.shape[0] // num_slots, ibias.shape[0] // num_slots
+            slot_side = (norms[s * n : (s + 1) * n], ibias[s * b : (s + 1) * b])
+        if full_rows:
+            score = score_slot(posts, slot_side, s * width, width)
+        else:
+            score = score_slot(posts[:, s * width : (s + 1) * width], slot_side)
+        score = w * score.astype(jnp.float32)
+        total = score if total is None else total + score
+    assert total is not None, "every slot weight is zero"
+    return total.astype(jnp.bfloat16)
+
+
 class RecsysCandidateTower(hk.Module):
     config: RecsysCandidateModelConfig
     sharding_context: ShardingContext
@@ -275,7 +305,7 @@ class RecsysCandidateModelConfig(Config):
             use_project_then_sum=use_project_then_sum,
         )
 
-    def make_post_embeddings(self):
+    def make_post_embeddings(self, num_table_slots: int = 1):
         all_post_ids = jnp.arange(self.max_posts * 2).reshape(-1, 2).astype(jnp.int32)
         all_author_ids = jnp.arange(self.max_posts * 2).reshape(-1, 2).astype(jnp.int32)
         all_dataset_types = jnp.full(
@@ -285,13 +315,15 @@ class RecsysCandidateModelConfig(Config):
         if os.environ.get("DEBUG_ALLOW_RANDOM_INIT") == "1":
             emb_init = jax.random.uniform(
                 jax.random.PRNGKey(0),
-                (self.max_posts, self.emb_table_width),
+                (self.max_posts, self.emb_table_width * num_table_slots),
                 dtype=jnp.bfloat16,
                 minval=-scale,
                 maxval=scale,
             )
         else:
-            emb_init = jnp.empty((self.max_posts, self.emb_table_width), dtype=jnp.bfloat16)
+            emb_init = jnp.empty(
+                (self.max_posts, self.emb_table_width * num_table_slots), dtype=jnp.bfloat16
+            )
         post_embeddings = Parameter(
             x=emb_init,
             pspec=P(("stage", "expert", "replica", "data"), ("seq", "model")),
@@ -689,14 +721,18 @@ def _mol_side_tables_chunked(
     )
 
 
+def _quantize_rows(q: jax.Array) -> tuple[jax.Array, jax.Array]:
+    qf = q.astype(jnp.float32)
+    qs = jnp.maximum(jnp.max(jnp.abs(qf), axis=1) / 127.0, 1e-12)
+    return jnp.clip(jnp.round(qf / qs[:, None]), -127, 127).astype(jnp.int8), qs
+
+
 def _mol_transformed_query_dots(
     q_cb: jax.Array, posts: jax.Array, post_scales: jax.Array | None
 ) -> jax.Array:
     if post_scales is None:
         return jnp.matmul(q_cb.astype(posts.dtype), posts.T)
-    qf = q_cb.astype(jnp.float32)
-    qs = jnp.maximum(jnp.max(jnp.abs(qf), axis=1) / 127.0, 1e-12)
-    qq = jnp.clip(jnp.round(qf / qs[:, None]), -127, 127).astype(jnp.int8)
+    qq, qs = _quantize_rows(q_cb)
     acc = jax.lax.dot_general(qq, posts, (((1,), (1,)), ((), ())), preferred_element_type=jnp.int32)
     return (acc.astype(jnp.float32) * qs[:, None] * post_scales[None, :]).astype(jnp.bfloat16)
 
@@ -707,23 +743,50 @@ def mol_kernel_scores(
     posts: jax.Array,
     post_scales: jax.Array | None = None,
     side_tables: tuple[jax.Array, jax.Array] | None = None,
+    col_offset: int = 0,
+    width: int | None = None,
 ) -> jax.Array:
     from xrex.cuda import mol_epilogue
 
+    width = posts.shape[1] if width is None else width
+    strided = col_offset != 0 or width != posts.shape[1]
+    slot_posts = posts[:, col_offset : col_offset + width] if strided else posts
     if post_scales is None:
-        posts = posts.astype(jnp.bfloat16)
+        slot_posts = slot_posts.astype(jnp.bfloat16)
     if side_tables is None:
-        norms, ibias = _mol_side_tables_chunked(scorer, posts, post_scales)
+        norms, ibias = _mol_side_tables_chunked(scorer, slot_posts, post_scales)
     else:
         norms, ibias = side_tables
     B, K, D = users.shape
     q = scorer.transformed_queries(users)
     L = q.shape[2]
     kl = K * L
-    q_cb = jnp.transpose(q, (1, 2, 0, 3)).reshape(kl * B, D)
-    dots = _mol_transformed_query_dots(q_cb, posts, post_scales)
     ubias = scorer.user_gate_bias(users)
     ubias = jnp.zeros((B, kl), jnp.float32) if ubias is None else ubias.astype(jnp.float32)
+    if (
+        post_scales is not None
+        and mol_epilogue.fused_supported(kl, L, scorer.gate_w1.shape[1], B, D)
+        and (not strided or mol_epilogue.fused_col_offset_supported())
+    ):
+        qq, qs = _quantize_rows(q.reshape(B * kl, D))
+        pad = mol_epilogue.fused_query_rows(B * kl) - B * kl
+        return mol_epilogue.mol_fused_int8(
+            posts,
+            post_scales,
+            jnp.pad(qq, ((0, pad), (0, 0))),
+            jnp.pad(qs, (0, pad)),
+            norms,
+            jnp.transpose(ubias),
+            ibias,
+            scorer.gate_w1,
+            scorer.gate_b1,
+            scorer.gate_w2,
+            scorer.gate_b2,
+            num_users=B,
+            col_offset=col_offset,
+        )
+    q_cb = jnp.transpose(q, (1, 2, 0, 3)).reshape(kl * B, D)
+    dots = _mol_transformed_query_dots(q_cb, slot_posts, post_scales)
     return mol_epilogue.mol_epilogue(
         dots,
         norms,
@@ -1424,22 +1487,28 @@ class RecsysTwoTowerModel(hk.Module):
             token_parts.append(sid_embedding[..., None, :])
         return jnp.concatenate(token_parts, axis=-2)
 
-    def build_candidate_embeddings(
+    def candidate_token_stack(
         self,
         recsys_features_batch: RecsysFeaturesBatch,
         recsys_embeddings: RecsysEmbeddings,
-        head_index: int = 0,
     ) -> jax.Array:
         _config = self.config.user_tower_config
         assert _config.model_config.output_vocab_size is not None, "output_vocab_size is required"
         assert _config.use_post_embedding or _config.use_post_sid, (
             "At least one of use_post_embedding / use_post_sid must be True for the candidate tower"
         )
-
         post_embeddings, author_embeddings, sid_embedding = self._candidate_feature_tensors(
             recsys_features_batch, recsys_embeddings
         )
-        stacked = self._stack_candidate_tokens(post_embeddings, author_embeddings, sid_embedding)
+        return self._stack_candidate_tokens(post_embeddings, author_embeddings, sid_embedding)
+
+    def build_candidate_embeddings(
+        self,
+        recsys_features_batch: RecsysFeaturesBatch,
+        recsys_embeddings: RecsysEmbeddings,
+        head_index: int = 0,
+    ) -> jax.Array:
+        stacked = self.candidate_token_stack(recsys_features_batch, recsys_embeddings)
         return self.candidate_tower(stacked, head_index=head_index)
 
     def build_candidate_embeddings_from_lookups(
@@ -1610,9 +1679,10 @@ class RecsysTwoTowerModel(hk.Module):
                 )
 
         num_heads = self.config.candidate_tower_config.num_candidate_heads
+        stacked = self.candidate_token_stack(batch, recsys_embeddings)
         all_candidate_reprs: list[jax.Array] = []
         for h in range(num_heads):
-            cand_repr = self.build_candidate_embeddings(batch, recsys_embeddings, head_index=h)
+            cand_repr = self.candidate_tower(stacked, head_index=h)
             if self.config.use_seqpack:
                 per_user_C = cand_repr.shape[1] // batch["user_hashes"].shape[1]
                 cand_repr = cand_repr.reshape(-1, per_user_C, cand_repr.shape[-1])
@@ -1750,23 +1820,29 @@ class RecsysTwoTowerModel(hk.Module):
             else None,
         )
 
+    def _table_slots(self, post_table: jax.Array) -> list[jax.Array]:
+        return jnp.split(post_table, self.config.num_table_slots, axis=-1)
+
     def mol_side_table_rows(self, post_table: jax.Array) -> jax.Array:
         scorer = self._mol_scorer()
         assert scorer is not None
-        return scorer.side_table_rows(post_table)
+        slots = self._table_slots(post_table)
+        return jnp.concatenate([scorer.side_table_rows(s) for s in slots], axis=1)
 
     def mol_side_tables(self, post_table: jax.Array) -> tuple[jax.Array, jax.Array]:
         scorer = self._mol_scorer()
         assert scorer is not None
         mesh = self.sharding_context.mesh
         saxis = "expert"
-        return shard_map(
+        side_fn = shard_map(
             scorer.sharded_serving_side_tables,
             mesh=mesh,
             in_specs=(P(saxis),),
             out_specs=(P(None, saxis), P(None, saxis)),
             check_vma=False,
-        )(post_table)
+        )
+        norms, ibias = zip(*(side_fn(s) for s in self._table_slots(post_table)), strict=True)
+        return jnp.concatenate(norms, axis=0), jnp.concatenate(ibias, axis=0)
 
     @hk.transparent
     def forward(
@@ -1787,6 +1863,7 @@ class RecsysTwoTowerModel(hk.Module):
         post_scales: jax.Array | None = None,
         dataset_capacities: tuple[int, ...] | None = None,
         mol_side_tables: tuple[jax.Array, jax.Array] | None = None,
+        query_head_weights: tuple[float, float] | None = None,
         return_validity: bool = False,
     ) -> tuple[tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array], ...]:
         saxis = "expert"
@@ -1837,19 +1914,37 @@ class RecsysTwoTowerModel(hk.Module):
         def _side(norms, ibias):
             return (norms, ibias) if mol_side_tables is not None else None
 
+        slot_weights = (
+            (1.0,)
+            if self.config.ld_head is None
+            else (query_head_weights or self.config.query_head_weights)
+        )
+
+        def _over_slots(score_slot, posts: jax.Array, side, full_rows: bool = False) -> jax.Array:
+            return score_over_slots(score_slot, posts, side, slot_weights, full_rows)
+
         def _score_posts(
             user_embedding: jax.Array, posts: jax.Array, scorer, side=None
         ) -> jax.Array:
             if use_mol:
                 users = user_embedding if user_embedding.ndim == 3 else user_embedding[:, None, :]
                 if use_mol_kernel:
-                    return mol_kernel_scores(scorer, users, posts, side_tables=side).astype(
-                        jnp.bfloat16
+                    return _over_slots(
+                        lambda p, sd: mol_kernel_scores(scorer, users, p, side_tables=sd).astype(
+                            jnp.bfloat16
+                        ),
+                        posts,
+                        side,
                     )
-                return scorer.chunked_pair_scores(
-                    users, posts.astype(jnp.bfloat16), self.config.mol_eval_user_chunk
+                return _over_slots(
+                    lambda p, sd: scorer.chunked_pair_scores(
+                        users, p.astype(jnp.bfloat16), self.config.mol_eval_user_chunk
+                    ),
+                    posts,
+                    None,
                 )
-            return jnp.matmul(user_embedding.astype(jnp.bfloat16), posts.T)
+            users = user_embedding.astype(jnp.bfloat16)
+            return _over_slots(lambda p, _: jnp.matmul(users, p.T), posts, None)
 
         @shard_map(
             mesh=mesh,
@@ -1938,13 +2033,14 @@ class RecsysTwoTowerModel(hk.Module):
                     users = (
                         user_embedding if user_embedding.ndim == 3 else user_embedding[:, None, :]
                     )
-                    scores = mol_kernel_scores(
-                        scorer,
-                        users,
+                    scores = _over_slots(
+                        lambda p, sd, off, w: mol_kernel_scores(
+                            scorer, users, p, scales, sd, col_offset=off, width=w
+                        ).astype(jnp.bfloat16),
                         post_q8,
-                        post_scales=scales,
-                        side_tables=_side(norms, ibias),
-                    ).astype(jnp.bfloat16)
+                        _side(norms, ibias),
+                        full_rows=True,
+                    )
                     return jax.lax.all_to_all(
                         scores, axis_name=saxis, split_axis=0, concat_axis=1, tiled=True
                     )
@@ -1957,12 +2053,16 @@ class RecsysTwoTowerModel(hk.Module):
                 uf = user_embedding.astype(jnp.float32)
                 us = jnp.maximum(jnp.max(jnp.abs(uf), axis=1) / 127.0, 1e-12)
                 uq = jnp.clip(jnp.round(uf / us[:, None]), -127, 127).astype(jnp.int8)
-                acc = jax.lax.dot_general(
-                    uq, post_q8, (((1,), (1,)), ((), ())), preferred_element_type=jnp.int32
-                )
-                scores = (acc.astype(jnp.float32) * us[:, None] * scales[None, :]).astype(
-                    jnp.bfloat16
-                )
+
+                def _int8_dot(p, _):
+                    acc = jax.lax.dot_general(
+                        uq, p, (((1,), (1,)), ((), ())), preferred_element_type=jnp.int32
+                    )
+                    return (acc.astype(jnp.float32) * us[:, None] * scales[None, :]).astype(
+                        jnp.bfloat16
+                    )
+
+                scores = _over_slots(_int8_dot, post_q8, None)
                 return jax.lax.all_to_all(
                     scores, axis_name=saxis, split_axis=0, concat_axis=1, tiled=True
                 )
@@ -2187,6 +2287,7 @@ class RecsysTwoTowerModel(hk.Module):
             )
             total_loss = total_loss + head_loss
             if num_heads > 1:
+                stats[f"{head_names[h]}/loss"] = head_loss
                 for k, v in head_metrics.items():
                     stats[f"{head_names[h]}/{k}"] = v
             else:
@@ -2305,16 +2406,49 @@ class RecsysTwoTowerModelConfig(Config):
         ]
     )
 
+    ld_positive_actions: list[int] = field(
+        default_factory=lambda: [recsys_pb2.ActionName.CLIENT_TWEET_RECAP_DWELLED]
+    )
+    ld_hard_negative_actions: list[int] = field(
+        default_factory=lambda: RecsysTwoTowerModelConfig.get_hard_negative_actions()
+    )
+    ld_soft_negative_actions: list[int] = field(
+        default_factory=lambda: RecsysTwoTowerModelConfig.get_soft_negative_actions()
+    )
+
     head_dataset_mapping: dict[str, int] | None = None
 
     head_names: list[str] = field(default_factory=lambda: ["home"])
+
+    w_fav: float = 1.0
+    w_ld: float = 0.0
+
+    @property
+    def ld_head(self) -> int | None:
+        return self.head_names.index("ld") if "ld" in self.head_names else None
+
+    @property
+    def num_table_slots(self) -> int:
+        return 1 + (self.ld_head is not None)
+
+    @property
+    def query_head_weights(self) -> tuple[float, float]:
+        return (self.w_fav, self.w_ld)
 
     @property
     def mol_side_table_width(self) -> int:
         wanted = self.mol_serving_kernel or self.mol_side_table_in_checkpoint
         if not (wanted and self.mol_item_components > 0):
             return 0
-        return self.mol_item_components * (1 + max(self.user_query_heads, 1))
+        per_slot = self.mol_item_components * (1 + max(self.user_query_heads, 1))
+        return per_slot * self.num_table_slots
+
+    def mol_side_tables_from_rows(self, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
+        components = self.mol_item_components
+        blocks = jnp.split(rows, self.num_table_slots, axis=1)
+        norms = jnp.concatenate([jnp.transpose(b[:, :components]) for b in blocks], axis=0)
+        ibias = jnp.concatenate([jnp.transpose(b[:, components:]) for b in blocks], axis=0)
+        return norms, ibias
 
     @classmethod
     def get_positive_actions(cls) -> list[int]:
@@ -2329,16 +2463,20 @@ class RecsysTwoTowerModelConfig(Config):
         return cls.__dataclass_fields__["soft_negative_actions"].default_factory()
 
     def get_per_head_actions(self) -> list[tuple[list[int], list[int], list[int]]]:
-        configs = [(self.positive_actions, self.hard_negative_actions, self.soft_negative_actions)]
-        if self.candidate_tower_config.num_candidate_heads > 1:
-            configs.append(
-                (
-                    self.immersive_positive_actions,
-                    self.immersive_hard_negative_actions,
-                    self.immersive_soft_negative_actions,
-                )
-            )
-        return configs
+        actions = {
+            "home": (self.positive_actions, self.hard_negative_actions, self.soft_negative_actions),
+            "immersive": (
+                self.immersive_positive_actions,
+                self.immersive_hard_negative_actions,
+                self.immersive_soft_negative_actions,
+            ),
+            "ld": (
+                self.ld_positive_actions,
+                self.ld_hard_negative_actions,
+                self.ld_soft_negative_actions,
+            ),
+        }
+        return [actions[name] for name in self.head_names]
 
     embed_memory_kind: MemoryKind = "device"
 
@@ -2389,6 +2527,9 @@ class RecsysTwoTowerModelConfig(Config):
     def compute_tflops(self, num_seq_per_sec_per_device):
         return self.user_tower_config.compute_tflops(num_seq_per_sec_per_device)
 
+    def compute_forward_tflops(self, num_seq_per_sec_per_device):
+        return self.user_tower_config.compute_forward_tflops(num_seq_per_sec_per_device)
+
     def get_embed_memory_kind(self):
         return self.embed_memory_kind
 
@@ -2408,6 +2549,19 @@ class RecsysTwoTowerModelConfig(Config):
             assert (
                 isinstance(attn_config, RecsysAttentionConfig)
                 and attn_config.num_user_prefix_tokens == self.num_user_prefix_tokens
+            )
+
+        if len(self.head_names) != self.candidate_tower_config.num_candidate_heads:
+            raise ValueError(
+                f"head_names {self.head_names} must name each of the "
+                f"{self.candidate_tower_config.num_candidate_heads} candidate heads"
+            )
+        if self.ld_head == 0:
+            raise ValueError("'ld' must not be the first head; head 0 fills slot 0 of HOME rows")
+        if self.ld_head is not None and self.ld_head in (self.head_dataset_mapping or {}).values():
+            raise ValueError(
+                f"ld_head={self.ld_head} fills the second table slot; it must not own a dataset "
+                "in head_dataset_mapping"
             )
 
         user_tower = self.user_tower_config.make(sharding_context)

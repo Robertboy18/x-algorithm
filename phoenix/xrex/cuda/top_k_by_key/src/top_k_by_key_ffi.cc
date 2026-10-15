@@ -67,6 +67,27 @@ XLA_FFI_DEFINE_HANDLER(
         .Attr<int64_t>("num_components")
 );
 
+XLA_FFI_DEFINE_HANDLER(
+    kXrexMolFusedInt8,
+    mol_fused_int8,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::DataType::S8>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::S8>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Ret<ffi::Buffer<ffi::DataType::BF16>>()
+        .Attr<int64_t>("num_users")
+        .Attr<int64_t>("col_offset")
+);
+
 }
 
 XAI_TOPK_FFI_EXPORT int32_t xai_topk_ffi_api_version(void) {
@@ -89,6 +110,10 @@ XAI_TOPK_FFI_EXPORT XLA_FFI_Error* xai_topk_ffi_top_k_by_key_radix_select(
 
 XAI_TOPK_FFI_EXPORT XLA_FFI_Error* xai_topk_ffi_xrex_mol_epilogue(XLA_FFI_CallFrame* call_frame) {
   return kXrexMolEpilogue(call_frame);
+}
+
+XAI_TOPK_FFI_EXPORT XLA_FFI_Error* xai_topk_ffi_xrex_mol_fused_int8(XLA_FFI_CallFrame* call_frame) {
+  return kXrexMolFusedInt8(call_frame);
 }
 
 static_assert(

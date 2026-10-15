@@ -1,5 +1,7 @@
 use crate::hydration::fallback_cache::{Column, FallbackCache};
-use crate::models::{AuthorId, MediaFeature, NsfwFeature, PureCore, TweetFeatures, TweetId};
+use crate::models::{
+    AuthorId, MediaFeature, NsfwFeature, PureCore, ReplyTo, TweetFeatures, TweetId,
+};
 use std::num::NonZeroU64;
 use xai_core_entities::entities::{EditControl, EditControlInitial, PureCoreData, TakedownReason};
 
@@ -224,15 +226,23 @@ pub(crate) fn pure_core(core: &PureCoreData) -> PureCore {
         author_id: AuthorId(core.author_id),
         source_tweet_id: core.source_tweet_id.map(TweetId),
         source_author_id: core.source_user_id.filter(|&id| id != 0).map(AuthorId),
-        direct_reply_root_author_id: direct_reply_root_author(core),
+        reply_to: reply_to(core),
     }
 }
 
-fn direct_reply_root_author(core: &PureCoreData) -> Option<AuthorId> {
-    core.in_reply_to_tweet_id
-        .filter(|&replied_to| core.conversation_id == Some(replied_to))
-        .and(core.in_reply_to_user_id)
-        .map(AuthorId)
+fn reply_to(core: &PureCoreData) -> Option<ReplyTo> {
+    let conversation_id = TweetId(core.conversation_id?);
+    let parent_id = TweetId(core.in_reply_to_tweet_id?);
+    if parent_id != conversation_id {
+        return Some(ReplyTo::Nested {
+            conversation_id,
+            parent_id,
+        });
+    }
+    Some(ReplyTo::Root {
+        conversation_id,
+        root_author_id: AuthorId(core.in_reply_to_user_id?),
+    })
 }
 
 #[cfg(test)]
@@ -253,6 +263,36 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(pure_core(&core).source_author_id, None);
+        }
+    }
+
+    #[test]
+    fn a_direct_reply_names_its_root_author_and_a_nested_one_its_parent() {
+        let root = Some(ReplyTo::Root {
+            conversation_id: TweetId(100),
+            root_author_id: AuthorId(30),
+        });
+        let nested = Some(ReplyTo::Nested {
+            conversation_id: TweetId(100),
+            parent_id: TweetId(101),
+        });
+        for (ids, expected) in [
+            ((Some(100), Some(100), Some(30)), root),
+            ((Some(100), Some(100), None), None),
+            ((Some(100), Some(101), Some(30)), nested),
+            ((Some(100), Some(101), None), nested),
+            ((None, Some(101), Some(30)), None),
+            ((Some(100), None, Some(30)), None),
+        ] {
+            let (conversation_id, in_reply_to_tweet_id, in_reply_to_user_id) = ids;
+            let core = PureCoreData {
+                author_id: 10,
+                conversation_id,
+                in_reply_to_tweet_id,
+                in_reply_to_user_id,
+                ..Default::default()
+            };
+            assert_eq!(pure_core(&core).reply_to, expected, "{ids:?}");
         }
     }
 

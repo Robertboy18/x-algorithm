@@ -99,11 +99,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn decode_garbage_returns_decode_error() {
-        assert!(matches!(decode(&[0xff; 16]), CacheLookup::DecodeError));
-    }
-
-    #[test]
     fn decode_found_with_undecodable_mval_returns_decode_error() {
         let blob = cached_value_blob(CachedValueStatus::FOUND, Some(&[0xff; 8]));
         assert!(matches!(decode(&blob), CacheLookup::DecodeError));

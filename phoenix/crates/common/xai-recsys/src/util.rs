@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use xai_recsys_proto as pb;
 
 lazy_static! {
-    static ref USER_FEATURE_FILL_TOTAL: IntCounterVec = register_int_counter_vec!(
+    pub(crate) static ref USER_FEATURE_FILL_TOTAL: IntCounterVec = register_int_counter_vec!(
         "recsys_user_feature_fill_total",
         "User feature fill rate by feature name and status.",
         &["feature", "status"]
@@ -280,7 +280,7 @@ pub fn stamp_local_time_features(
 
 const TWITTER_EPOCH_MS: i64 = 1288834974657;
 
-fn snowflake_to_creation_ts_sec(tweet_id: i64) -> i32 {
+pub(crate) fn snowflake_to_creation_ts_sec(tweet_id: i64) -> i32 {
     if tweet_id == 0 {
         return 0;
     }

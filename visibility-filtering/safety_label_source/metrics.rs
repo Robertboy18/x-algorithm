@@ -4,6 +4,7 @@ use std::time::Instant;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 
 use super::types::{FailureKind, FallbackReason, LabelSource};
+use crate::rules::metrics::RequestOutcome;
 
 const REQUESTS: &str = "safety_labels_lookup_requests";
 const LATENCY_MS: &str = "safety_labels_lookup_latency_ms_vm";
@@ -16,15 +17,6 @@ const MANHATTAN_KEYS: &str = "safety_labels_manhattan_keys";
 const CACHE_FALLBACK_KEYS: &str = "safety_labels_cache_fallback_keys";
 const BATCH_SIZE: &str = "safety_labels_lookup_batch_size";
 const CACHE_WARM_KEYS: &str = "safety_labels_cache_warm_keys";
-
-#[derive(Clone, Copy, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-pub(crate) enum RequestOutcome {
-    Started,
-    Cancelled,
-    Success,
-    Failure,
-}
 
 #[derive(Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]

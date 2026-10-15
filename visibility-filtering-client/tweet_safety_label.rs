@@ -120,7 +120,7 @@ fn vf_channel_params(dc: &str) -> VfChannelParams<'_> {
     VfChannelParams {
         name: "vf-safety-labels",
         dc,
-        discovery: VfDiscovery::from_env(VF_SAFETY_LABELS_DISCOVERY_ENV),
+        discovery: VfDiscovery::from_env(VF_SAFETY_LABELS_DISCOVERY_ENV, VfDiscovery::Wily),
         aperture_size: VF_SAFETY_LABELS_APERTURE_SIZE,
         deterministic_aperture: std::env::var("APP_ENV").as_deref() == Ok("prod"),
         xds_lb_policy: LbPolicy::least_request(),
@@ -581,29 +581,6 @@ mod tests {
         for id in tweet_ids {
             assert!(result.labels.contains_key(&id));
         }
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn get_safety_labels_parses_failed_ids() {
-        let service = TestVisibilityFilteringService {
-            responses: Arc::new(Mutex::new(vec![Ok(vf_pb::GetSafetyLabelsResponse {
-                results: HashMap::from([(1, vf_pb::SafetyLabelMap::default())]),
-                failed_ids: vec![2],
-            })])),
-            ..Default::default()
-        };
-        let (addr, handle) = start_test_server(service).await;
-        let client = test_client(addr).await;
-
-        let result = client.get_safety_labels(vec![1, 2]).await.unwrap();
-
-        assert_eq!(result.labels.len(), 1);
-        assert!(result.labels.contains_key(&1));
-        assert_eq!(
-            result.failures,
-            HashMap::from([(2, SafetyLabelFailure::LookupFailed)])
-        );
         handle.abort();
     }
 

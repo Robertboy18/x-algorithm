@@ -202,6 +202,11 @@ impl SlidingWindowLimiter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_for_test(&self) {
+        self.seeded.store(true, Ordering::Relaxed);
+    }
+
     pub fn stats(&self, cap: i64) -> (u32, u32, u32) {
         let used = self.rolling_cached();
         (
@@ -371,6 +376,51 @@ impl SlidingWindowLimiter {
             "sliding-window refresh"
         );
     }
+}
+
+#[cfg(test)]
+pub(crate) fn counting_limiter_for_test() -> (SlidingWindowLimiter, Arc<AtomicI64>) {
+    struct Counting(Arc<AtomicI64>);
+    #[async_trait]
+    impl CounterSource for Counting {
+        async fn increment(&self) -> Option<i64> {
+            Some(self.0.fetch_add(1, Ordering::Relaxed) + 1)
+        }
+    }
+    struct NoStore;
+    #[async_trait]
+    impl SnapshotStore for NoStore {
+        async fn scan(
+            &self,
+            _pkey: &str,
+            _from: Option<&str>,
+            _to: Option<&str>,
+            _limit: u32,
+        ) -> anyhow::Result<Vec<(String, String)>> {
+            Ok(Vec::new())
+        }
+        async fn put_with_ttl(
+            &self,
+            _pkey: &str,
+            _lkey: &str,
+            _value: String,
+            _ttl_nanos: i64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _pkey: &str, _lkey: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let tickets = Arc::new(AtomicI64::new(0));
+    let limiter = SlidingWindowLimiter::from_parts(
+        Arc::new(Counting(tickets.clone())),
+        Arc::new(NoStore),
+        true,
+        USER_SNAP_PKEY,
+        "user",
+    );
+    (limiter, tickets)
 }
 
 #[cfg(test)]

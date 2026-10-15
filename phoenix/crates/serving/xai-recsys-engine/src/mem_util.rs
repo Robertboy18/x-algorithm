@@ -4,10 +4,12 @@ use futures::future::join_all;
 use std::{cmp, ffi::c_int, io, mem};
 use tokio::task;
 
+#[cfg(all(test, target_os = "linux"))]
+use nix::libc::MPOL_DEFAULT;
 #[cfg(target_os = "linux")]
 use nix::libc::{
-    MADV_HUGEPAGE, MADV_NORMAL, MADV_SEQUENTIAL, MPOL_BIND, MPOL_INTERLEAVE, SYS_get_mempolicy,
-    SYS_set_mempolicy, madvise, syscall,
+    MADV_HUGEPAGE, MADV_NORMAL, MADV_SEQUENTIAL, MPOL_BIND, MPOL_INTERLEAVE, MPOL_LOCAL,
+    SYS_get_mempolicy, SYS_mbind, SYS_set_mempolicy, madvise, syscall,
 };
 
 pub const NODE_MASK_SIZE: usize = 16;
@@ -76,6 +78,13 @@ pub fn set_numa_policy(mode: c_int, node_mask: [u64; NODE_MASK_SIZE]) -> Result<
     Ok(())
 }
 
+pub fn opt_out_of_numa_balancing() -> Result<(), io::Error> {
+    #[cfg(target_os = "linux")]
+    return set_numa_policy(MPOL_LOCAL, [0; NODE_MASK_SIZE]);
+    #[cfg(not(target_os = "linux"))]
+    Ok(())
+}
+
 #[cfg(target_arch = "aarch64")]
 const HUGE_PAGE_SIZE: usize = 2usize.pow(29);
 #[cfg(not(target_arch = "aarch64"))]
@@ -103,6 +112,71 @@ pub fn madvise_hugepage_internal(slice: &mut [u8]) -> Result<(), io::Error> {
         }
     }
     Ok(())
+}
+
+pub fn mbind_interleave_internal(slice: &mut [u8]) -> Result<(), io::Error> {
+    let _used = (&slice, HUGE_PAGE_SIZE);
+
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let offset = (!(slice.as_ptr() as usize) + 1) & (HUGE_PAGE_SIZE - 1);
+        let len = slice.len().saturating_sub(offset) & !(HUGE_PAGE_SIZE - 1);
+        if len == 0 {
+            return Ok(());
+        }
+        let nodes = interleave_nodes()?;
+        if nodes.iter().map(|m| m.count_ones()).sum::<u32>() < 2 {
+            return Ok(());
+        }
+        let ret = syscall(
+            SYS_mbind,
+            slice.as_mut_ptr().add(offset),
+            len,
+            MPOL_INTERLEAVE,
+            nodes.as_ptr(),
+            NODE_MASK_SIZE * 64,
+            0u32,
+        );
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn interleave_nodes() -> Result<[u64; NODE_MASK_SIZE], io::Error> {
+    let mut nodes = get_numa_policy(MPOL_F_MEMS_ALLOWED)?.1;
+    if let Some(with_cpus) = std::fs::read_to_string("/sys/devices/system/node/has_cpu")
+        .ok()
+        .and_then(|text| parse_node_list(&text))
+    {
+        for (node, cpu) in nodes.iter_mut().zip(with_cpus) {
+            *node &= cpu;
+        }
+    }
+    Ok(nodes)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_node_list(text: &str) -> Option<[u64; NODE_MASK_SIZE]> {
+    let mut mask = [0u64; NODE_MASK_SIZE];
+    for part in text.trim().split(',').filter(|part| !part.is_empty()) {
+        let (lo, hi) = match part.split_once('-') {
+            Some((lo, hi)) => (lo.parse::<usize>().ok()?, hi.parse::<usize>().ok()?),
+            None => {
+                let node = part.parse::<usize>().ok()?;
+                (node, node)
+            }
+        };
+        if lo > hi || hi >= NODE_MASK_SIZE * 64 {
+            return None;
+        }
+        for node in lo..=hi {
+            mask[node / 64] |= 1 << (node % 64);
+        }
+    }
+    Some(mask)
 }
 
 pub fn madvise_sequential_internal(slice: &mut [u8]) -> Result<(), io::Error> {
@@ -237,4 +311,98 @@ pub async fn init_mem(buf: &mut [u8], kind: InitKind) -> Result<(), io::Error> {
         .collect::<Result<Vec<()>, _>>()?;
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    const MPOL_F_ADDR: u64 = 2;
+
+    fn policy_at(addr: *const u8) -> c_int {
+        let mut mode: c_int = -1;
+        let ret = unsafe {
+            syscall(
+                SYS_get_mempolicy,
+                &mut mode,
+                std::ptr::null_mut::<u64>(),
+                0usize,
+                addr,
+                MPOL_F_ADDR,
+            )
+        };
+        assert_eq!(ret, 0, "get_mempolicy: {}", io::Error::last_os_error());
+        mode
+    }
+
+    #[test]
+    fn numa_balancing_opt_out_is_inherited_by_later_threads() {
+        std::thread::spawn(|| {
+            match opt_out_of_numa_balancing() {
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return,
+                r => r.unwrap(),
+            }
+            assert_eq!(get_numa_policy(0).unwrap().0, MPOL_LOCAL);
+            let child = std::thread::spawn(|| get_numa_policy(0).unwrap().0);
+            assert_eq!(child.join().unwrap(), MPOL_LOCAL);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn mbind_interleave_covers_the_whole_huge_pages() {
+        let mut buf = vec![0u8; 3 * HUGE_PAGE_SIZE];
+        match mbind_interleave_internal(&mut buf) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return,
+            r => r.unwrap(),
+        }
+        let nodes = interleave_nodes().unwrap();
+        let want = if nodes.iter().map(|m| m.count_ones()).sum::<u32>() >= 2 {
+            MPOL_INTERLEAVE
+        } else {
+            MPOL_DEFAULT
+        };
+        let offset = (!(buf.as_ptr() as usize) + 1) & (HUGE_PAGE_SIZE - 1);
+        let first = unsafe { buf.as_ptr().add(offset) };
+        assert_eq!(policy_at(first), want);
+        assert_eq!(
+            policy_at(unsafe { first.add(2 * HUGE_PAGE_SIZE - 1) }),
+            want
+        );
+    }
+
+    #[test]
+    fn interleave_nodes_have_cpus_and_are_allowed() {
+        let allowed = get_numa_policy(MPOL_F_MEMS_ALLOWED).unwrap().1;
+        let nodes = interleave_nodes().unwrap();
+        for (node, allowed) in nodes.iter().zip(allowed) {
+            assert_eq!(node & !allowed, 0);
+        }
+        let Ok(text) = std::fs::read_to_string("/sys/devices/system/node/has_cpu") else {
+            return;
+        };
+        let with_cpus = parse_node_list(&text).unwrap();
+        for (node, cpu) in nodes.iter().zip(with_cpus) {
+            assert_eq!(node & !cpu, 0);
+        }
+    }
+
+    #[test]
+    fn node_lists_parse_like_sysfs() {
+        let mask = |nodes: &[usize]| {
+            let mut mask = [0u64; NODE_MASK_SIZE];
+            for &n in nodes {
+                mask[n / 64] |= 1 << (n % 64);
+            }
+            mask
+        };
+        assert_eq!(parse_node_list("0-1\n"), Some(mask(&[0, 1])));
+        assert_eq!(parse_node_list("0,2-3,70"), Some(mask(&[0, 2, 3, 70])));
+        assert_eq!(parse_node_list("\n"), Some(mask(&[])));
+        assert_eq!(parse_node_list("1023"), Some(mask(&[1023])));
+        for bad in ["1-0", "a", "0-", "1024"] {
+            assert_eq!(parse_node_list(bad), None, "{bad}");
+        }
+    }
 }

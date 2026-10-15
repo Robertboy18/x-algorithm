@@ -4,43 +4,30 @@ use thrift::protocol::{
     TFieldIdentifier, TInputProtocol, TOutputProtocol, TSerializable, TStructIdentifier, TType,
 };
 use thrift::{new_protocol_error, ProtocolErrorKind};
-use tonic::async_trait;
 use xai_strato::strato_thrift::{strato_decode, StratoResult};
 use xai_strato::{encode, MValCodec, StratoGrpc};
 
 const IS_MEMBER_COLUMN: &str = "trusted-friends/visibility-filtering/isMember.TrustedFriendsList";
 const IS_OWNER_COLUMN: &str = "trusted-friends/visibility-filtering/isOwner.TrustedFriendsList";
 
-#[async_trait]
-pub trait TrustedFriendsClient: Send + Sync {
-    async fn batch_is_member_or_owner(&self, viewer_id: u64, list_ids: &[u64])
-        -> Vec<Result<bool>>;
-}
-
-pub struct ProdTrustedFriendsClient {
+pub struct TrustedFriendsClient {
     grpc: StratoGrpc,
 }
 
-impl ProdTrustedFriendsClient {
+impl TrustedFriendsClient {
     pub fn new(grpc: StratoGrpc) -> Self {
         Self { grpc }
     }
-}
 
-#[async_trait]
-impl TrustedFriendsClient for ProdTrustedFriendsClient {
-    async fn batch_is_member_or_owner(
+    pub async fn batch_is_member_or_owner(
         &self,
         viewer_id: u64,
         list_ids: &[u64],
     ) -> Vec<Result<bool>> {
-        let view = View {
-            user_id: viewer_id.cast_signed(),
-        };
         let calls = list_ids
             .iter()
-            .flat_map(|list_id| {
-                let key = encode(&(list_id.cast_signed(), &view));
+            .flat_map(|&list_id| {
+                let key = key(list_id, viewer_id);
                 [IS_MEMBER_COLUMN, IS_OWNER_COLUMN]
                     .map(|column| (column.to_string(), "fetch".to_string(), vec![key.clone()]))
             })
@@ -53,6 +40,13 @@ impl TrustedFriendsClient for ProdTrustedFriendsClient {
             .map(|bytes| decode_answer(&bytes?));
         iter::from_fn(|| Some(member_or_owner(answers.next()?, answers.next()?))).collect()
     }
+}
+
+pub(crate) fn key(list_id: u64, viewer_id: u64) -> Vec<u8> {
+    let view = View {
+        user_id: viewer_id.cast_signed(),
+    };
+    encode(&(list_id.cast_signed(), &view))
 }
 
 fn member_or_owner(member: Result<bool>, owner: Result<bool>) -> Result<bool> {
@@ -122,37 +116,24 @@ impl TSerializable for Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clients::strato_answer::{found, no_row, Thrift};
     use anyhow::anyhow;
-    use thrift::protocol::TBinaryOutputProtocol;
 
     fn answer(value: Option<bool>) -> bool {
-        let mut bytes = Vec::new();
-        let mut proto = TBinaryOutputProtocol::new(&mut bytes, false);
-        proto
-            .write_struct_begin(&TStructIdentifier::new(""))
-            .unwrap();
-        for id in [4, 2556, 118] {
-            proto
-                .write_field_begin(&TFieldIdentifier::new("", TType::Struct, id))
-                .unwrap();
-            proto
-                .write_struct_begin(&TStructIdentifier::new(""))
-                .unwrap();
-        }
-        let (option_type, option_field) = match value {
-            Some(_) => (TType::Bool, 26900),
-            None => (TType::Void, 9048),
-        };
-        proto
-            .write_field_begin(&TFieldIdentifier::new("", option_type, option_field))
-            .unwrap();
-        if let Some(value) = value {
-            proto.write_bool(value).unwrap();
-        }
-        for _ in 0..4 {
-            proto.write_field_stop().unwrap();
-        }
+        let bytes = value.map_or_else(no_row, |value| found(Thrift::Bool(value)));
         decode_answer(&bytes).unwrap()
+    }
+
+    #[test]
+    fn the_key_names_the_list_and_the_viewer_as_userid() {
+        assert_eq!(
+            key(9001, 50),
+            [
+                0x0c, 0x00, 0x04, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x29,
+                0x0c, 0x00, 0x01, 0x0a, 0x2e, 0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32,
+                0x00, 0x00, 0x00,
+            ]
+        );
     }
 
     #[test]

@@ -100,6 +100,12 @@ param!(
     false
 );
 param!(
+    ReactWithVideoWeight,
+    f64,
+    "rust_home_mixer_react_with_video_weight",
+    0.0
+);
+param!(
     NotInterestedWeight,
     f64,
     "rust_home_mixer_not_interested_weight",
@@ -231,6 +237,12 @@ param!(
     bool,
     "rust_home_mixer_vm_ranker_dpp_enabled",
     true
+);
+param!(
+    TopicDppEnabled,
+    bool,
+    "rust_home_mixer_vm_ranker_topic_dpp_enabled",
+    false
 );
 param!(DppTheta, f64, "rust_home_mixer_vm_ranker_dpp_theta", 0.65);
 param!(

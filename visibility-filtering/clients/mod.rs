@@ -4,11 +4,13 @@ pub mod about_this_account_client;
 pub mod article_client;
 pub mod gizmoduck_client;
 pub mod socialgraph_client;
+#[cfg(test)]
+pub(crate) mod strato_answer;
 pub mod trusted_friends_client;
 pub mod user_location_client;
 pub mod wingman_client;
 
-fn read_fields(
+pub(crate) fn read_fields(
     i_prot: &mut dyn TInputProtocol,
     mut read_field: impl FnMut(&mut dyn TInputProtocol, &TFieldIdentifier) -> thrift::Result<bool>,
 ) -> thrift::Result<()> {

@@ -4,7 +4,7 @@ use crate::hydration::Hydrator::{
     RootFollowsViewer, RootFollowsViewerSecondDegree, SuperFollowsRoot,
 };
 use crate::models::{
-    ConversationControlFeatures, HydratedTweetCandidate, LimitedEngagementReason, SafetyLabelType,
+    ConversationControlFeatures, LimitedEngagementReason, PostCandidate, SafetyLabelType,
     ViewerProfile,
 };
 use crate::rules::fixtures::{
@@ -267,6 +267,6 @@ fn co_root(
     }
 }
 
-fn controlled_candidate(features: ConversationControlFeatures) -> HydratedTweetCandidate {
+fn controlled_candidate(features: ConversationControlFeatures) -> PostCandidate {
     candidate().with_conversation_control(features).build()
 }

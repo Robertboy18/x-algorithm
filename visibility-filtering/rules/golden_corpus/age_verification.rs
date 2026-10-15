@@ -6,9 +6,9 @@ use crate::models::VerifyBlurSupport::{
     AndroidNeedsUpdate, IosNeedsUpdate, Supported, Unsupported,
 };
 use crate::models::{
-    AuthorFeatures, ClientCapability, HydratedTweetCandidate, LimitedEngagementReason, NsfwFeature,
-    NsfwViewerDropReason, SafetyLabelType, TombstoneReason, TweetFeatures, VerifyBlurSupport,
-    Viewer, ViewerFeatures, ViewerProfile,
+    AuthorFeatures, ClientCapability, LimitedEngagementReason, NsfwFeature, NsfwViewerDropReason,
+    PostCandidate, SafetyLabelType, TombstoneReason, TweetFeatures, VerifyBlurSupport, Viewer,
+    ViewerFeatures, ViewerProfile,
 };
 use crate::rules::fixtures::{
     allow, author_viewer, blurred, blurred_and_limited, candidate, legacy_interstitial, limited,
@@ -72,7 +72,7 @@ fn nsfw_flag(nsfw: NsfwFeature) -> TweetFeatures {
     }
 }
 
-fn nsfw_admin_flag_media() -> HydratedTweetCandidate {
+fn nsfw_admin_flag_media() -> PostCandidate {
     candidate()
         .with_tweet_features(nsfw_flag(NsfwFeature {
             admin: true,
@@ -348,9 +348,11 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "nsfw_high_precision_media_with_a_failed_viewer_lookup",
-            post: HydratedTweetCandidate {
-                failed: Hydrators::of(Hydrator::ViewerProfile).with(Hydrator::ViewerLabels),
-                ..nsfw_high_precision_media()
+            post: {
+                let mut candidate = nsfw_high_precision_media();
+                candidate.failed =
+                    Hydrators::of(Hydrator::ViewerProfile).with(Hydrator::ViewerLabels);
+                candidate
             },
             expect: vec![
                 (TimelineHomeHydration, web_in_fr(), verify_high_precision()),

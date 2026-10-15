@@ -2,8 +2,8 @@ use super::builders::on_client;
 use super::{Role, Row};
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    ClientCapability, CommunityModeration, HydratedTweetCandidate, LimitedEngagementReason,
-    TweetFeatures, Verdict, ViewerFeatures,
+    ClientCapability, CommunityModeration, LimitedEngagementReason, PostCandidate, TweetFeatures,
+    Verdict, ViewerFeatures,
 };
 use crate::rules::fixtures::{
     allow, author_viewer, candidate, dropped, limited, viewer, VIEWER_ID,
@@ -25,15 +25,15 @@ const AUTHOR_REMOVED: CommunityModeration = CommunityModeration {
 fn community_post(
     moderation: CommunityModeration,
     viewer_is_moderator: Option<bool>,
-) -> HydratedTweetCandidate {
+) -> PostCandidate {
     let mut post = candidate()
         .with_tweet_features(TweetFeatures {
             community_id: NonZeroU64::new(500),
             ..Default::default()
         })
         .build();
-    post.community_moderation = moderation;
-    post.viewer_is_community_moderator = viewer_is_moderator;
+    post.post.community_moderation = moderation;
+    post.post.viewer_is_community_moderator = viewer_is_moderator;
     post
 }
 
@@ -51,10 +51,11 @@ fn author_removed_drop() -> Verdict {
     )
 }
 
-fn viewer_removed_post(viewer_is_removed: bool) -> HydratedTweetCandidate {
-    HydratedTweetCandidate {
-        viewer_is_removed_from_community: viewer_is_removed,
-        ..community_post(CommunityModeration::default(), Some(false))
+fn viewer_removed_post(viewer_is_removed: bool) -> PostCandidate {
+    {
+        let mut candidate = community_post(CommunityModeration::default(), Some(false));
+        candidate.post.viewer_is_removed_from_community = viewer_is_removed;
+        candidate
     }
 }
 
@@ -202,9 +203,10 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "community_post_viewer_removal_lookup_failed",
-            post: HydratedTweetCandidate {
-                failed: Hydrators::of(Hydrator::CommunityViewerRemoved),
-                ..viewer_removed_post(false)
+            post: {
+                let mut candidate = viewer_removed_post(false);
+                candidate.failed = Hydrators::of(Hydrator::CommunityViewerRemoved);
+                candidate
             },
             expect: vec![(
                 TimelineHomeHydration,

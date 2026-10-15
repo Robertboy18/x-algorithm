@@ -43,6 +43,10 @@ pub(crate) trait Exchange {
     fn ids(key: &Self::Key, wire: Option<&Self::Wire>) -> anyhow::Result<Vec<Id>>;
 }
 
+pub(crate) trait Visit {
+    fn exchange<X: Exchange>(&mut self);
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Bytes(pub(crate) Vec<u8>);
 
@@ -127,9 +131,9 @@ impl FromStr for EdgeKey {
     }
 }
 
-pub(crate) struct TesPureCore;
+pub(crate) struct TesPureCoreData;
 
-impl Exchange for TesPureCore {
+impl Exchange for TesPureCoreData {
     const NAME: &'static str = "pure_cores";
     const SCOPE: Scope = Scope::Shared;
     type Key = u64;
@@ -149,6 +153,19 @@ impl Exchange for TesPureCore {
         Ok(iter::once(Id::Tweet(tweet_id))
             .chain(linked.flatten())
             .collect())
+    }
+}
+
+pub(crate) struct TesConversationRoot;
+
+impl Exchange for TesConversationRoot {
+    const NAME: &'static str = "conversation_roots";
+    const SCOPE: Scope = Scope::Shared;
+    type Key = u64;
+    type Wire = PureCoreData;
+
+    fn ids(root_id: &u64, core: Option<&PureCoreData>) -> anyhow::Result<Vec<Id>> {
+        TesPureCoreData::ids(root_id, core)
     }
 }
 
@@ -451,6 +468,32 @@ impl Exchange for ArticleLifecycle {
     type Wire = i32;
 
     fn ids(&article_id: &u64, _: Option<&i32>) -> anyhow::Result<Vec<Id>> {
+        Ok(vec![Id::Article(article_id)])
+    }
+}
+
+pub(crate) struct ArticleMediaEntities;
+
+impl Exchange for ArticleMediaEntities {
+    const NAME: &'static str = "article_media_entities";
+    const SCOPE: Scope = Scope::Case;
+    type Key = u64;
+    type Wire = bool;
+
+    fn ids(&article_id: &u64, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {
+        Ok(vec![Id::Article(article_id)])
+    }
+}
+
+pub(crate) struct ArticleCoverMedia;
+
+impl Exchange for ArticleCoverMedia {
+    const NAME: &'static str = "article_cover_media";
+    const SCOPE: Scope = Scope::Case;
+    type Key = u64;
+    type Wire = bool;
+
+    fn ids(&article_id: &u64, _: Option<&bool>) -> anyhow::Result<Vec<Id>> {
         Ok(vec![Id::Article(article_id)])
     }
 }

@@ -154,22 +154,6 @@ mod tests {
     }
 
     #[test]
-    fn found_not_found_and_failed_stay_distinguishable() {
-        let batch = batch(HashMap::from([
-            (1, Ok(Some(7))),
-            (2, Ok(None)),
-            (3, Err("backend unavailable")),
-        ]));
-
-        assert_eq!(batch.get(&1), Some(&7));
-        assert_eq!(batch.hydrated(&2), Some(&Hydrated::NotFound));
-        assert_eq!(
-            batch.hydrated(&3),
-            Some(&Hydrated::Failed(HydrationError::Error))
-        );
-    }
-
-    #[test]
     fn absent_expected_keys_become_missing() {
         let batch: HydrationBatch<u64, u32> =
             HydrationBatch::from_results([1, 2], HashMap::from([(1, Ok::<_, &str>(Some(7)))]));

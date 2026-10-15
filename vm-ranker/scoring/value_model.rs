@@ -86,6 +86,7 @@ pub fn weights_from_params(params: &Params, viewer_id: u64) -> ValueModelWeights
         follow_author: params.get(FollowAuthorWeight),
         post_unexplored: params.get(PostUnexploredWeight),
         post_unexplored_include_out_of_network: params.get(PostUnexploredIncludeOutOfNetwork),
+        react_with_video: params.get(ReactWithVideoWeight),
         not_interested: params.get(NotInterestedWeight),
         block_author: params.get(BlockAuthorWeight),
         mute_author: params.get(MuteAuthorWeight),

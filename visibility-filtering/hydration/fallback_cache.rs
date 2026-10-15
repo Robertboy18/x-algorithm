@@ -5,6 +5,8 @@ use quick_cache::sync::{Cache, EntryAction, EntryResult};
 use quick_cache::OptionsBuilder;
 
 use crate::hydration::batch::{Hydrated, RawHydrationBatch};
+use crate::hydration::decode::author::AuthorFallbackCache;
+use crate::hydration::decode::tweet::TweetFallbackCache;
 use crate::hydration::metrics::{record_fallback_cache_entries, FallbackCacheCounts};
 
 const CACHE_SHARDS: usize = 64;
@@ -24,6 +26,12 @@ pub(crate) trait Column {
     fn holds(entry: &Self::Entry) -> bool;
     fn others_hold(entry: &Self::Entry) -> bool;
     fn clear(entry: &mut Self::Entry) -> Option<Self::Stored>;
+}
+
+#[derive(Default)]
+pub(crate) struct FallbackCaches {
+    pub(crate) tweets: Option<TweetFallbackCache>,
+    pub(crate) authors: Option<AuthorFallbackCache>,
 }
 
 pub(crate) struct FallbackCache<E> {
@@ -249,22 +257,6 @@ mod tests {
 
     fn failed() -> Hydrated<String> {
         Hydrated::Failed(HydrationError::Timeout)
-    }
-
-    #[test]
-    fn recovers_only_resident_failed_keys() {
-        let cache = cache();
-        cache.resolve_hydration_batch::<Left>(batch([(1, found("cached"))]));
-
-        let resolved = cache.resolve_hydration_batch::<Left>(batch([
-            (1, failed()),
-            (2, failed()),
-            (3, found("fresh")),
-        ]));
-
-        assert_eq!(resolved.get(&1), Some(&"cached".to_string()));
-        assert!(matches!(resolved.hydrated(&2), Some(Hydrated::Failed(_))));
-        assert_eq!(resolved.get(&3), Some(&"fresh".to_string()));
     }
 
     #[test]

@@ -25,6 +25,27 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("num_components")
 );
 
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    mol_fused_int8_handler,
+    mol_fused_int8,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::DataType::S8>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::S8>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Arg<ffi::Buffer<ffi::DataType::F32>>()
+        .Ret<ffi::Buffer<ffi::DataType::BF16>>()
+        .Attr<int64_t>("num_users")
+        .Attr<int64_t>("col_offset")
+);
+
 template <typename T>
 nb::capsule encapsulate_ffi_call(T* fn) {
   static_assert(
@@ -37,4 +58,6 @@ nb::capsule encapsulate_ffi_call(T* fn) {
 NB_MODULE(mol_epilogue_api, m) {
   m.doc() = "Mixture-of-logits retrieval scoring epilogue (bf16 dots -> f32 scores)";
   m.def("mol_epilogue", []() { return encapsulate_ffi_call(mol_epilogue_handler); });
+  m.def("mol_fused_int8", []() { return encapsulate_ffi_call(mol_fused_int8_handler); });
+  m.attr("mol_fused_int8_col_offset") = true;
 }

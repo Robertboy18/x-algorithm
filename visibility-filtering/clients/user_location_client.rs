@@ -5,7 +5,6 @@ use thrift::protocol::{
     TFieldIdentifier, TInputProtocol, TOutputProtocol, TSerializable, TSetIdentifier,
     TStructIdentifier, TType,
 };
-use tonic::async_trait;
 use xai_strato::strato_thrift::{strato_decode, StratoResult};
 use xai_strato::{encode, MValCodec, StratoGrpc};
 
@@ -22,38 +21,29 @@ const GEODUCK_IDL_DEFAULT_FLAGS: [(&str, i16, bool); 3] = [
 const FOUND: i16 = 1;
 const PLACE_MAP: i16 = 5;
 
-#[async_trait]
-pub trait UserLocationClient: Send + Sync {
-    async fn places(&self, user_id: u64) -> anyhow::Result<HashSet<u64>>;
-}
-
-pub struct ProdUserLocationClient {
+pub struct UserLocationClient {
     grpc: StratoGrpc,
 }
 
-impl ProdUserLocationClient {
+impl UserLocationClient {
     pub fn new(grpc: StratoGrpc) -> Self {
         Self { grpc }
     }
-}
 
-#[async_trait]
-impl UserLocationClient for ProdUserLocationClient {
-    async fn places(&self, user_id: u64) -> anyhow::Result<HashSet<u64>> {
-        let view = UserLocationRequest {
-            user_id: user_id.cast_signed(),
-        };
+    pub async fn places(&self, user_id: u64) -> anyhow::Result<HashSet<u64>> {
         let bytes = self
             .grpc
-            .call(
-                USER_LOCATION_COLUMN,
-                "fetch",
-                vec![encode(&((), &view))],
-                None,
-            )
+            .call(USER_LOCATION_COLUMN, "fetch", vec![key(user_id)], None)
             .await?;
         decode_places(&bytes, user_id)
     }
+}
+
+pub(crate) fn key(user_id: u64) -> Vec<u8> {
+    let view = UserLocationRequest {
+        user_id: user_id.cast_signed(),
+    };
+    encode(&((), &view))
 }
 
 fn decode_places(bytes: &[u8], user_id: u64) -> anyhow::Result<HashSet<u64>> {
@@ -188,9 +178,8 @@ fn read_place_ids(i_prot: &mut dyn TInputProtocol) -> thrift::Result<HashSet<u64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thrift::protocol::{TBinaryOutputProtocol, TMapIdentifier};
-
-    type Proto<'a> = TBinaryOutputProtocol<&'a mut Vec<u8>>;
+    use crate::clients::strato_answer::Thrift::{Map, Set, Struct, I32, I64};
+    use crate::clients::strato_answer::{found, no_row, strato_error};
 
     const USER: u64 = 7;
     const OTHER_USER: u64 = 8;
@@ -200,90 +189,27 @@ mod tests {
     const POI: i32 = 5;
     const ABOVE_I64_MAX: u64 = 0xa000_0000_0000_0001;
 
-    fn field(proto: &mut Proto<'_>, ty: TType, id: i16) {
-        proto
-            .write_field_begin(&TFieldIdentifier::new("", ty, id))
-            .unwrap();
-    }
-
-    fn begin_struct(proto: &mut Proto<'_>) {
-        proto
-            .write_struct_begin(&TStructIdentifier::new(""))
-            .unwrap();
-    }
-
-    fn mval(value: impl FnOnce(&mut Proto<'_>)) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut proto = TBinaryOutputProtocol::new(&mut bytes, false);
-        begin_struct(&mut proto);
-        for id in [4, 2556, 118] {
-            field(&mut proto, TType::Struct, id);
-            begin_struct(&mut proto);
-        }
-        value(&mut proto);
-        for _ in 0..4 {
-            proto.write_field_stop().unwrap();
-        }
-        bytes
-    }
-
     type Found<'a> = (u64, Option<&'a [(i32, u64)]>);
 
     fn located(users: &[Found<'_>]) -> Vec<u8> {
-        mval(|p| {
-            field(p, TType::Struct, 26900);
-            begin_struct(p);
-            field(p, TType::Map, 1);
-            p.write_map_begin(&TMapIdentifier::new(
-                TType::I64,
-                TType::Struct,
-                users.len() as i32,
-            ))
-            .unwrap();
-            for &(user, place_map) in users {
-                p.write_i64(user.cast_signed()).unwrap();
-                begin_struct(p);
-                field(p, TType::I64, 1);
-                p.write_i64(user.cast_signed()).unwrap();
-                if let Some(place_map) = place_map {
-                    field(p, TType::Map, 5);
-                    p.write_map_begin(&TMapIdentifier::new(
-                        TType::I32,
-                        TType::Set,
-                        place_map.len() as i32,
-                    ))
-                    .unwrap();
-                    for &(place_type, id) in place_map {
-                        p.write_i32(place_type).unwrap();
-                        p.write_set_begin(&TSetIdentifier::new(TType::I64, 1))
-                            .unwrap();
-                        p.write_i64(id.cast_signed()).unwrap();
-                    }
-                }
-                field(p, TType::I64, 4);
-                p.write_i64(1).unwrap();
-                p.write_field_stop().unwrap();
-            }
-            p.write_field_stop().unwrap();
-        })
-    }
-
-    fn strato_error(code: i32, reason: &str) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut proto = TBinaryOutputProtocol::new(&mut bytes, false);
-        begin_struct(&mut proto);
-        field(&mut proto, TType::Struct, 4);
-        begin_struct(&mut proto);
-        field(&mut proto, TType::Struct, 4421);
-        begin_struct(&mut proto);
-        field(&mut proto, TType::I32, -21011);
-        proto.write_i32(code).unwrap();
-        field(&mut proto, TType::String, -28092);
-        proto.write_string(reason).unwrap();
-        for _ in 0..3 {
-            proto.write_field_stop().unwrap();
-        }
-        bytes
+        let id = |id: u64| I64(id.cast_signed());
+        let users = users.iter().map(|&(user, place_map)| {
+            let place_map = place_map.map(|place_map| {
+                let places = place_map.iter().map(|&(place_type, place)| {
+                    (I32(place_type), Set(TType::I64, vec![id(place)]))
+                });
+                (5, Map(TType::I32, TType::Set, places.collect()))
+            });
+            let fields = [(1, id(user))]
+                .into_iter()
+                .chain(place_map)
+                .chain([(4, I64(1))]);
+            (id(user), Struct(fields.collect()))
+        });
+        found(Struct(vec![(
+            1,
+            Map(TType::I64, TType::Struct, users.collect()),
+        )]))
     }
 
     #[test]
@@ -325,12 +251,7 @@ mod tests {
                 located(&[(OTHER_USER, Some(&[(CITY, 11)]))]),
             ),
             ("found without a place map", located(&[(USER, None)])),
-            (
-                "no value",
-                mval(|p| {
-                    field(p, TType::Void, 9048);
-                }),
-            ),
+            ("no value", no_row()),
         ] {
             assert_eq!(
                 decode_places(&response, USER).unwrap(),

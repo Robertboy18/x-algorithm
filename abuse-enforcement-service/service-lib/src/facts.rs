@@ -189,7 +189,12 @@ impl ScoreFacts {
         let labels = score
             .summary
             .as_ref()
-            .map(|s| s.labels.clone())
+            .map(|s| {
+                s.labels
+                    .iter()
+                    .map(|l| crate::action_control::strip_dry_run_prefix(l).to_owned())
+                    .collect()
+            })
             .unwrap_or_default();
         Self {
             model_version: take_string("model_version"),

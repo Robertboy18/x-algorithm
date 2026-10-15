@@ -246,22 +246,29 @@ class CutedslRankerVarlenAttention(CustomAttention):
     def sharded_custom_op_with_extra_args(self, **kwargs):
         assert isinstance(self.config, RecsysAttentionConfig)
         assert not self.config.causal, "CuTeDSL FA4 does not support causal attention"
-        assert self.config.attn_logit_cap <= 0, (
-            "The packed CuTeDSL FA4 wrapper does not wire the attn_logit_cap score_mod "
-            f"(got attn_logit_cap={self.config.attn_logit_cap}); use qk_norm=True, or "
-            "cutedsl_ranker_attn for a capped model"
+        has_cap = self.config.attn_logit_cap > 0 and self.config.attn_logit_cap_method != "none"
+        assert self.config.qk_norm or has_cap, (
+            "CuTeDSL FA4 needs logit stabilisation: qk_norm=True or attn_logit_cap > 0"
         )
-        assert self.config.qk_norm, "CuTeDSL FA4 requires qk_norm=True for stable training"
         from xrex.utils.gpu import GpuArch, gpu_arch
 
         arch = gpu_arch()
         assert arch in (GpuArch.A100, GpuArch.H100, GpuArch.GB200, GpuArch.GB300), (
             f"CuTeDSL ranker varlen attention requires A100, H100, GB200 or GB300 (got {arch})"
         )
+        assert not (has_cap and arch == GpuArch.A100), (
+            "CuTeDSL FA4 attn_logit_cap is SM90/SM100 only (SM80 rejects score_mod with block "
+            "sparsity); use qk_norm=True with attn_logit_cap=-1 on A100"
+        )
         sm_scale = self.scale_config.attn_output_scale(self.config.key_size)
+        cap = self.config.attn_logit_cap if has_cap else -1.0
+        cap_method = self.config.attn_logit_cap_method
 
         from xrex.cutedsl.ranker_attention_varlen_fa4 import (
             ranker_attention_varlen_fa4,
+        )
+        from xrex.cutedsl.ranker_candidate_attention_fa4 import (
+            ranker_candidate_attention_fa4,
         )
 
         def sharded_mha(
@@ -285,6 +292,7 @@ class CutedslRankerVarlenAttention(CustomAttention):
             bsp_bwd_diag_idx,
             bsp_valid_block_upper,
             bsp_valid_block_lower,
+            *candidate_region_args,
         ):
             del segment_ids, segment_ids_k, temp
             fwd_bs = (
@@ -303,8 +311,29 @@ class CutedslRankerVarlenAttention(CustomAttention):
                 bsp_bwd_diag_cnt,
                 bsp_bwd_diag_idx,
             )
-            return (
-                ranker_attention_varlen_fa4(
+            if candidate_region_args:
+                assert cap <= 0, (
+                    "attn_logit_cap is not wired into the compact candidate layout "
+                    "(ranker_candidate_attention_fa4); use the regular packed layout"
+                )
+                candidate_cu_seqlens, candidate_token_to_slot, key_starts, key_counts = (
+                    candidate_region_args
+                )
+                attn_out = ranker_candidate_attention_fa4(
+                    q,
+                    k,
+                    v,
+                    sm_scale,
+                    (fwd_bs, bwd_bs),
+                    bsp_valid_block_upper,
+                    bsp_valid_block_lower,
+                    candidate_cu_seqlens[0],
+                    key_starts[0],
+                    key_counts[0],
+                    history_region_len=q.shape[1] - candidate_token_to_slot.shape[-1],
+                )
+            else:
+                attn_out = ranker_attention_varlen_fa4(
                     q,
                     k,
                     v,
@@ -312,9 +341,10 @@ class CutedslRankerVarlenAttention(CustomAttention):
                     block_sparse_layout=(fwd_bs, bwd_bs),
                     valid_block_upper=bsp_valid_block_upper,
                     valid_block_lower=bsp_valid_block_lower,
-                ),
-                None,
-            )
+                    cap=cap,
+                    cap_method=cap_method,
+                )
+            return attn_out, None
 
         def _rep(s):
             return NamedShape(s, ("batch_attn",) + tuple("replicated" for _ in s[1:]))
@@ -336,4 +366,14 @@ class CutedslRankerVarlenAttention(CustomAttention):
             "bsp_valid_block_lower",
         )
         extras = tuple((name, _rep) for name in bsp_names)
+        if kwargs.get("candidate_cu_seqlens") is not None:
+            extras += tuple(
+                (name, _rep)
+                for name in (
+                    "candidate_cu_seqlens",
+                    "candidate_token_to_slot",
+                    "candidate_key_starts",
+                    "candidate_key_counts",
+                )
+            )
         return sharded_mha, extras

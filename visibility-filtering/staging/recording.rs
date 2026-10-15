@@ -1,6 +1,6 @@
 use crate::hydration::batch::Hydrated;
 use crate::hydration::plan::Source;
-use crate::hydration::sources::{Exchange, Id, Observer, Scope, exchange};
+use crate::hydration::sources::{Exchange, Id, Observer, Scope, Visit};
 use crate::models::CommunityModeration;
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -85,33 +85,9 @@ impl From<Recording> for BTreeMap<String, Kept> {
     }
 }
 
-trait Visit {
-    fn exchange<X: Exchange>(&mut self);
-}
-
-fn visit(source: Source, visitor: &mut impl Visit) {
-    match source {
-        Source::TesPureCore => visitor.exchange::<exchange::TesPureCore>(),
-        Source::TesTweet => visitor.exchange::<exchange::TesTweet>(),
-        Source::TesConversationControl => visitor.exchange::<exchange::TesConversationControl>(),
-        Source::SafetyLabels => visitor.exchange::<exchange::SafetyLabels>(),
-        Source::GizmoduckViewer => visitor.exchange::<exchange::GizmoduckViewer>(),
-        Source::GizmoduckAuthor => visitor.exchange::<exchange::GizmoduckAuthor>(),
-        Source::Flock => visitor.exchange::<exchange::Flock>(),
-        Source::ViewerCountry => visitor.exchange::<exchange::ViewerCountry>(),
-        Source::Wingman => visitor.exchange::<exchange::Wingman>(),
-        Source::CommunityModeration => visitor.exchange::<exchange::CommunityModeration>(),
-        Source::CommunityModerator => visitor.exchange::<exchange::CommunityModerator>(),
-        Source::CommunityViewerRemoved => visitor.exchange::<exchange::CommunityViewerRemoved>(),
-        Source::ArticleLifecycle => visitor.exchange::<exchange::ArticleLifecycle>(),
-        Source::TrustedFriends => visitor.exchange::<exchange::TrustedFriends>(),
-        Source::UserLocation => visitor.exchange::<exchange::UserLocation>(),
-    }
-}
-
 fn visit_all<V: Visit>(mut visitor: V) -> V {
     for &source in Source::VARIANTS {
-        visit(source, &mut visitor);
+        source.visit(&mut visitor);
     }
     visitor
 }
@@ -297,10 +273,12 @@ mod replay {
     use crate::hydration::batch::{HydrationBatch, HydrationError, RawHydrationBatch};
     use crate::hydration::community_source::CommunityPost;
     use crate::hydration::sources::{
-        Bytes, DecodedAuthor, DecodedViewer, EdgeKey, Sources, author_batch, core_batch,
-        country_batch, label_batch, lifecycle_batch, tweet_batch, viewer_batch,
+        Answered, Bytes, DecodedAuthor, DecodedViewer, EdgeKey, Observed, Sources, author_batch,
+        core_batch, country_batch, exchange, label_batch, lifecycle_batch, tweet_batch,
+        viewer_batch,
     };
     use crate::models::{ArticleLifecycle, PureCore, TweetFeatures};
+    use crate::post_card::PostCard;
     use prost::Message;
     use std::collections::HashMap;
     use std::hash::Hash;
@@ -345,17 +323,17 @@ mod replay {
         fn batch<X: Exchange>(
             &self,
             keys: impl Iterator<Item = X::Key>,
-        ) -> HydrationBatch<X::Key, X::Wire>
+        ) -> Observed<X, HydrationBatch<X::Key, X::Wire>>
         where
             X::Key: Eq + Hash,
         {
-            HydrationBatch::from_hydrated(
+            Observed::quiet(HydrationBatch::from_hydrated(
                 keys.map(|key| {
                     let answer = self.answer::<X>(&key);
                     (key, answer)
                 })
                 .collect(),
-            )
+            ))
         }
 
                                 fn found<X: Exchange<Key = u64>>(
@@ -401,25 +379,38 @@ mod replay {
 
     #[tonic::async_trait]
     impl Sources for Replay {
-        async fn pure_cores(&self, tweet_ids: &[u64]) -> RawHydrationBatch<PureCore> {
-            core_batch(self.batch::<exchange::TesPureCore>(tweet_ids.iter().copied()))
+        async fn pure_cores(
+            &self,
+            tweet_ids: &[u64],
+        ) -> Answered<exchange::TesPureCoreData, PureCore> {
+            self.batch::<exchange::TesPureCoreData>(tweet_ids.iter().copied())
+                .map(core_batch)
         }
 
-        async fn tweets(&self, tweet_ids: &[u64]) -> RawHydrationBatch<TweetFeatures> {
-            tweet_batch(tweet_ids, self.found::<exchange::TesTweet>(tweet_ids))
+        async fn conversation_roots(
+            &self,
+            root_ids: &[u64],
+        ) -> Answered<exchange::TesConversationRoot, PureCore> {
+            self.batch::<exchange::TesConversationRoot>(root_ids.iter().copied())
+                .map(core_batch)
+        }
+
+        async fn tweets(&self, tweet_ids: &[u64]) -> Answered<exchange::TesTweet, TweetFeatures> {
+            let tweets = self.found::<exchange::TesTweet>(tweet_ids);
+            Observed::quiet(tweet_batch(tweet_ids, tweets))
         }
 
         async fn conversation_controls(
             &self,
             tweet_ids: &[u64],
-        ) -> RawHydrationBatch<ConversationControl> {
+        ) -> Answered<exchange::TesConversationControl, ConversationControl> {
             self.batch::<exchange::TesConversationControl>(tweet_ids.iter().copied())
         }
 
         async fn safety_labels(
             &self,
             tweet_ids: &[u64],
-        ) -> RawHydrationBatch<Arc<vf_pb::SafetyLabelMap>> {
+        ) -> Answered<exchange::SafetyLabels, Arc<vf_pb::SafetyLabelMap>> {
             let labels = self
                 .found::<exchange::SafetyLabels>(tweet_ids)
                 .into_iter()
@@ -430,62 +421,64 @@ mod replay {
                     (id, labels)
                 })
                 .collect();
-            label_batch(tweet_ids, labels)
+            Observed::quiet(label_batch(tweet_ids, labels))
         }
 
         async fn viewer(
             &self,
             viewer_id: u64,
             fields: &[QueryFields],
-        ) -> RawHydrationBatch<DecodedViewer> {
+        ) -> Answered<exchange::GizmoduckViewer, DecodedViewer> {
             self.asked::<exchange::GizmoduckViewer>(fields);
             let viewer = result(self.answer::<exchange::GizmoduckViewer>(&viewer_id));
-            viewer_batch(viewer_id, viewer, fields)
+            Observed::quiet(viewer_batch(viewer_id, viewer, fields))
         }
 
         async fn users(
             &self,
             user_ids: &[u64],
             fields: &[QueryFields],
-        ) -> RawHydrationBatch<DecodedAuthor> {
+        ) -> Answered<exchange::GizmoduckAuthor, DecodedAuthor> {
             self.asked::<exchange::GizmoduckAuthor>(fields);
-            author_batch(self.batch::<exchange::GizmoduckAuthor>(user_ids.iter().copied()))
+            self.batch::<exchange::GizmoduckAuthor>(user_ids.iter().copied())
+                .map(author_batch)
         }
 
         async fn select_edges(
             &self,
             _viewer_id: u64,
             queries: &[EdgeQuery],
-        ) -> Vec<RawHydrationBatch<bool>> {
-            queries
-                .iter()
-                .map(|query| {
-                    let answers = query.destination_ids.iter().map(|&destination| {
-                        let key = EdgeKey::of(query, destination);
-                        (destination, self.answer::<exchange::Flock>(&key))
-                    });
-                    HydrationBatch::from_hydrated(answers.collect())
-                })
-                .collect()
+        ) -> Observed<exchange::Flock, Vec<RawHydrationBatch<bool>>> {
+            let batches = queries.iter().map(|query| {
+                let answers = query.destination_ids.iter().map(|&destination| {
+                    let key = EdgeKey::of(query, destination);
+                    (destination, self.answer::<exchange::Flock>(&key))
+                });
+                HydrationBatch::from_hydrated(answers.collect())
+            });
+            Observed::quiet(batches.collect())
         }
 
-        async fn viewer_country(&self, viewer_id: u64) -> RawHydrationBatch<Arc<str>> {
+        async fn viewer_country(
+            &self,
+            viewer_id: u64,
+        ) -> Answered<exchange::ViewerCountry, Arc<str>> {
             let country = result(self.answer::<exchange::ViewerCountry>(&viewer_id));
-            country_batch(viewer_id, country)
+            Observed::quiet(country_batch(viewer_id, country))
         }
 
         async fn second_degree(
             &self,
             _viewer_id: u64,
             root_author_ids: &[u64],
-        ) -> RawHydrationBatch<bool> {
+        ) -> Answered<exchange::Wingman, bool> {
             self.batch::<exchange::Wingman>(root_author_ids.iter().copied())
         }
 
         async fn community_moderations(
             &self,
             posts: &[CommunityPost],
-        ) -> RawHydrationBatch<CommunityModeration> {
+        ) -> Answered<exchange::CommunityModeration, CommunityModeration> {
             self.batch::<exchange::CommunityModeration>(posts.iter().map(|post| post.tweet_id))
         }
 
@@ -493,7 +486,7 @@ mod replay {
             &self,
             _viewer_id: u64,
             community_ids: &[u64],
-        ) -> RawHydrationBatch<bool> {
+        ) -> Answered<exchange::CommunityModerator, bool> {
             self.batch::<exchange::CommunityModerator>(community_ids.iter().copied())
         }
 
@@ -501,22 +494,39 @@ mod replay {
             &self,
             _viewer_id: u64,
             community_ids: &[u64],
-        ) -> RawHydrationBatch<bool> {
+        ) -> Answered<exchange::CommunityViewerRemoved, bool> {
             self.batch::<exchange::CommunityViewerRemoved>(community_ids.iter().copied())
+        }
+
+        async fn article_media_entities(
+            &self,
+            _viewer_id: Option<u64>,
+            article_ids: &[u64],
+        ) -> Answered<exchange::ArticleMediaEntities, bool> {
+            self.batch::<exchange::ArticleMediaEntities>(article_ids.iter().copied())
+        }
+
+        async fn article_cover_media(
+            &self,
+            _viewer_id: Option<u64>,
+            article_ids: &[u64],
+        ) -> Answered<exchange::ArticleCoverMedia, bool> {
+            self.batch::<exchange::ArticleCoverMedia>(article_ids.iter().copied())
         }
 
         async fn article_lifecycles(
             &self,
             article_ids: &[u64],
-        ) -> RawHydrationBatch<ArticleLifecycle> {
-            lifecycle_batch(self.batch::<exchange::ArticleLifecycle>(article_ids.iter().copied()))
+        ) -> Answered<exchange::ArticleLifecycle, ArticleLifecycle> {
+            self.batch::<exchange::ArticleLifecycle>(article_ids.iter().copied())
+                .map(lifecycle_batch)
         }
 
         async fn trusted_friends(
             &self,
             _viewer_id: u64,
             list_ids: &[u64],
-        ) -> RawHydrationBatch<bool> {
+        ) -> Answered<exchange::TrustedFriends, bool> {
             self.batch::<exchange::TrustedFriends>(list_ids.iter().copied())
         }
 
@@ -524,8 +534,12 @@ mod replay {
             &self,
             _viewer_id: u64,
             place_ids: &[u64],
-        ) -> RawHydrationBatch<bool> {
+        ) -> Answered<exchange::UserLocation, bool> {
             self.batch::<exchange::UserLocation>(place_ids.iter().copied())
+        }
+
+        async fn post_card(&self, _tweet_id: u64) -> Option<PostCard> {
+            None
         }
     }
 
@@ -603,12 +617,10 @@ mod replay {
 mod tests {
     use super::*;
     use crate::clients::socialgraph_client::{EdgeDirection, EdgeQuery, Graph};
-    use crate::filter::{FilterRequest, FilterTweets};
     use crate::hydration::batch::{HydrationError, RawHydrationBatch};
-    use crate::hydration::sources::{Bytes, EdgeKey, InMemorySources, Sources};
-    use crate::models::{ClientCapability, RawCandidate, TweetId, ViewerProfile};
-    use crate::rules::metrics::Rpc;
-    use crate::rules::{RuleEngine, SafetyLevel};
+    use crate::hydration::sources::{Bytes, EdgeKey, InMemorySources, Sources, exchange};
+    use crate::rules::SafetyLevel;
+    use crate::scenario::{Scenario, raw};
     use std::collections::HashMap;
     use std::fmt;
     use xai_core_entities::entities::{
@@ -623,136 +635,29 @@ mod tests {
     #[tokio::test]
     async fn a_call_the_recording_lacks_is_named() {
         let recorder = Arc::new(Recorder::default());
-        recorder.answered::<exchange::TesPureCore>(iter::once((
+        recorder.answered::<exchange::TesPureCoreData>(iter::once((
             1,
             Hydrated::Found(PureCoreData {
                 author_id: 10,
                 ..Default::default()
             }),
         )));
-        let sources = Arc::new(recorder.take().into_replay(Some(50)).unwrap());
-        FilterTweets::new(Arc::<Replay>::clone(&sources), RuleEngine::for_tests())
-            .run(FilterRequest {
-                viewer_id: Some(50),
-                country_code: None,
-                client_capability: ClientCapability::default(),
-                safety_level: SafetyLevel::TimelineHomeHydration,
-                candidates: vec![RawCandidate {
-                    tweet_id: TweetId(1),
-                    request_author_id: None,
-                }],
-                rpc: Rpc::FilterTweets,
-            })
-            .await;
+        let replay = recorder.take().into_replay(Some(50)).unwrap();
+        let scenario = Scenario::new(replay, SafetyLevel::TimelineHomeHydration).viewer(Some(50));
+        scenario.evaluate(&[raw(1, None)]).await;
 
-        assert!(sources.misses().contains(&"tweets/1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn what_the_recorder_observes_replays_as_observed() {
-        const VIEWER: u64 = 50;
-        let paths = [(20, true), (21, false)];
-        let lists = [(7, true), (8, false)];
-        let edges = [
-            (EdgeDirection::Forward, 30, Hydrated::Found(true)),
-            (EdgeDirection::Forward, 31, Hydrated::Found(false)),
-            (EdgeDirection::Reverse, 32, Hydrated::Found(true)),
-            (EdgeDirection::Reverse, 33, Hydrated::Found(false)),
-            (EdgeDirection::Forward, 34, Hydrated::Partial(false)),
-        ];
-        let query = |direction, destination| EdgeQuery {
-            graph: Graph::Follows,
-            direction,
-            destination_ids: vec![destination],
-        };
-        let recorder = Arc::new(Recorder::default());
-        recorder.answered::<exchange::TesPureCore>(iter::once((1, Hydrated::NotFound)));
-        recorder.answered::<exchange::TesConversationControl>(iter::once((1, Hydrated::NotFound)));
-        recorder.answered::<exchange::GizmoduckAuthor>(iter::once((10, Hydrated::NotFound)));
-        recorder.answered::<exchange::GizmoduckViewer>(iter::once((VIEWER, Hydrated::NotFound)));
-        recorder.answered::<exchange::ViewerCountry>(iter::once((
-            VIEWER,
-            Hydrated::Found("us".to_owned()),
-        )));
-        recorder.answered::<exchange::Wingman>(
-            paths
-                .into_iter()
-                .map(|(root, path)| (root, Hydrated::Found(path))),
+        assert!(
+            scenario
+                .sources()
+                .misses()
+                .contains(&"tweets/1".to_string())
         );
-        recorder.answered::<exchange::TrustedFriends>(
-            lists
-                .into_iter()
-                .map(|(list, holds)| (list, Hydrated::Found(holds))),
-        );
-        recorder.answered::<exchange::Flock>(edges.iter().map(
-            |(direction, destination, answer)| {
-                (
-                    EdgeKey::of(&query(*direction, *destination), *destination),
-                    answer.clone(),
-                )
-            },
-        ));
-        let recording: Recording =
-            serde_json::from_value(serde_json::to_value(recorder.take()).unwrap()).unwrap();
-        assert_eq!(recording.unsuccessful(), Vec::<String>::new());
-        let sources = recording.into_replay(Some(VIEWER)).unwrap();
-
-        assert!(matches!(
-            sources.pure_cores(&[1]).await.hydrated(&1),
-            Some(Hydrated::NotFound)
-        ));
-        assert!(matches!(
-            sources.conversation_controls(&[1]).await.hydrated(&1),
-            Some(Hydrated::NotFound)
-        ));
-        assert!(matches!(
-            sources.users(&[10], &[]).await.hydrated(&10),
-            Some(Hydrated::NotFound)
-        ));
-        assert!(matches!(
-            Sources::viewer(&sources, VIEWER, &[]).await.hydrated(&VIEWER),
-            Some(Hydrated::Found(viewer)) if viewer.profile == ViewerProfile::default()
-        ));
-        assert_eq!(
-            sources.viewer_country(VIEWER).await.hydrated(&VIEWER),
-            Some(&Hydrated::Found(Arc::from("us")))
-        );
-        for (root, path) in paths {
-            assert_eq!(
-                sources.second_degree(VIEWER, &[root]).await.hydrated(&root),
-                Some(&Hydrated::Found(path)),
-                "second_degree/{root}"
-            );
-        }
-        for (list, holds) in lists {
-            assert_eq!(
-                sources
-                    .trusted_friends(VIEWER, &[list])
-                    .await
-                    .hydrated(&list),
-                Some(&Hydrated::Found(holds)),
-                "trusted_friends/{list}"
-            );
-        }
-        for (direction, destination, answer) in edges {
-            let answers = sources
-                .select_edges(VIEWER, &[query(direction, destination)])
-                .await;
-            assert_eq!(
-                answers
-                    .first()
-                    .and_then(|batch| batch.hydrated(&destination)),
-                Some(&answer),
-                "{direction:?}/{destination}"
-            );
-        }
-        assert_eq!(sources.misses(), Vec::<String>::new());
     }
 
     #[test]
     fn every_answer_a_fallback_cache_could_replace_is_unsuccessful() {
         let recorder = Arc::new(Recorder::default());
-        recorder.answered::<exchange::TesPureCore>(
+        recorder.answered::<exchange::TesPureCoreData>(
             [(1, failed()), (2, Hydrated::NotFound)].into_iter(),
         );
         recorder.answered::<exchange::TesTweet>(iter::once((1, failed())));
@@ -775,32 +680,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_logged_out_recording_holds_no_viewer_keyed_answer() {
-        let recorder = Arc::new(Recorder::default());
-        recorder.answered::<exchange::TesPureCore>(iter::once((1, Hydrated::NotFound)));
-        let logged_out = recorder.take();
-        recorder.answered::<exchange::GizmoduckViewer>(iter::once((50, Hydrated::NotFound)));
-        let planted = logged_out.clone().with_shared(&recorder.take());
-
-        assert!(logged_out.into_replay(None).is_ok());
-        assert!(planted.clone().into_replay(Some(50)).is_ok());
-        assert_eq!(
-            planted.into_replay(None).err().map(|e| e.to_string()),
-            Some(r#"a logged-out recording holds viewer-keyed ["viewers"]"#.to_owned())
-        );
-    }
-
     mod completeness {
         use super::*;
         use crate::clients::about_this_account_client::AboutThisAccountClient;
         use crate::clients::article_client::ArticleClient;
+        use crate::clients::gizmoduck_client::GizmoduckLookup;
         use crate::clients::socialgraph_client::SocialgraphClient;
-        use crate::clients::trusted_friends_client::TrustedFriendsClient;
-        use crate::clients::user_location_client::UserLocationClient;
+        use crate::clients::strato_answer::{Thrift, found, no_row};
+        use crate::clients::trusted_friends_client::{self, TrustedFriendsClient};
+        use crate::clients::user_location_client::{self, UserLocationClient};
         use crate::clients::wingman_client::WingmanClient;
         use crate::hydration::community_source::{CommunityPost, CommunitySource};
-        use crate::hydration::sources::{ProdSources, control};
+        use crate::hydration::sources::{Backends, ProdSources, control};
         use crate::hydration::tweet_source::TweetSource;
         use crate::safety_label_source::SafetyLabelSource;
         use crate::safety_label_source::lookup::{
@@ -810,11 +701,9 @@ mod tests {
         use rustc_hash::FxHashMap;
         use std::any::TypeId;
         use std::collections::HashSet;
+        use std::fmt::Write as _;
         use std::hash::Hash;
-        use thrift::protocol::{
-            TBinaryOutputProtocol, TFieldIdentifier, TListIdentifier, TOutputProtocol,
-            TStructIdentifier, TType,
-        };
+        use thrift::protocol::TType;
         use tonic::metadata::MetadataMap;
         use tonic::{Request, Response, Status};
         use tower::ServiceExt;
@@ -906,75 +795,215 @@ mod tests {
             answers
         }
 
-                        macro_rules! failing_tes {
-            ($($method:ident => $value:ty),* $(,)?) => {
-                #[tonic::async_trait]
-                impl TESClient for Failing<MockTESClient> {
-                    $(
-                        async fn $method(
-                            &self,
-                            ids: Vec<u64>,
-                        ) -> HashMap<u64, anyhow::Result<Option<$value>>> {
-                            failing(self.0.$method(ids).await, |id| id)
-                        }
-                    )*
+        #[tonic::async_trait]
+        impl TESClient for Failing<MockTESClient> {
+            async fn get_tweet_core_datas(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<PureCoreData>>> {
+                failing(self.0.get_tweet_core_datas(ids).await, |id| id)
+            }
 
-                    async fn get_core_data_and_api_counts(
-                        &self,
-                        tweet_id: u64,
-                    ) -> (
-                        anyhow::Result<Option<PureCoreData>>,
-                        anyhow::Result<Option<ApiCounts>>,
-                    ) {
-                        self.0.get_core_data_and_api_counts(tweet_id).await
-                    }
+            async fn get_tweet_media_entities(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<MediaEntities>>> {
+                failing(self.0.get_tweet_media_entities(ids).await, |id| id)
+            }
 
-                    async fn get_status_perspectives(
-                        &self,
-                        ids: Vec<u64>,
-                        metadata: Option<&MetadataMap>,
-                    ) -> HashMap<u64, anyhow::Result<Option<ApiPerspective>>> {
-                        failing(self.0.get_status_perspectives(ids, metadata).await, |id| id)
-                    }
+            async fn get_subscription_author_ids(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<u64>>> {
+                failing(self.0.get_subscription_author_ids(ids).await, |id| id)
+            }
 
-                    async fn get_api_media_entities(
-                        &self,
-                        ids: Vec<u64>,
-                        metadata: Option<&MetadataMap>,
-                    ) -> HashMap<u64, anyhow::Result<Option<Vec<ApiMediaEntity>>>> {
-                        failing(self.0.get_api_media_entities(ids, metadata).await, |id| id)
-                    }
-                }
-            };
-        }
+            async fn get_conversation_controls(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<ConversationControl>>> {
+                failing(self.0.get_conversation_controls(ids).await, |id| id)
+            }
 
-        failing_tes! {
-            get_tweet_core_datas => PureCoreData,
-            get_tweet_media_entities => MediaEntities,
-            get_subscription_author_ids => u64,
-            get_conversation_controls => ConversationControl,
-            get_quoted_tweets => QuotedTweet,
-            get_reaction_context => ReactionContext,
-            get_min_video_durations => i64,
-            get_media_count => i64,
-            get_nullcast => bool,
-            get_community => i64,
-            get_nsfw_user => bool,
-            get_nsfw_admin => bool,
-            get_has_takedown => bool,
-            get_takedown_country_codes => Vec<String>,
-            get_takedown_reasons => Vec<TakedownReason>,
-            get_language_code => String,
-            get_api_counts => ApiCounts,
-            get_is_article => bool,
-            get_is_premium => bool,
-            get_urls => UrlEntities,
-            get_cashtag_attachments => CashtagAttachments,
-            get_exclusive_controls => ExclusiveTweetControl,
-            get_trusted_friends_controls => TrustedFriendsControl,
-            get_grok_post_ids => String,
-            get_edit_control => EditControl,
-            get_escherbird_entity_annotations => Vec<EscherbirdEntityAnnotation>,
+            async fn get_quoted_tweets(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<QuotedTweet>>> {
+                failing(self.0.get_quoted_tweets(ids).await, |id| id)
+            }
+
+            async fn get_reaction_context(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<ReactionContext>>> {
+                failing(self.0.get_reaction_context(ids).await, |id| id)
+            }
+
+            async fn get_min_video_durations(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<i64>>> {
+                failing(self.0.get_min_video_durations(ids).await, |id| id)
+            }
+
+            async fn get_media_count(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<i64>>> {
+                failing(self.0.get_media_count(ids).await, |id| id)
+            }
+
+            async fn get_nullcast(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_nullcast(ids).await, |id| id)
+            }
+
+            async fn get_community(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<i64>>> {
+                failing(self.0.get_community(ids).await, |id| id)
+            }
+
+            async fn get_nsfw_user(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_nsfw_user(ids).await, |id| id)
+            }
+
+            async fn get_nsfw_admin(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_nsfw_admin(ids).await, |id| id)
+            }
+
+            async fn get_has_takedown(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_has_takedown(ids).await, |id| id)
+            }
+
+            async fn get_takedown_country_codes(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<Vec<String>>>> {
+                failing(self.0.get_takedown_country_codes(ids).await, |id| id)
+            }
+
+            async fn get_takedown_reasons(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<Vec<TakedownReason>>>> {
+                failing(self.0.get_takedown_reasons(ids).await, |id| id)
+            }
+
+            async fn get_language_code(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<String>>> {
+                failing(self.0.get_language_code(ids).await, |id| id)
+            }
+
+            async fn get_api_counts(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<ApiCounts>>> {
+                failing(self.0.get_api_counts(ids).await, |id| id)
+            }
+
+            async fn get_is_article(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_is_article(ids).await, |id| id)
+            }
+
+            async fn get_is_premium(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<bool>>> {
+                failing(self.0.get_is_premium(ids).await, |id| id)
+            }
+
+            async fn get_urls(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<UrlEntities>>> {
+                failing(self.0.get_urls(ids).await, |id| id)
+            }
+
+            async fn get_cashtag_attachments(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<CashtagAttachments>>> {
+                failing(self.0.get_cashtag_attachments(ids).await, |id| id)
+            }
+
+            async fn get_exclusive_controls(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<ExclusiveTweetControl>>> {
+                failing(self.0.get_exclusive_controls(ids).await, |id| id)
+            }
+
+            async fn get_trusted_friends_controls(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<TrustedFriendsControl>>> {
+                failing(self.0.get_trusted_friends_controls(ids).await, |id| id)
+            }
+
+            async fn get_grok_post_ids(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<String>>> {
+                failing(self.0.get_grok_post_ids(ids).await, |id| id)
+            }
+
+            async fn get_edit_control(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<EditControl>>> {
+                failing(self.0.get_edit_control(ids).await, |id| id)
+            }
+
+            async fn get_escherbird_entity_annotations(
+                &self,
+                ids: Vec<u64>,
+            ) -> HashMap<u64, anyhow::Result<Option<Vec<EscherbirdEntityAnnotation>>>> {
+                failing(self.0.get_escherbird_entity_annotations(ids).await, |id| id)
+            }
+
+            async fn get_core_data_and_api_counts(
+                &self,
+                tweet_id: u64,
+            ) -> (
+                anyhow::Result<Option<PureCoreData>>,
+                anyhow::Result<Option<ApiCounts>>,
+            ) {
+                self.0.get_core_data_and_api_counts(tweet_id).await
+            }
+
+            async fn get_status_perspectives(
+                &self,
+                ids: Vec<u64>,
+                metadata: Option<&MetadataMap>,
+            ) -> HashMap<u64, anyhow::Result<Option<ApiPerspective>>> {
+                failing(self.0.get_status_perspectives(ids, metadata).await, |id| id)
+            }
+
+            async fn get_api_media_entities(
+                &self,
+                ids: Vec<u64>,
+                metadata: Option<&MetadataMap>,
+            ) -> HashMap<u64, anyhow::Result<Option<Vec<ApiMediaEntity>>>> {
+                failing(self.0.get_api_media_entities(ids, metadata).await, |id| id)
+            }
         }
 
         type Users = HashMap<i64, anyhow::Result<Option<GizmoduckUserResult>>>;
@@ -1042,61 +1071,6 @@ mod tests {
         }
 
         struct Fake;
-
-        #[tonic::async_trait]
-        impl AboutThisAccountClient for Fake {
-            async fn tfe_top_country(&self, viewer_id: u64) -> anyhow::Result<Option<String>> {
-                match viewer_id {
-                    MISSING => Ok(None),
-                    FAILED => Err(anyhow!("country of {viewer_id} fails")),
-                    _ => Ok(Some("us".to_owned())),
-                }
-            }
-        }
-
-        #[tonic::async_trait]
-        impl ArticleClient for Fake {
-            async fn lifecycles(&self, ids: &[u64]) -> HashMap<u64, anyhow::Result<Option<i32>>> {
-                const SOFT_DELETED: i32 = 2;
-                ids.iter()
-                    .map(|&id| {
-                        let lifecycle = match id {
-                            MISSING => Ok(None),
-                            FAILED => Err(anyhow!("article {id} fails")),
-                            _ => Ok(Some(SOFT_DELETED)),
-                        };
-                        (id, lifecycle)
-                    })
-                    .collect()
-            }
-        }
-
-        #[tonic::async_trait]
-        impl TrustedFriendsClient for Fake {
-            async fn batch_is_member_or_owner(
-                &self,
-                _: u64,
-                ids: &[u64],
-            ) -> Vec<anyhow::Result<bool>> {
-                ids.iter()
-                    .map(|&id| match id {
-                        MISSING => Ok(false),
-                        FAILED => Err(anyhow!("list {id} fails")),
-                        _ => Ok(true),
-                    })
-                    .collect()
-            }
-        }
-
-        #[tonic::async_trait]
-        impl UserLocationClient for Fake {
-            async fn places(&self, user_id: u64) -> anyhow::Result<HashSet<u64>> {
-                match user_id {
-                    FAILED => Err(anyhow!("location of {user_id} fails")),
-                    _ => Ok(HashSet::from([PLACE])),
-                }
-            }
-        }
 
         #[tonic::async_trait]
         impl WingmanClient for Fake {
@@ -1174,125 +1148,73 @@ mod tests {
             }
         }
 
-        enum Thrift {
-            Struct(Vec<(i16, Thrift)>),
-            Bool(bool),
-            I64(u64),
-            I64s(Vec<u64>),
-            Str(String),
-        }
-
-        impl Thrift {
-            fn kind(&self) -> TType {
-                match self {
-                    Self::Struct(_) => TType::Struct,
-                    Self::Bool(_) => TType::Bool,
-                    Self::I64(_) => TType::I64,
-                    Self::I64s(_) => TType::List,
-                    Self::Str(_) => TType::String,
-                }
-            }
-
-            fn write(&self, proto: &mut dyn TOutputProtocol) {
-                match self {
-                    Self::Struct(fields) => {
-                        proto
-                            .write_struct_begin(&TStructIdentifier::new(""))
-                            .unwrap();
-                        for (id, value) in fields {
-                            proto
-                                .write_field_begin(&TFieldIdentifier::new("", value.kind(), *id))
-                                .unwrap();
-                            value.write(proto);
-                            proto.write_field_end().unwrap();
-                        }
-                        proto.write_field_stop().unwrap();
-                        proto.write_struct_end().unwrap();
-                    }
-                    Self::Bool(value) => proto.write_bool(*value).unwrap(),
-                    Self::I64(value) => proto.write_i64(value.cast_signed()).unwrap(),
-                    Self::I64s(values) => {
-                        let len = i32::try_from(values.len()).unwrap();
-                        proto
-                            .write_list_begin(&TListIdentifier::new(TType::I64, len))
-                            .unwrap();
-                        for value in values {
-                            proto.write_i64(value.cast_signed()).unwrap();
-                        }
-                        proto.write_list_end().unwrap();
-                    }
-                    Self::Str(value) => proto.write_string(value).unwrap(),
-                }
-            }
-        }
-
-                fn mval(value: Option<Thrift>) -> Vec<u8> {
-            let value = value.map(|value| (118, Thrift::Struct(vec![(26900, value)])));
-            let envelope = [2556, 4]
-                .into_iter()
-                .fold(Thrift::Struct(value.into_iter().collect()), |inner, id| {
-                    Thrift::Struct(vec![(id, inner)])
-                });
-            let mut bytes = vec![];
-            envelope.write(&mut TBinaryOutputProtocol::new(&mut bytes, false));
-            bytes
+        fn id(id: u64) -> Thrift {
+            Thrift::I64(id.cast_signed())
         }
 
         fn tweet() -> Thrift {
-            use Thrift::{Bool, I64, I64s, Str, Struct};
+            use Thrift::{Bool, List, Str, Struct};
+            let ids = |ids: &[u64]| List(TType::I64, ids.iter().copied().map(id).collect());
             let core_data = Struct(vec![
-                (1, I64(CORE_AUTHOR)),
+                (1, id(CORE_AUTHOR)),
                 (
                     5,
                     Struct(vec![
-                        (1, I64(CORE_REPLIED_TWEET)),
-                        (2, I64(CORE_REPLIED_AUTHOR)),
+                        (1, id(CORE_REPLIED_TWEET)),
+                        (2, id(CORE_REPLIED_AUTHOR)),
                     ]),
                 ),
-                (6, Struct(vec![(1, I64(DIRECTED_AT))])),
+                (6, Struct(vec![(1, id(DIRECTED_AT))])),
                 (
                     7,
                     Struct(vec![
-                        (1, I64(CORE_SOURCE_TWEET)),
-                        (2, I64(CORE_SOURCE_AUTHOR)),
-                        (3, I64(PARENT_TWEET)),
+                        (1, id(CORE_SOURCE_TWEET)),
+                        (2, id(CORE_SOURCE_AUTHOR)),
+                        (3, id(PARENT_TWEET)),
                     ]),
                 ),
                 (9, Bool(true)),
-                (14, I64(CORE_CONVERSATION)),
+                (14, id(CORE_CONVERSATION)),
             ]);
             Struct(vec![
-                (1, I64(TWEET_AS_ANSWERED)),
+                (1, id(TWEET_AS_ANSWERED)),
                 (2, core_data),
-                (
-                    125,
-                    Struct(vec![(1, I64s(vec![COMMUNITY, SECOND_COMMUNITY]))]),
-                ),
-                (155, Struct(vec![(1, I64(EXCLUSIVE_AUTHOR))])),
-                (156, Struct(vec![(1, I64(CIRCLE))])),
+                (125, Struct(vec![(1, ids(&[COMMUNITY, SECOND_COMMUNITY]))])),
+                (155, Struct(vec![(1, id(EXCLUSIVE_AUTHOR))])),
+                (156, Struct(vec![(1, id(CIRCLE))])),
                 (
                     157,
                     Struct(vec![(
                         2,
                         Struct(vec![
-                            (1, I64(INITIAL_TWEET)),
-                            (2, Struct(vec![(1, I64s(vec![EDIT_TWEET]))])),
+                            (1, id(INITIAL_TWEET)),
+                            (2, Struct(vec![(1, ids(&[EDIT_TWEET]))])),
                         ]),
                     )]),
                 ),
-                (170, Struct(vec![(1, I64(ARTICLE))])),
+                (170, Struct(vec![(1, id(ARTICLE))])),
                 (172, Struct(vec![(1, Str(format!("{PLACE:x}")))])),
             ])
         }
 
+        fn located() -> Thrift {
+            use Thrift::{I32, Map, Set, Struct};
+            const CITY: i32 = 3;
+            let places = vec![(I32(CITY), Set(TType::I64, vec![id(PLACE)]))];
+            let viewer = Struct(vec![
+                (1, id(VIEWER)),
+                (5, Map(TType::I32, TType::Set, places)),
+            ]);
+            let found = Map(TType::I64, TType::Struct, vec![(id(VIEWER), viewer)]);
+            Struct(vec![(1, found)])
+        }
+
         fn second_tweet() -> Thrift {
-            use Thrift::{I64s, Struct};
+            use Thrift::{List, Struct};
+            let edits = List(TType::I64, vec![id(SECOND_EDIT_TWEET)]);
             Struct(vec![
                 (2, Struct(vec![])),
-                (
-                    157,
-                    Struct(vec![(1, Struct(vec![(1, I64s(vec![SECOND_EDIT_TWEET]))]))]),
-                ),
+                (157, Struct(vec![(1, Struct(vec![(1, edits)]))])),
             ])
         }
 
@@ -1304,9 +1226,17 @@ mod tests {
                 &self,
                 request: Request<Issue3>,
             ) -> Result<Response<ResultList>, Status> {
-                use Thrift::{Bool, Struct};
-                fn asks(call: &Call3, id: u64) -> bool {
-                    let key = xai_strato::encode(&(id, ()));
+                use Thrift::{Bool, I32, I64, Set, Str, Struct};
+                const SOFT_DELETED: i32 = 2;
+                                                fn asks(call: &Call3, id: u64) -> bool {
+                    let key = match call.path.as_str() {
+                        "trusted-friends/visibility-filtering/isMember.TrustedFriendsList"
+                        | "trusted-friends/visibility-filtering/isOwner.TrustedFriendsList" => {
+                            trusted_friends_client::key(id, VIEWER)
+                        }
+                        "geo/service/userLocation" => user_location_client::key(id),
+                        _ => xai_strato::encode(&(id, ())),
+                    };
                     call.args.first().is_some_and(|asked| *asked == key)
                 }
                 let results = request
@@ -1341,10 +1271,29 @@ mod tests {
                                 Some(Struct(vec![(1, Struct(vec![(4, Bool(true))]))]))
                             }
                             "communities/isRemoved.Community" => Some(Bool(true)),
+                            "about_this_account/tfe_top_country.User" => {
+                                Some(Struct(vec![(2, Struct(vec![(1, Str("us".to_owned()))]))]))
+                            }
+                            "article/fields/mediaEntities.ArticleEntity" => Some(Set(
+                                TType::Struct,
+                                vec![Struct(vec![(1, Struct(vec![(1, I64(7)), (2, I64(0))]))])],
+                            )),
+                            "article/fields/coverMedia.ArticleEntity" => {
+                                Some(Struct(vec![(1, Struct(vec![(1, I64(7)), (2, I64(0))]))]))
+                            }
+                            "article/fields/lifecycleState.ArticleEntity" => {
+                                Some(Struct(vec![(1, I32(SOFT_DELETED))]))
+                            }
+                            "trusted-friends/visibility-filtering/isMember.TrustedFriendsList"
+                            | "trusted-friends/visibility-filtering/isOwner.TrustedFriendsList" => {
+                                Some(Bool(true))
+                            }
+                            "geo/service/userLocation" => Some(located()),
                             path => return Err(Status::unimplemented(path)),
                         };
+                        let answer = value.map_or_else(no_row, found);
                         Ok(xai_strato::strato_proto::Result {
-                            result_type: Some(result::ResultType::Ok(mval(value).into())),
+                            result_type: Some(result::ResultType::Ok(answer.into())),
                         })
                     })
                     .collect::<Result<_, _>>()?;
@@ -1426,28 +1375,26 @@ mod tests {
                 ..Default::default()
             };
             let fake = Arc::new(Fake);
-            ProdSources::new(
-                Arc::new(Failing(tes)),
-                TweetSource {
+            ProdSources::new(Backends {
+                tes: Arc::new(Failing(tes)),
+                tweets: TweetSource {
                     grpc_client: Arc::new(strato()),
                 },
-                Arc::new(Failing(gizmoduck)),
-                Arc::clone(&fake) as _,
-                Arc::clone(&fake) as _,
-                Arc::clone(&fake) as _,
-                Arc::clone(&fake) as _,
-                Arc::clone(&fake) as _,
-                Arc::clone(&fake) as _,
-                Arc::new(SafetyLabelSource::new(
+                gizmoduck: GizmoduckLookup::new(Arc::new(Failing(gizmoduck))),
+                socialgraph: Arc::clone(&fake) as _,
+                about_this_account: AboutThisAccountClient::new(strato()),
+                wingman: Arc::clone(&fake) as _,
+                articles: ArticleClient::new(strato()),
+                trusted_friends: TrustedFriendsClient::new(strato()),
+                user_location: UserLocationClient::new(strato()),
+                safety_labels: Arc::new(SafetyLabelSource::new(
                     Arc::new(RemoteSource::new(Arc::clone(&fake), fake)),
                     None,
                 )),
-                CommunitySource {
+                communities: CommunitySource {
                     grpc_client: strato(),
                 },
-                None,
-                None,
-            )
+            })
         }
 
         fn shown<V: fmt::Debug>(batch: &RawHydrationBatch<V>, keys: &[u64]) -> String {
@@ -1460,21 +1407,28 @@ mod tests {
 
         async fn ask(sources: &dyn Sources, source: Source) -> String {
             match source {
-                Source::TesPureCore => {
+                Source::TesPureCoreData => {
                     let keys = [TWEET, MISSING, FAILED, ABSENT];
-                    shown(&sources.pure_cores(&keys).await, &keys)
+                    shown(&sources.pure_cores(&keys).await.into_inner(), &keys)
+                }
+                Source::TesConversationRoot => {
+                    let keys = [TWEET, MISSING, FAILED, ABSENT];
+                    shown(&sources.conversation_roots(&keys).await.into_inner(), &keys)
                 }
                 Source::TesTweet => {
                     let keys = [TWEET, SECOND_TWEET, MISSING, FAILED, ABSENT];
-                    shown(&sources.tweets(&keys).await, &keys)
+                    shown(&sources.tweets(&keys).await.into_inner(), &keys)
                 }
                 Source::TesConversationControl => {
                     let keys = [TWEET, MISSING, FAILED, ABSENT];
-                    shown(&sources.conversation_controls(&keys).await, &keys)
+                    shown(
+                        &sources.conversation_controls(&keys).await.into_inner(),
+                        &keys,
+                    )
                 }
                 Source::SafetyLabels => {
                     let keys = [TWEET, MISSING, FAILED];
-                    shown(&sources.safety_labels(&keys).await, &keys)
+                    shown(&sources.safety_labels(&keys).await.into_inner(), &keys)
                 }
                 Source::GizmoduckViewer => {
                     let asked = FIELDS
@@ -1486,6 +1440,7 @@ mod tests {
                         let viewer = sources
                             .viewer(viewer_id, fields)
                             .await
+                            .into_inner()
                             .map(|viewer| (viewer.profile, viewer.has_age_verified_18_label));
                         shown_viewers.push(shown(&viewer, &[viewer_id]));
                     }
@@ -1496,7 +1451,8 @@ mod tests {
                         [&[AUTHOR, MISSING, FAILED, ABSENT], &[SUSPENDED_AUTHOR]];
                     let mut shown_authors = vec![];
                     for (authors, fields) in asked.into_iter().zip(FIELDS) {
-                        shown_authors.push(shown(&sources.users(authors, fields).await, authors));
+                        let users = sources.users(authors, fields).await.into_inner();
+                        shown_authors.push(shown(&users, authors));
                     }
                     shown_authors.join(", ")
                 }
@@ -1514,7 +1470,7 @@ mod tests {
                     let failed = vec![query(Graph::Follows, EdgeDirection::Forward, FAILED)];
                     let mut shown_edges = vec![];
                     for queries in [held, failed] {
-                        let batches = sources.select_edges(VIEWER, &queries).await;
+                        let batches = sources.select_edges(VIEWER, &queries).await.into_inner();
                         for (query, batch) in queries.iter().zip(&batches) {
                             shown_edges.push(shown(batch, &query.destination_ids));
                         }
@@ -1524,43 +1480,80 @@ mod tests {
                 Source::ViewerCountry => {
                     let mut shown_countries = vec![];
                     for viewer in [VIEWER, MISSING, FAILED] {
-                        let country = sources.viewer_country(viewer).await;
+                        let country = sources.viewer_country(viewer).await.into_inner();
                         shown_countries.push(shown(&country, &[viewer]));
                     }
                     shown_countries.join(", ")
                 }
                 Source::Wingman => {
                     let keys = [ROOT, MISSING, FAILED];
-                    shown(&sources.second_degree(VIEWER, &keys).await, &keys)
+                    shown(
+                        &sources.second_degree(VIEWER, &keys).await.into_inner(),
+                        &keys,
+                    )
                 }
                 Source::CommunityModeration => {
                     let posts = [POST, MISSING_POST, FAILED_POST];
-                    let batch = sources.community_moderations(&posts).await;
+                    let batch = sources.community_moderations(&posts).await.into_inner();
                     shown(&batch, &posts.map(|post| post.tweet_id))
                 }
                 Source::CommunityModerator => {
                     let keys = [COMMUNITY, MISSING, FAILED];
-                    shown(&sources.community_moderators(VIEWER, &keys).await, &keys)
+                    shown(
+                        &sources
+                            .community_moderators(VIEWER, &keys)
+                            .await
+                            .into_inner(),
+                        &keys,
+                    )
                 }
                 Source::CommunityViewerRemoved => {
                     let keys = [COMMUNITY, MISSING, FAILED];
                     shown(
-                        &sources.community_viewer_removals(VIEWER, &keys).await,
+                        &sources
+                            .community_viewer_removals(VIEWER, &keys)
+                            .await
+                            .into_inner(),
+                        &keys,
+                    )
+                }
+                Source::ArticleMediaEntities => {
+                    let keys = [ARTICLE, MISSING, FAILED];
+                    shown(
+                        &sources
+                            .article_media_entities(Some(VIEWER), &keys)
+                            .await
+                            .into_inner(),
+                        &keys,
+                    )
+                }
+                Source::ArticleCoverMedia => {
+                    let keys = [ARTICLE, MISSING, FAILED];
+                    shown(
+                        &sources
+                            .article_cover_media(Some(VIEWER), &keys)
+                            .await
+                            .into_inner(),
                         &keys,
                     )
                 }
                 Source::ArticleLifecycle => {
                     let keys = [ARTICLE, MISSING, FAILED];
-                    shown(&sources.article_lifecycles(&keys).await, &keys)
+                    shown(&sources.article_lifecycles(&keys).await.into_inner(), &keys)
                 }
                 Source::TrustedFriends => {
                     let keys = [CIRCLE, MISSING, FAILED];
-                    shown(&sources.trusted_friends(VIEWER, &keys).await, &keys)
+                    shown(
+                        &sources.trusted_friends(VIEWER, &keys).await.into_inner(),
+                        &keys,
+                    )
                 }
                 Source::UserLocation => {
                     let keys = [PLACE, MISSING];
-                    let located = shown(&sources.outside_places(VIEWER, &keys).await, &keys);
-                    let failed = shown(&sources.outside_places(FAILED, &[FAILED]).await, &[FAILED]);
+                    let located = sources.outside_places(VIEWER, &keys).await;
+                    let failed = sources.outside_places(FAILED, &[FAILED]).await;
+                    let located = shown(&located.into_inner(), &keys);
+                    let failed = shown(&failed.into_inner(), &[FAILED]);
                     format!("{located}, {failed}")
                 }
             }
@@ -1586,7 +1579,7 @@ mod tests {
 
         fn without(recording: &Recording, source: Source) -> Recording {
             let mut recording = recording.clone();
-            visit(source, &mut Forget(&mut recording));
+            source.visit(&mut Forget(&mut recording));
             recording
         }
 
@@ -1650,121 +1643,55 @@ mod tests {
                     "{bytes}: {hex:?}"
                 );
             }
-            assert_eq!(
-                recording.unsuccessful(),
-                [
-                    "article_lifecycles/9",
-                    "community_moderations/9",
-                    "community_moderators/9",
-                    "community_viewer_removals/9",
-                    "conversation_controls/17",
-                    "conversation_controls/9",
-                    "edges/follows/Forward/9",
-                    "outside_places/9",
-                    "pure_cores/17",
-                    "pure_cores/9",
-                    "safety_labels/9",
-                    "second_degree/9",
-                    "trusted_friends/9",
-                    "tweets/17",
-                    "tweets/9",
-                    "users/17",
-                    "users/9",
-                    "viewer_countries/9",
-                    "viewers/9"
-                ]
-            );
+        }
+
+        fn shape(recording: &Recording) -> String {
+            let kind = |answer: &Answer<_>| match answer {
+                Answer::Found(_) => "found",
+                Answer::Partial(_) => "partial",
+                Answer::NotFound => "not_found",
+                Answer::Failed => "failed",
+            };
+            let (_, shared) = recording.clone().split_shared();
+            let shared = shared.names();
+            let unsuccessful = recording.unsuccessful();
+            let mut rendered = String::new();
+            for name in recording.names() {
+                let side = if shared.contains(&name) {
+                    "shared"
+                } else {
+                    "case"
+                };
+                let kinds: BTreeSet<&str> = match recording.answers.get(name) {
+                    Some(answers) => answers.values().map(kind).collect(),
+                    None => BTreeSet::from(["fields"]),
+                };
+                let failed: Vec<&str> = unsuccessful
+                    .iter()
+                    .filter_map(|key| key.strip_prefix(name)?.strip_prefix('/'))
+                    .collect();
+                writeln!(rendered, "{name}: {side} {kinds:?} {failed:?}").unwrap();
+            }
+            let logged_out = recording.clone().into_replay(None).err();
+            let logged_out = logged_out.map(|error| error.to_string());
+            writeln!(rendered, "logged out: {logged_out:?}").unwrap();
+            rendered
         }
 
         #[tokio::test]
-        async fn every_source_records_each_answer_its_backend_gives() {
+        async fn the_recording_matches_recording_shape_txt() {
             let (_, recording) = answered().await;
-            let kinds: BTreeMap<&str, BTreeSet<&str>> = recording
-                .answers
-                .iter()
-                .map(|(name, answers)| {
-                    let kinds = answers.values().map(|answer| match answer {
-                        Answer::Found(_) => "found",
-                        Answer::Partial(_) => "partial",
-                        Answer::NotFound => "not_found",
-                        Answer::Failed => "failed",
-                    });
-                    (name.as_str(), kinds.collect())
-                })
-                .collect();
-
-            let found_or_failed = || BTreeSet::from(["found", "failed"]);
-            let every = || BTreeSet::from(["found", "not_found", "failed"]);
-            assert_eq!(
-                kinds,
-                BTreeMap::from([
-                    ("article_lifecycles", every()),
-                    ("community_moderations", found_or_failed()),
-                    ("community_moderators", found_or_failed()),
-                    ("community_viewer_removals", found_or_failed()),
-                    ("conversation_controls", every()),
-                    ("edges", BTreeSet::from(["found", "partial", "failed"])),
-                    ("outside_places", found_or_failed()),
-                    ("pure_cores", every()),
-                    ("safety_labels", found_or_failed()),
-                    ("second_degree", found_or_failed()),
-                    ("trusted_friends", found_or_failed()),
-                    ("tweets", found_or_failed()),
-                    ("users", every()),
-                    ("viewer_countries", every()),
-                    ("viewers", every()),
-                ])
+            crate::hydration::assert_blessed(
+                "recording_shape.txt",
+                include_str!("../../tests/fixtures/recording_shape.txt"),
+                &shape(&recording),
             );
         }
 
         #[tokio::test]
-        async fn a_logged_out_replay_refuses_every_viewer_keyed_answer() {
-            let (_, recording) = answered().await;
-
-            assert_eq!(
-                recording.into_replay(None).err().map(|e| e.to_string()),
-                Some(
-                    "a logged-out recording holds viewer-keyed [\"viewers\", \"viewer_fields\", \
-                     \"edges\", \"viewer_countries\", \"second_degree\", \
-                     \"community_moderators\", \"community_viewer_removals\", \"trusted_friends\", \
-                     \"outside_places\"]"
-                        .to_owned()
-                )
-            );
-        }
-
-        #[tokio::test]
-        async fn shared_json_takes_the_viewer_free_answers() {
+        async fn shared_answers_split_out_and_join_back_unchanged() {
             let (_, recording) = answered().await;
             let (case, shared) = recording.clone().split_shared();
-
-            assert_eq!(
-                shared.names(),
-                [
-                    "conversation_controls",
-                    "pure_cores",
-                    "safety_labels",
-                    "tweets",
-                    "user_fields",
-                    "users"
-                ]
-            );
-            assert_eq!(
-                case.names(),
-                [
-                    "article_lifecycles",
-                    "community_moderations",
-                    "community_moderators",
-                    "community_viewer_removals",
-                    "edges",
-                    "outside_places",
-                    "second_degree",
-                    "trusted_friends",
-                    "viewer_countries",
-                    "viewer_fields",
-                    "viewers"
-                ]
-            );
             assert_eq!(case.with_shared(&shared), recording);
         }
 
@@ -1916,7 +1843,7 @@ mod tests {
                     walked: &walked,
                     unwalked: vec![],
                 };
-                visit(source, &mut scan);
+                source.visit(&mut scan);
                 unwalked.extend(
                     scan.unwalked
                         .into_iter()

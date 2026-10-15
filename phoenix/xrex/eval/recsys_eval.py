@@ -40,6 +40,19 @@ rank_logger = logging.getLogger("rank")
 _membership_validation_done = False
 
 
+def _weighted_slot_scores(
+    users: np.ndarray, cands: np.ndarray, slot_weights: Optional[Tuple[float, ...]]
+) -> np.ndarray:
+    if slot_weights is None:
+        return users @ cands.T
+    width = users.shape[-1]
+    total = np.zeros((users.shape[0], cands.shape[0]), dtype=np.float32)
+    for s, w in enumerate(slot_weights):
+        if w != 0.0:
+            total += w * (users @ cands[:, s * width : (s + 1) * width].T)
+    return total
+
+
 @functools.lru_cache(maxsize=2)
 def _make_gather_in_batch_jit(mesh: jax.sharding.Mesh):
     gather_out_sharding = NamedSharding(mesh, P(("stage", "expert", "replica", "data"), None, None))
@@ -67,6 +80,7 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
     )
     candidate_seq_len: int = 64
     target_dataset_type: RetrievalDataset = RetrievalDataset.HOME
+    query_head_weights: Optional[Tuple[float, float]] = None
     recall_ema_half_life_reports: float = 50.0
 
     positive_actions: List[int] = field(default_factory=lambda: list())
@@ -267,7 +281,9 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                 ).astype(np.float32)
                 _cand[missing_mask] = 0.0
                 _cand_flat = _cand.reshape(local_batch_size * self.candidate_seq_len, -1)
-                in_batch_top_k_scores = _user_local @ _cand_flat.T
+                in_batch_top_k_scores = _weighted_slot_scores(
+                    _user_local, _cand_flat, self.query_head_weights
+                )
 
                 _eval_bs = kwargs.get("eval_bs_per_device", 0)
                 global_top_large_k_indices, _ = forward_fn(

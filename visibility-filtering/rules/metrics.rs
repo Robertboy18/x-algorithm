@@ -24,11 +24,35 @@ const DEADLINE: &str = "filter_tweets_deadline";
 const DEADLINE_REMAINING_MS: &str = "filter_tweets_deadline_remaining_ms";
 const DEADLINE_OVERRUN_MS: &str = "filter_tweets_deadline_overrun_ms";
 
-#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum Rpc {
+pub enum Rpc {
     FilterTweets,
     EvaluateTweets,
+}
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum RequestOutcome {
+    Started,
+    Cancelled,
+    Success,
+    Failure,
+}
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum DeadlineOutcome {
+    Absent,
+    Within,
+    Overrun,
+}
+
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum Stage {
+    Hydration,
+    PostHydration,
 }
 
 pub(crate) fn record_viewer_state(raw: Option<u64>, normalized: Option<u64>) {
@@ -162,7 +186,7 @@ pub(crate) struct RequestMetricsGuard {
     requests: &'static str,
     latency_ms: &'static str,
     start: Instant,
-    outcome: Cell<&'static str>,
+    outcome: Cell<RequestOutcome>,
 }
 
 impl RequestMetricsGuard {
@@ -171,34 +195,34 @@ impl RequestMetricsGuard {
     }
 
     pub(crate) fn named(requests: &'static str, latency_ms: &'static str) -> Self {
-        incr(requests, &[("outcome", "started")], 1);
+        incr(requests, &[("outcome", RequestOutcome::Started.into())], 1);
         Self {
             requests,
             latency_ms,
             start: Instant::now(),
-            outcome: Cell::new("cancelled"),
+            outcome: Cell::new(RequestOutcome::Cancelled),
         }
     }
 
     pub(crate) fn mark_success(&self) {
-        self.outcome.set("success");
+        self.outcome.set(RequestOutcome::Success);
     }
 
     pub(crate) fn mark_failure(&self) {
-        self.outcome.set("failure");
+        self.outcome.set(RequestOutcome::Failure);
     }
 
     pub(crate) fn record_deadline(&self, grpc_timeout: Option<Duration>) {
         let Some(deadline) = grpc_timeout else {
-            incr(DEADLINE, &[("outcome", "absent")], 1);
+            incr(DEADLINE, &[("outcome", DeadlineOutcome::Absent.into())], 1);
             return;
         };
         let elapsed = self.start.elapsed();
         if elapsed <= deadline {
-            incr(DEADLINE, &[("outcome", "within")], 1);
+            incr(DEADLINE, &[("outcome", DeadlineOutcome::Within.into())], 1);
             observe_vm(DEADLINE_REMAINING_MS, &[], millis(deadline - elapsed));
         } else {
-            incr(DEADLINE, &[("outcome", "overrun")], 1);
+            incr(DEADLINE, &[("outcome", DeadlineOutcome::Overrun.into())], 1);
             observe_vm(DEADLINE_OVERRUN_MS, &[], millis(elapsed - deadline));
         }
     }
@@ -213,16 +237,11 @@ pub(crate) enum RetweetSources {
     Fetched,
 }
 
-pub(crate) fn record_phase(
-    rpc: Rpc,
-    stage: &'static str,
-    sources: RetweetSources,
-    elapsed: Duration,
-) {
+pub(crate) fn record_phase(rpc: Rpc, stage: Stage, sources: RetweetSources, elapsed: Duration) {
     observe_vm(
         PHASE_MS,
         &[
-            ("stage", stage),
+            ("stage", stage.into()),
             ("rpc", rpc.into()),
             ("sources", sources.into()),
         ],
@@ -236,7 +255,7 @@ fn millis(d: Duration) -> f64 {
 
 impl Drop for RequestMetricsGuard {
     fn drop(&mut self) {
-        incr(self.requests, &[("outcome", self.outcome.get())], 1);
+        incr(self.requests, &[("outcome", self.outcome.get().into())], 1);
         observe_vm(self.latency_ms, &[], millis(self.start.elapsed()));
     }
 }
@@ -304,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_generator_pins_the_evaluated_candidates_and_unresolved_tweets_metrics() {
+    fn dashboard_generator_pins_the_evaluated_candidates_unresolved_tweets_and_deadline_metrics() {
         let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
         let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
         let path = if Path::new(cargo).exists() { cargo } else { ws };
@@ -318,6 +337,12 @@ mod tests {
         assert!(dashboard.contains(&format!(
             "UNRESOLVED_TWEETS_METRIC = \"{UNRESOLVED_TWEETS}\""
         )));
+        assert!(dashboard.contains(&format!("FT_DEADLINE_METRIC = \"{DEADLINE}\"")));
+        assert!(dashboard.contains(&format!(
+            "FT_DEADLINE_REMAINING_METRIC = \"{DEADLINE_REMAINING_MS}\""
+        )));
+        let overrun: &str = DeadlineOutcome::Overrun.into();
+        assert!(dashboard.contains(&format!("outcome=\"{overrun}\"")));
     }
 
     #[test]

@@ -4,14 +4,13 @@
 #include <cstdint>
 
 #include "mol_epilogue_kernel.hpp"
+#include "mol_gate.hpp"
 #include "xrex/cuda/xla_utils/cuda_error_utils.hpp"
 
 namespace {
 
 constexpr int kMaxUsers = 512;
 constexpr int kThreads = 128;
-constexpr int kMinBlocksPerSm = 6;
-constexpr int U = 2;
 
 struct Params {
   const __nv_bfloat16* dots;
@@ -28,13 +27,13 @@ struct Params {
   long long num_posts;
 };
 
+template <int KL>
+constexpr int kUsersPerThread = KL <= 4 ? 3 : (KL <= 8 ? 2 : 1);
+
 template <int KL, int H, int U>
 __device__ __forceinline__ void score_users(
     const Params& p,
-    const volatile float* vw1,
-    const volatile float* vw2,
-    const float* s_b1,
-    const float* s_b2,
+    const xrex_mol::Gate<KL, H>& g,
     const float* s_ubias,
     const float* inv_norm,
     const float* ib,
@@ -48,74 +47,25 @@ __device__ __forceinline__ void score_users(
   for (int c = 0; c < KL; ++c) {
     const long long row = static_cast<long long>(c) * B + b0;
 #pragma unroll
-    for (int u = 0; u < U; ++u) {
-      cos[u][c] = __bfloat162float(p.dots[(row + u) * M + m]) * inv_norm[c];
-    }
-  }
-  float hid[U][H];
-#pragma unroll
-  for (int h = 0; h < H; ++h) {
-    float a[U];
-#pragma unroll
-    for (int u = 0; u < U; ++u) a[u] = s_b1[h];
-#pragma unroll
-    for (int c = 0; c < KL; ++c) {
-      const float w = vw1[c * H + h];
-#pragma unroll
-      for (int u = 0; u < U; ++u) a[u] = fmaf(w, cos[u][c], a[u]);
-    }
-#pragma unroll
-    for (int u = 0; u < U; ++u) hid[u][h] = a[u] * __frcp_rn(1.0f + __expf(-a[u]));
+    for (int u = 0; u < U; ++u) cos[u][c] = __bfloat162float(p.dots[(row + u) * M + m]) * inv_norm[c];
   }
   float logit[U][KL];
-  float mx[U];
 #pragma unroll
-  for (int u = 0; u < U; ++u) mx[u] = -3.0e38f;
+  for (int u = 0; u < U; ++u)
 #pragma unroll
-  for (int c = 0; c < KL; ++c) {
-    float a[U];
+    for (int c = 0; c < KL; ++c) logit[u][c] = g.b2[c] + ib[c] + s_ubias[c * B + b0 + u];
+  float out[U];
+  xrex_mol::gate_scores<KL, H, U>(g, cos, logit, out);
 #pragma unroll
-    for (int u = 0; u < U; ++u) a[u] = s_b2[c] + ib[c] + s_ubias[c * B + b0 + u];
-#pragma unroll
-    for (int h = 0; h < H; ++h) {
-      const float w = vw2[h * KL + c];
-#pragma unroll
-      for (int u = 0; u < U; ++u) a[u] = fmaf(w, hid[u][h], a[u]);
-    }
-#pragma unroll
-    for (int u = 0; u < U; ++u) {
-      logit[u][c] = a[u];
-      mx[u] = fmaxf(mx[u], a[u]);
-    }
-  }
-#pragma unroll
-  for (int u = 0; u < U; ++u) {
-    float den = 0.0f, num = 0.0f;
-#pragma unroll
-    for (int c = 0; c < KL; ++c) {
-      const float e = __expf(logit[u][c] - mx[u]);
-      den += e;
-      num = fmaf(e, cos[u][c], num);
-    }
-    p.out[static_cast<long long>(b0 + u) * M + m] = num * __frcp_rn(den);
-  }
+  for (int u = 0; u < U; ++u) p.out[static_cast<long long>(b0 + u) * M + m] = out[u];
 }
 
 template <int KL, int H>
-__global__ void __launch_bounds__(kThreads, kMinBlocksPerSm) mol_epilogue_kernel(Params p) {
-  __shared__ float s_w1[KL * H];
-  __shared__ float s_w2[H * KL];
-  __shared__ float s_b1[H];
-  __shared__ float s_b2[KL];
+__global__ void __launch_bounds__(kThreads) mol_epilogue_kernel(Params p) {
+  constexpr int U = kUsersPerThread<KL>;
+  __shared__ xrex_mol::Gate<KL, H> g;
   __shared__ float s_ubias[KL * kMaxUsers];
-  for (int i = threadIdx.x; i < KL * H; i += blockDim.x) {
-    s_w1[i] = p.w1[i];
-    s_w2[i] = p.w2[i];
-  }
-  if (threadIdx.x < H)
-    s_b1[threadIdx.x] = p.b1[threadIdx.x];
-  if (threadIdx.x < KL)
-    s_b2[threadIdx.x] = p.b2[threadIdx.x];
+  xrex_mol::load_gate<KL, H>(g, p.w1, p.b1, p.w2, p.b2);
   for (int i = threadIdx.x; i < KL * p.num_users; i += blockDim.x) s_ubias[i] = p.ubias[i];
   __syncthreads();
 
@@ -133,15 +83,9 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksPerSm) mol_epilogue_kernel
     ib[c] = p.ibias[static_cast<long long>(c) * M + m];
   }
 
-  const volatile float* vw1 = s_w1;
-  const volatile float* vw2 = s_w2;
   int b = 0;
-  for (; b + U <= B; b += U) {
-    score_users<KL, H, U>(p, vw1, vw2, s_b1, s_b2, s_ubias, inv_norm, ib, b, m);
-  }
-  for (; b < B; ++b) {
-    score_users<KL, H, 1>(p, vw1, vw2, s_b1, s_b2, s_ubias, inv_norm, ib, b, m);
-  }
+  for (; b + U <= B; b += U) score_users<KL, H, U>(p, g, s_ubias, inv_norm, ib, b, m);
+  for (; b < B; ++b) score_users<KL, H, 1>(p, g, s_ubias, inv_norm, ib, b, m);
 }
 
 }

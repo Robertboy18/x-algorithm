@@ -553,6 +553,17 @@ def _range_partitions(total_partitions: int, shard_index: int, num_shards: int) 
     return list(range(start, end))
 
 
+def _subsample_partitions(partition_ids: list[int], partition_sampling_factor: int) -> list[int]:
+    if partition_sampling_factor <= 1:
+        return partition_ids
+    if partition_ids and len(partition_ids) < partition_sampling_factor:
+        raise ValueError(
+            f"partition_sampling_factor={partition_sampling_factor} exceeds this shard's "
+            f"{len(partition_ids)} partitions; some ranks would receive none and hang."
+        )
+    return partition_ids[::partition_sampling_factor]
+
+
 async def handle_topic_offset(
     consumer: AIOKafkaConsumer,
     topic: str,
@@ -561,6 +572,7 @@ async def handle_topic_offset(
     reset_to_latest: bool,
     seek_to_timestamp_ms: int | None = None,
     seek_to_offset: dict[int, int] | None = None,
+    partition_sampling_factor: int = 1,
 ) -> list[TopicPartition]:
     assert seek_to_timestamp_ms is None or seek_to_offset is None, (
         "seek_to_timestamp_ms and seek_to_offset cannot both be set"
@@ -588,7 +600,9 @@ async def handle_topic_offset(
 
     total_partitions = len(partitions)
 
-    partition_ids = _range_partitions(total_partitions, shard_index, num_shards)
+    partition_ids = _subsample_partitions(
+        _range_partitions(total_partitions, shard_index, num_shards), partition_sampling_factor
+    )
     if not partition_ids:
         rank_logger.warning(
             f"Worker {shard_index} received 0 partitions (total_partitions={total_partitions}, "
@@ -1031,6 +1045,7 @@ async def _consume_multi_consumer(
     reset_to_latest_event: threading.Event | None = None,
     negative_downsample_rate: int = 1,
     negative_downsample_positive_action_indices: str = DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES,
+    partition_sampling_factor: int = 1,
     auth: KafkaAuth | None = None,
 ) -> None:
     auth = _coerce_auth(auth, sasl_mechanism, sasl_plain_username, sasl_plain_password)
@@ -1059,7 +1074,9 @@ async def _consume_multi_consumer(
             pass
 
     total_partitions = len(all_partitions)
-    partition_ids = _range_partitions(total_partitions, shard_index, num_shards)
+    partition_ids = _subsample_partitions(
+        _range_partitions(total_partitions, shard_index, num_shards), partition_sampling_factor
+    )
     shard_partitions = [TopicPartition(topic, i) for i in partition_ids]
     if not partition_ids:
         rank_logger.warning(
@@ -1237,6 +1254,7 @@ async def consume_messages(
     reset_to_latest_event: threading.Event | None = None,
     negative_downsample_rate: int = 1,
     negative_downsample_positive_action_indices: str = DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES,
+    partition_sampling_factor: int = 1,
 ):
     auth = _coerce_auth(auth, sasl_mechanism, sasl_plain_username, sasl_plain_password)
     metric_attrs = {
@@ -1274,6 +1292,7 @@ async def consume_messages(
             reset_to_latest_event=reset_to_latest_event,
             negative_downsample_rate=negative_downsample_rate,
             negative_downsample_positive_action_indices=negative_downsample_positive_action_indices,
+            partition_sampling_factor=partition_sampling_factor,
         )
         return
 
@@ -1328,6 +1347,7 @@ async def consume_messages(
             reset_to_latest=reset_to_latest,
             seek_to_timestamp_ms=seek_to_timestamp_ms,
             seek_to_offset=seek_to_offset,
+            partition_sampling_factor=partition_sampling_factor,
         )
         assigned_partitions_array_index = 0
         assigned_partitions_array_len = len(assigned_partitions)

@@ -94,6 +94,7 @@ message UserContext {
   int32 user_muters_count = 17;
   bool is_nsfw_user = 18;
   bool is_nsfw_mode = 19;
+  bytes id_list_features_ipc = 20;
 }
 
 message EngagementCountRow {
@@ -171,6 +172,9 @@ message PredictNextActionsRequest {
 
   repeated PurchaseValueBaseline purchase_value_baselines = 23;
   EngagementCounts user_ads_engagement_counts = 24;
+
+  FeedRequestContext feed_request_context = 25;
+  FeedCursorDirection feed_cursor_direction = 26;
 }
 
 message PurchaseValueBaseline {
@@ -353,6 +357,7 @@ enum RetrievalDatasetType {
   RETRIEVAL_DATASET_TYPE_TRENDING = 12;
   RETRIEVAL_DATASET_TYPE_HOME_COLD = 13;
   RETRIEVAL_DATASET_TYPE_HOME_HOT = 14;
+  RETRIEVAL_DATASET_TYPE_ZERO_FAV = 16;
 }
 
 message ScoredCandidate {
@@ -441,7 +446,7 @@ enum ActionName {
   CLIENT_TWEET_TRANSLATE_CLICK = 41;
   CLIENT_TWEET_NOT_RELEVANT = 42;
   CLIENT_TWEET_UNDO_NOT_RELEVANT = 43;
-  CLIENT_CARD_CLICK = 44;
+  SERVER_TWEET_REACT_WITH_VIDEO = 44;
   CLIENT_TWEET_SHOW_MORE_EXPAND = 45;
   CLIENT_TWEET_CLICK_GROK_ANALYZE = 46;
   CLIENT_TWEET_VIDEO_OPEN = 47;
@@ -611,7 +616,25 @@ enum ActionName {
   ADS_SEARCH_CONVERSION_DELAYED_TIER_3 = 231;
   ADS_SIGN_UP_CONVERSION_DELAYED_TIER_3 = 232;
   ADS_CHECKOUT_INITIATED_CONVERSION_DELAYED_TIER_3 = 233;
-  reserved 234 to 252;
+  ADS_ATTRIBUTED_KEY_VIEW_CONVERSION_DELAYED = 234;
+  ADS_ATTRIBUTED_VIEW_CONVERSION_DELAYED = 235;
+  ADS_PURCHASE_CONVERSION_VIEW_THROUGH_DELAYED = 236;
+  ADS_ADD_TO_CART_CONVERSION_VIEW_THROUGH_DELAYED = 237;
+  ADS_CHECKOUT_INITIATED_CONVERSION_VIEW_THROUGH_DELAYED = 238;
+  ADS_SIGN_UP_CONVERSION_VIEW_THROUGH_DELAYED = 239;
+  ADS_ATTRIBUTED_KEY_VIEW_CONVERSION_DELAYED_TIER_2 = 240;
+  ADS_ATTRIBUTED_VIEW_CONVERSION_DELAYED_TIER_2 = 241;
+  ADS_PURCHASE_CONVERSION_VIEW_THROUGH_DELAYED_TIER_2 = 242;
+  ADS_ADD_TO_CART_CONVERSION_VIEW_THROUGH_DELAYED_TIER_2 = 243;
+  ADS_CHECKOUT_INITIATED_CONVERSION_VIEW_THROUGH_DELAYED_TIER_2 = 244;
+  ADS_SIGN_UP_CONVERSION_VIEW_THROUGH_DELAYED_TIER_2 = 245;
+  ADS_ATTRIBUTED_KEY_VIEW_CONVERSION_DELAYED_TIER_3 = 246;
+  ADS_ATTRIBUTED_VIEW_CONVERSION_DELAYED_TIER_3 = 247;
+  ADS_PURCHASE_CONVERSION_VIEW_THROUGH_DELAYED_TIER_3 = 248;
+  ADS_ADD_TO_CART_CONVERSION_VIEW_THROUGH_DELAYED_TIER_3 = 249;
+  ADS_CHECKOUT_INITIATED_CONVERSION_VIEW_THROUGH_DELAYED_TIER_3 = 250;
+  ADS_SIGN_UP_CONVERSION_VIEW_THROUGH_DELAYED_TIER_3 = 251;
+  reserved 252;
   P_OPEN_LINK_P90 = 253;
   ADS_MMP_CLICK = 254;
   PLACE_HOLDER_255 = 255;
@@ -1336,6 +1359,7 @@ message UserActionMeta {
   int64 predictionId = 26;
   uint64 safetyLabelMask = 27;
   optional uint32 percent_screen_height_100k = 28;
+  optional uint64 fair_view_time_ms = 29;
 }
 
 message TweetInfo {
@@ -1618,6 +1642,8 @@ message AdInfo {
   EngagementCounts viewer_advertiser_engagement_counts = 24;
 
   EngagementCounts viewer_advertiser_conversion_counts = 25;
+
+  repeated int64 post_video_media_ids = 26;
 }
 
 message UserAdActionMeta {

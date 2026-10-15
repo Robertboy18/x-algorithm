@@ -1,7 +1,7 @@
 use super::Role;
 use crate::models::{
-    AuthorFeatures, ConversationControlFeatures, HydratedTweetCandidate, SafetyLabelType,
-    TweetFeatures, Verdict, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
+    AuthorFeatures, ConversationControlFeatures, PostCandidate, SafetyLabelType, TweetFeatures,
+    Verdict, VerifyBlurSupport, Viewer, ViewerAge, ViewerFeatures, ViewerProfile,
 };
 use crate::rules::fixtures::{
     candidate, conversation_control, viewer, viewer_with_profile, AUTHOR_ID, CLIENT_CLASSES,
@@ -10,19 +10,19 @@ use crate::rules::fixtures::{
 use crate::rules::SafetyLevel;
 use xai_core_entities::entities::ConversationControlArm;
 
-pub(super) fn author_candidate(set: fn(&mut AuthorFeatures)) -> HydratedTweetCandidate {
+pub(super) fn author_candidate(set: fn(&mut AuthorFeatures)) -> PostCandidate {
     let mut features = AuthorFeatures::default();
     set(&mut features);
     candidate().with_author_features(features).build()
 }
 
-pub(super) fn tweet_candidate(set: fn(&mut TweetFeatures)) -> HydratedTweetCandidate {
+pub(super) fn tweet_candidate(set: fn(&mut TweetFeatures)) -> PostCandidate {
     let mut features = TweetFeatures::default();
     set(&mut features);
     candidate().with_tweet_features(features).build()
 }
 
-pub(super) fn labeled(label: SafetyLabelType) -> HydratedTweetCandidate {
+pub(super) fn labeled(label: SafetyLabelType) -> PostCandidate {
     candidate().with_label(label).build()
 }
 
@@ -72,7 +72,7 @@ pub(super) fn on_client(class_name: &str, country: &str, base: ViewerFeatures) -
     }
 }
 
-pub(super) fn nsfw_high_precision_media() -> HydratedTweetCandidate {
+pub(super) fn nsfw_high_precision_media() -> PostCandidate {
     candidate()
         .with_label(SafetyLabelType::NSFW_HIGH_PRECISION)
         .with_media()

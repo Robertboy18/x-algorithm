@@ -19,19 +19,6 @@ const MAX_POST_ENFORCEMENTS_KEY: &str = "max_post_enforcements_per_day";
 
 const TOPIC_LABELS_KEY: &str = "topic_labels";
 
-const DEDUP_HEAD_ACTION_CLASS_KEY: &str = "dedup_head_action_class";
-
-const DEFAULT_DEDUP_HEAD_ACTION_CLASS: &[(&str, u8)] = &[
-    (
-        "NearDupEmbeddingCseMatch",
-        crate::dedup_cache::CLASS_SUSPEND,
-    ),
-    (
-        "NearDupEmbeddingCseNcmecMatch",
-        crate::dedup_cache::CLASS_SUSPEND,
-    ),
-];
-
 const GENERIC_ACTIONS_KEY: &str = "generic_actions";
 const GENERIC_KINDS_KEY: &str = "kinds";
 const GENERIC_SUSPEND_POLICIES_KEY: &str = "suspend_policies";
@@ -241,10 +228,6 @@ impl DynamicConfig {
         }
     }
 
-    pub fn dedup_action_class_for_head(&self, head: &str) -> u8 {
-        dedup_action_class_from_config(self.snapshot().config.as_ref(), head)
-    }
-
     pub fn generic_action_allowlist(
         &self,
         entity_type: EntityType,
@@ -254,6 +237,18 @@ impl DynamicConfig {
 
     pub fn overturn_hold_gate(&self) -> crate::overturn_hold::HoldGateConfig {
         crate::overturn_hold::HoldGateConfig::from_config(self.snapshot().config.as_ref())
+    }
+
+    pub fn off_switch_enabled(&self) -> bool {
+        crate::off_switch::enabled_from_config(self.snapshot().config.as_ref())
+    }
+
+    pub fn action_control_config(&self) -> crate::action_control::ControlConfig {
+        crate::action_control::ControlConfig::from_config(self.snapshot().config.as_ref())
+    }
+
+    pub fn confidence_config(&self) -> crate::confidence::ConfidenceConfig {
+        crate::confidence::ConfidenceConfig::from_config(self.snapshot().config.as_ref())
     }
 
     pub fn config(&self) -> Option<Value> {
@@ -319,26 +314,6 @@ fn generic_actions_from_config(
         kinds: string_set(entity.and_then(|e| e.get(GENERIC_KINDS_KEY))),
         suspend_policies: string_set(entity.and_then(|e| e.get(GENERIC_SUSPEND_POLICIES_KEY))),
         labels: string_set(entity.and_then(|e| e.get(GENERIC_LABELS_KEY))),
-    }
-}
-
-fn dedup_action_class_from_config(config: Option<&Value>, head: &str) -> u8 {
-    use crate::dedup_cache::{parse_action_class, CLASS_NONE, CLASS_SUSPEND};
-    if head.is_empty() {
-        return CLASS_NONE;
-    }
-    match get_path(config, &[DEDUP_HEAD_ACTION_CLASS_KEY, head]) {
-        Some(Value::String(s)) => parse_action_class(s).unwrap_or(CLASS_NONE),
-        Some(Value::Number(n)) => match n.as_u64() {
-            Some(v) if v <= CLASS_SUSPEND as u64 => v as u8,
-            _ => CLASS_NONE,
-        },
-        Some(_) => CLASS_NONE,
-        None => DEFAULT_DEDUP_HEAD_ACTION_CLASS
-            .iter()
-            .find(|(h, _)| *h == head)
-            .map(|(_, c)| *c)
-            .unwrap_or(CLASS_NONE),
     }
 }
 
@@ -441,85 +416,6 @@ mod tests {
         let gate = cfg_without_gb(false).overturn_hold_gate();
         assert_eq!(gate.mode, crate::overturn_hold::GateMode::Off);
         assert!(!gate.enabled());
-    }
-
-    #[test]
-    fn dedup_action_class_reads_opted_in_heads() {
-        use crate::dedup_cache::{CLASS_CHALLENGE, CLASS_LABEL, CLASS_NONE, CLASS_SUSPEND};
-        let cfg = json!({"dedup_head_action_class": {
-            "NearDupEmbeddingCseMatch": "suspend",
-            "SomeChallengeHead": "challenge",
-            "SomeLabelHead": "label",
-            "NumericHead": 3,
-            "TypoHead": "Suspend",
-            "OutOfRangeHead": 99,
-        }});
-        let c = Some(&cfg);
-        assert_eq!(
-            dedup_action_class_from_config(c, "NearDupEmbeddingCseMatch"),
-            CLASS_SUSPEND
-        );
-        assert_eq!(
-            dedup_action_class_from_config(c, "SomeChallengeHead"),
-            CLASS_CHALLENGE
-        );
-        assert_eq!(
-            dedup_action_class_from_config(c, "SomeLabelHead"),
-            CLASS_LABEL
-        );
-        assert_eq!(
-            dedup_action_class_from_config(c, "NumericHead"),
-            CLASS_SUSPEND
-        );
-        assert_eq!(
-            dedup_action_class_from_config(c, "OutOfRangeHead"),
-            CLASS_NONE
-        );
-        assert_eq!(dedup_action_class_from_config(c, "TypoHead"), CLASS_NONE);
-        assert_eq!(dedup_action_class_from_config(c, "OtherHead"), CLASS_NONE);
-        assert_eq!(dedup_action_class_from_config(c, ""), CLASS_NONE);
-        assert_eq!(
-            dedup_action_class_from_config(None, "SomeLabelHead"),
-            CLASS_NONE
-        );
-    }
-
-    #[test]
-    fn dedup_action_class_baked_default_and_kill_switch() {
-        use crate::dedup_cache::{CLASS_LABEL, CLASS_NONE, CLASS_SUSPEND};
-        assert_eq!(
-            dedup_action_class_from_config(None, "NearDupEmbeddingCseMatch"),
-            CLASS_SUSPEND
-        );
-        let cfg = json!({"dry_run": true});
-        assert_eq!(
-            dedup_action_class_from_config(Some(&cfg), "NearDupEmbeddingCseMatch"),
-            CLASS_SUSPEND
-        );
-        let cfg = json!({"dedup_head_action_class": {"OtherHead": "label"}});
-        assert_eq!(
-            dedup_action_class_from_config(Some(&cfg), "NearDupEmbeddingCseMatch"),
-            CLASS_SUSPEND
-        );
-        assert_eq!(
-            dedup_action_class_from_config(None, "NearDupEmbeddingCseNcmecMatch"),
-            CLASS_SUSPEND
-        );
-        let cfg = json!({"dedup_head_action_class": {"NearDupEmbeddingCseMatch": 0}});
-        assert_eq!(
-            dedup_action_class_from_config(Some(&cfg), "NearDupEmbeddingCseMatch"),
-            CLASS_NONE
-        );
-        let cfg = json!({"dedup_head_action_class": {"NearDupEmbeddingCseMatch": "label"}});
-        assert_eq!(
-            dedup_action_class_from_config(Some(&cfg), "NearDupEmbeddingCseMatch"),
-            CLASS_LABEL
-        );
-        let cfg = json!({"dedup_head_action_class": {"NearDupEmbeddingCseMatch": null}});
-        assert_eq!(
-            dedup_action_class_from_config(Some(&cfg), "NearDupEmbeddingCseMatch"),
-            CLASS_NONE
-        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::candidate_hydrators::ads_brand_safety_vf_hydrator::AdsBrandSafetyVfHydrator;
 use crate::candidate_hydrators::ai_trend_feedback_context_hydrator::AiTrendFeedbackContextHydrator;
+use crate::candidate_hydrators::ancestor_video_hydrator::AncestorVideoHydrator;
 use crate::candidate_hydrators::bidirectional_follow_hydrator::BidirectionalFollowHydrator;
 use crate::candidate_hydrators::blocked_by_hydrator::BlockedByHydrator;
 use crate::candidate_hydrators::core_data_candidate_hydrator::CoreDataCandidateHydrator;
@@ -50,6 +51,7 @@ use crate::clients::user_action_aggregation_client::{
 };
 use crate::clients::vm_ranker_client::{MockVMRankerClient, ProdVMRankerClient, VMRankerClient};
 use crate::filters::age_filter::AgeFilter;
+use crate::filters::ancestor_video_filter::AncestorVideoFilter;
 use crate::filters::ancillary_vf_filter::AncillaryVFFilter;
 use crate::filters::author_socialgraph_filter::AuthorSocialgraphFilter;
 use crate::filters::brazil_2026_election_filter::Brazil2026ElectionFilter;
@@ -81,6 +83,7 @@ use crate::query_hydrators::explicit_engagement_signals_query_hydrator::Explicit
 use crate::query_hydrators::followed_grok_topics_query_hydrator::FollowedGrokTopicsQueryHydrator;
 use crate::query_hydrators::followed_starter_packs_query_hydrator::FollowedStarterPacksQueryHydrator;
 use crate::query_hydrators::followed_user_ids_query_hydrator::FollowedUserIdsQueryHydrator;
+use crate::query_hydrators::immersive_scoring_sequence_query_hydrator::ImmersiveScoringSequenceQueryHydrator;
 use crate::query_hydrators::implicit_engagement_signals_query_hydrator::ImplicitEngagementSignalsQueryHydrator;
 use crate::query_hydrators::impressed_posts_query_hydrator::ImpressedPostsQueryHydrator;
 use crate::query_hydrators::impression_bloom_filter_query_hydrator::ImpressionBloomFilterQueryHydrator;
@@ -93,6 +96,7 @@ use crate::query_hydrators::subscribed_user_ids_query_hydrator::SubscribedUserId
 use crate::query_hydrators::user_demographics_query_hydrator::UserDemographicsQueryHydrator;
 use crate::query_hydrators::user_inferred_gender_query_hydrator::UserInferredGenderQueryHydrator;
 use crate::query_hydrators::user_installed_apps_query_hydrator::UserInstalledAppsQueryHydrator;
+use crate::scorers::immersive_video_scorer::ImmersiveVideoScorer;
 use crate::scorers::phoenix_scorer::PhoenixScorer;
 use crate::scorers::vm_ranker::VMRanker;
 use crate::selectors::TopKScoreSelector;
@@ -258,6 +262,9 @@ impl PhoenixCandidatePipeline {
             Box::new(ScoringSequenceQueryHydrator::new(
                 user_action_aggregation_client.clone(),
             )),
+            Box::new(ImmersiveScoringSequenceQueryHydrator::new(
+                user_action_aggregation_client.clone(),
+            )),
             Box::new(RetrievalSequenceQueryHydrator::new(
                 user_action_aggregation_client,
             )),
@@ -380,7 +387,7 @@ impl PhoenixCandidatePipeline {
                 )
                 .await,
             ),
-            Box::new(MediaInfoHydrator::new(media_info_cache_client).await),
+            Box::new(MediaInfoHydrator::new(media_info_cache_client.clone()).await),
             Box::new(SubscriptionHydrator::new(tes_client.clone()).await),
             Box::new(GizmoduckCandidateHydrator::new(gizmoduck_client).await),
             Box::new(BlockedByHydrator::new(socialgraph_client).await),
@@ -452,8 +459,16 @@ impl PhoenixCandidatePipeline {
             xds_client: xds_vm_ranker_client,
             author_cold_start,
         });
+        let immersive_video_scorer = Box::new(ImmersiveVideoScorer {
+            dispatch: crate::util::egress::PredictionDispatch {
+                prod: phoenix_client.clone(),
+                paths: Vec::new(),
+                max_retries_key: "rust_home_mixer_phoenix_xds_max_retries",
+                enable_fallback_key: "rust_home_mixer_phoenix_enable_fallback",
+            },
+        });
         let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> =
-            vec![phoenix_scorer, vm_ranker];
+            vec![phoenix_scorer, immersive_video_scorer, vm_ranker];
 
         let selector = TopKScoreSelector;
 
@@ -477,11 +492,15 @@ impl PhoenixCandidatePipeline {
                 strato_client: strato_client.clone(),
             }),
             Box::new(VideoAspectRatioHydrator::new(tes_client.clone())),
+            Box::new(AncestorVideoHydrator {
+                media_info_cache_client,
+            }),
         ];
 
         let post_selection_filters: Vec<Box<dyn Filter<ScoredPostsQuery, PostCandidate>>> = vec![
             Box::new(VFFilter),
             Box::new(AncillaryVFFilter),
+            Box::new(AncestorVideoFilter),
             Box::new(DedupConversationFilter),
             Box::new(VideoCarouselFilter),
         ];

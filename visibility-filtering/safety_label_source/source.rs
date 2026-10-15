@@ -10,23 +10,12 @@ use super::expiring_cache::{ExpiringCache, Lookup};
 use super::lookup::{LookupError, LookupResults, RemoteSource};
 use super::metrics::{self, BatchStage, CacheResult, CacheTier};
 
-const YOUNG_TWEET_AGE: Duration = Duration::from_secs(5 * 60);
-const SHORT_TTL: Duration = Duration::from_secs(30);
-const LONG_TTL: Duration = Duration::from_secs(60);
+const TTL: Duration = Duration::from_secs(10);
 
-fn tweet_age(tweet_id: u64, now: SystemTime) -> Option<Duration> {
-    let created_ms = tweet_timestamp_ms(tweet_id);
-    let created_at = UNIX_EPOCH.checked_add(Duration::from_millis(created_ms))?;
-    now.duration_since(created_at).ok()
-}
-
-fn ttl_for_tweet(tweet_id: u64, now: SystemTime) -> Option<Duration> {
-    let age = tweet_age(tweet_id, now)?;
-    if age < YOUNG_TWEET_AGE {
-        Some(SHORT_TTL.min(YOUNG_TWEET_AGE - age))
-    } else {
-        Some(LONG_TTL)
-    }
+fn is_future_dated(tweet_id: u64, now: SystemTime) -> bool {
+    UNIX_EPOCH
+        .checked_add(Duration::from_millis(tweet_timestamp_ms(tweet_id)))
+        .is_none_or(|created_at| created_at > now)
 }
 
 pub struct SafetyLabelSource {
@@ -42,9 +31,7 @@ impl SafetyLabelSource {
     fn with_clock(remote: Arc<RemoteSource>, cache_capacity: Option<usize>, clock: Clock) -> Self {
         info!(
             cache_capacity = cache_capacity.unwrap_or(0),
-            young_ttl_secs = SHORT_TTL.as_secs(),
-            old_ttl_secs = LONG_TTL.as_secs(),
-            age_threshold_secs = YOUNG_TWEET_AGE.as_secs(),
+            ttl_secs = TTL.as_secs(),
             "Local safety-label cache initialized (single pool, per-entry TTL)"
         );
         Self {
@@ -107,9 +94,9 @@ impl SafetyLabelSource {
             let result = result.map(Arc::new);
             if let Some(cache) = &self.cache
                 && let Ok(label_map) = &result
-                && let Some(ttl) = ttl_for_tweet(id, wall_now)
+                && !is_future_dated(id, wall_now)
             {
-                cache.insert(id, Arc::clone(label_map), ttl);
+                cache.insert(id, Arc::clone(label_map), TTL);
             }
             results.insert(id, result);
         }
@@ -361,30 +348,6 @@ mod tests {
         assert_eq!(remote_keys.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn tweet_age_selects_and_clamps_local_ttl() {
-        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
-        for (age, expected) in [
-            (Duration::from_secs(60), Some(SHORT_TTL)),
-            (Duration::from_secs(600), Some(LONG_TTL)),
-            (
-                YOUNG_TWEET_AGE - Duration::from_secs(10),
-                Some(Duration::from_secs(10)),
-            ),
-            (
-                YOUNG_TWEET_AGE - Duration::from_millis(1),
-                Some(Duration::from_millis(1)),
-            ),
-            (YOUNG_TWEET_AGE, Some(LONG_TTL)),
-        ] {
-            let tweet_id = tweet_id_created_at(now - age);
-            assert_eq!(ttl_for_tweet(tweet_id, now), expected);
-        }
-
-        let future_id = tweet_id_created_at(now + Duration::from_secs(60));
-        assert_eq!(ttl_for_tweet(future_id, now), None);
-    }
-
     #[tokio::test]
     async fn expired_entry_is_refetched_and_restamped() {
         let (clock, mock) = Clock::mock();
@@ -398,7 +361,7 @@ mod tests {
         source.get(&[tweet_id]).await;
         let first_expiry = l1_expiry(&source, tweet_id).expect("backfilled");
 
-        mock.increment(SHORT_TTL + Duration::from_secs(1));
+        mock.increment(TTL + Duration::from_secs(1));
         source.get(&[tweet_id]).await;
         let restamped = l1_expiry(&source, tweet_id).expect("re-backfilled");
 

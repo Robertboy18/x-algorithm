@@ -171,6 +171,7 @@ mod tests {
             Arc::new(FilterTweets::new(
                 Arc::<InMemorySources>::clone(&sources),
                 RuleEngine::for_tests(),
+                Arc::default(),
             )),
             None,
         );
@@ -226,6 +227,7 @@ mod tests {
             Arc::new(FilterTweets::new(
                 Arc::new(InMemorySources::default()),
                 RuleEngine::for_tests(),
+                Arc::default(),
             )),
             Some(Box::new(viewer_ids)),
         );
@@ -275,6 +277,7 @@ mod tests {
             Arc::new(FilterTweets::new(
                 Arc::new(InMemorySources::default()),
                 RuleEngine::for_tests(),
+                Arc::default(),
             )),
             Some(Box::new(comparator)),
         );

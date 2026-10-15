@@ -171,6 +171,12 @@ class PostMapper:
             list_metadata=list_metadata,
             chat_group_metadata=chat_group_metadata,
             space_metadata=space_metadata,
+            mentioned_users=[
+                cls._from_strato_user_metadata_to_user(m)
+                for m in post_metadata.mentionedUsersMetadata
+            ]
+            if post_metadata.mentionedUsersMetadata
+            else None,
         )
 
     @classmethod
@@ -364,6 +370,10 @@ class PostMapper:
             profile_image=Image(url=user_metadata.profileImageUrl)
             if user_metadata.profileImageUrl
             else None,
+            profile_banner=Image(url=user_metadata.profileBannerImageUrl)
+            if user_metadata.profileBannerImageUrl
+            else None,
+            blocked_count=user_metadata.blockedCount,
         )
 
     @classmethod

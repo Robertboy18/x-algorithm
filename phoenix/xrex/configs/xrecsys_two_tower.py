@@ -256,7 +256,7 @@ def _xrecsys_two_tower_combined_base() -> dict:
         "enable_user_location_feature": True,
         "enable_user_gender_feature": True,
         "enable_user_age_feature": True,
-        "enable_user_installed_apps": True,
+        "enable_user_installed_apps": False,
         "candidate_seq_len": 64,
         "num_negatives_per_example": 0,
         "num_global_negatives_per_example": 64,
@@ -290,8 +290,10 @@ def _xrecsys_two_tower_combined_base() -> dict:
             recsys_pb2.ActionName.CLIENT_TWEET_BOOKMARK,
             recsys_pb2.ActionName.CLIENT_TWEET_SHARE,
         ],
-        "num_candidate_heads": 2,
-        "head_names": ["home", "immersive"],
+        "ld_positive_actions": [recsys_pb2.ActionName.CLIENT_TWEET_RECAP_DWELLED],
+        "num_candidate_heads": 3,
+        "head_names": ["home", "immersive", "ld"],
+        "w_ld": 0.75,
         "head_dataset_mapping": {
             "HOME": 0,
             "HOME_COLD": 0,
@@ -636,6 +638,7 @@ for config in configs:
     positive_actions = mparams.get(
         "positive_actions", RecsysTwoTowerModelConfig.get_positive_actions()
     )
+    head_names = mparams.get("head_names", ["home"])
     hard_negative_actions = mparams.get(
         "hard_negative_actions", RecsysTwoTowerModelConfig.get_hard_negative_actions()
     )
@@ -766,8 +769,28 @@ for config in configs:
                     "immersive_soft_negative_actions"
                 ].default_factory(),
             ),
+            ld_positive_actions=mparams.get(
+                "ld_positive_actions",
+                RecsysTwoTowerModelConfig.__dataclass_fields__[
+                    "ld_positive_actions"
+                ].default_factory(),
+            ),
+            ld_hard_negative_actions=mparams.get(
+                "ld_hard_negative_actions",
+                RecsysTwoTowerModelConfig.__dataclass_fields__[
+                    "ld_hard_negative_actions"
+                ].default_factory(),
+            ),
+            ld_soft_negative_actions=mparams.get(
+                "ld_soft_negative_actions",
+                RecsysTwoTowerModelConfig.__dataclass_fields__[
+                    "ld_soft_negative_actions"
+                ].default_factory(),
+            ),
             head_dataset_mapping=mparams.get("head_dataset_mapping", None),
-            head_names=mparams.get("head_names", ["home"]),
+            head_names=head_names,
+            w_fav=mparams.get("w_fav", 1.0),
+            w_ld=mparams.get("w_ld", 0.0),
             user_tower_config=RecsysAggregatedModelConfig(
                 candidate_seq_len=mparams["candidate_seq_len"],
                 pad_token=PAD_TOKEN,

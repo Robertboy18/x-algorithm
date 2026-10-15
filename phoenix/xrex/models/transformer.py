@@ -632,6 +632,7 @@ class Transformer(hk.Module):
         positions: jax.Array | None = None,
         seqpack_layout: SequencePackedLayout | None = None,
         subset_index: jax.Array | None = None,
+        act_l2_mask: jax.Array | None = None,
     ) -> TransformerModelOutput:
         config = self.config
 
@@ -758,12 +759,30 @@ class Transformer(hk.Module):
 
         h_final = d.output
 
-        summarize(f"{self.summarizer_prefix}attn-loss", jnp.sum(d.attn_loss))
-        summarize(f"{self.summarizer_prefix}ffn-loss", jnp.sum(d.ffn_loss))
+        regular_layout_token_scale = 1.0
+        if seqpack_layout is not None and seqpack_layout.candidate_token_to_slot is not None:
+            num_tokens = h_final.shape[1]
+            regular_num_tokens = (
+                num_tokens
+                - seqpack_layout.candidate_token_to_slot.shape[-1]
+                + seqpack_layout.candidate_positions.shape[-1]
+            )
+            regular_layout_token_scale = jnp.float32(num_tokens / regular_num_tokens)
+
+        summarize(
+            f"{self.summarizer_prefix}attn-loss", jnp.sum(d.attn_loss) * regular_layout_token_scale
+        )
+        summarize(
+            f"{self.summarizer_prefix}ffn-loss", jnp.sum(d.ffn_loss) * regular_layout_token_scale
+        )
 
         summarize(
             f"{self.summarizer_prefix}act-l2-loss",
-            jnp.mean(jnp.mean(h_final**2, axis=-1) * padding_mask),
+            jnp.mean(
+                jnp.mean(h_final**2, axis=-1)
+                * (padding_mask if act_l2_mask is None else act_l2_mask)
+            )
+            * regular_layout_token_scale,
         )
 
         return TransformerModelOutput(output=h_final)

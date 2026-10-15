@@ -93,6 +93,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for PhoenixReplyAncestorsHydrator
                 Ok(PostCandidate {
                     ancestors,
                     ancestor_users,
+                    conversation_id: core.conversation_id,
                     ..Default::default()
                 })
             })
@@ -103,6 +104,7 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for PhoenixReplyAncestorsHydrator
         if !hydrated.ancestors.is_empty() {
             candidate.ancestors = hydrated.ancestors;
             candidate.ancestor_users = hydrated.ancestor_users;
+            candidate.conversation_id = hydrated.conversation_id;
         }
     }
 }

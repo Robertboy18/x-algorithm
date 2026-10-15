@@ -1,6 +1,6 @@
 use super::{Role, Row};
 use crate::hydration::Hydrator;
-use crate::models::{HydratedTweetCandidate, SafetyLabelType};
+use crate::models::{PostCandidate, SafetyLabelType};
 use crate::rules::fixtures::{allow, candidate, dropped, CandidateBuilder};
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
 use xai_visibility_filtering::models::FilteredReason;
@@ -112,8 +112,8 @@ pub(super) fn rows() -> Vec<Row> {
     ]
 }
 
-fn exclusive_candidate(builder: CandidateBuilder) -> HydratedTweetCandidate {
+fn exclusive_candidate(builder: CandidateBuilder) -> PostCandidate {
     let mut c = builder.build();
-    c.tweet_features.exclusive_conversation_author_id = Some(42);
+    c.post.tweet_features.exclusive_conversation_author_id = Some(42);
     c
 }

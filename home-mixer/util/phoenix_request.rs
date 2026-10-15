@@ -224,3 +224,29 @@ pub fn build_prediction_request(
     request.columnar_sequences = query.columnar_scoring_sequence.iter().cloned().collect();
     request
 }
+
+pub fn build_immersive_prediction_request(
+    query: &ScoredPostsQuery,
+    candidates: &[&PostCandidate],
+) -> PredictNextActionsRequest {
+    let mut request =
+        build_request_without_sequence_and_candidates(query, ProductSurface::GalleryPage);
+    request.return_backbone_scores = false;
+    let followed_ids = followed_user_ids(query);
+    request.candidate_sets[0].candidates = candidates
+        .iter()
+        .map(|candidate| {
+            let tweet_info = candidate_to_tweet_info(candidate, query, &followed_ids);
+            TweetInfo {
+                first_video_duration_ms: tweet_info.min_video_duration_ms,
+                ..tweet_info
+            }
+        })
+        .collect();
+    request.columnar_sequences = query
+        .immersive_columnar_scoring_sequence
+        .iter()
+        .cloned()
+        .collect();
+    request
+}

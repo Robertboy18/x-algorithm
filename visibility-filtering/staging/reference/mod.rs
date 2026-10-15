@@ -1,4 +1,4 @@
-use crate::config::{ENV_APP_ENV, ENV_REFERENCE, parse_env_flag};
+use crate::config::{parse_env_flag, ENV_APP_ENV, ENV_REFERENCE};
 use crate::filter::FilterTweets;
 use crate::filter_tweets::{Comparator, FinishComparison};
 use crate::params::ClientSwitches;
@@ -26,12 +26,12 @@ pub const ENV_TWEETYPIE_CLIENT_ID: &str = "VF_TWEETYPIE_CLIENT_ID";
 #[strum(serialize_all = "snake_case")]
 pub enum Reference {
     None,
-        VfService,
-        Tweetypie,
+    VfService,
+    Tweetypie,
 }
 
 impl Reference {
-        pub fn resolve(
+    pub fn resolve(
         configured: Option<&str>,
         legacy_harness_flag: bool,
         app_env: Option<&str>,

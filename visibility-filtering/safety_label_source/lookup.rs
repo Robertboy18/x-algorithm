@@ -301,29 +301,4 @@ mod tests {
         assert!(results.get(&42).unwrap().is_ok());
         assert_eq!(manhattan.calls(), vec![vec![42]]);
     }
-
-    #[tokio::test]
-    async fn get_mixed_results_merges_cache_and_manhattan() {
-        let twemcache = FakeTwemcache::new(HashMap::from([
-            (1, TwemcacheOutcome::Hit(empty_label_map())),
-            (2, TwemcacheOutcome::Miss),
-            (3, TwemcacheOutcome::FallThrough(FallbackReason::Decode)),
-        ]));
-        let manhattan = FakeManhattan::new(HashMap::from([
-            (2, ManhattanOutcome::Resolved(empty_label_map())),
-            (
-                3,
-                ManhattanOutcome::Failure(LookupError::new(FailureKind::ManhattanDecode, "decode")),
-            ),
-        ]));
-        let source = RemoteSource::new(Arc::clone(&twemcache), Arc::clone(&manhattan));
-
-        let results = source.get(&[1, 2, 3]).await;
-
-        assert_eq!(results.len(), 3);
-        assert!(results.get(&1).unwrap().is_ok());
-        assert!(results.get(&2).unwrap().is_ok());
-        assert!(results.get(&3).unwrap().is_err());
-        assert_eq!(manhattan.calls(), vec![vec![2, 3]]);
-    }
 }

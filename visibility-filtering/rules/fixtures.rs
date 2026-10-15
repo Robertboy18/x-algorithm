@@ -1,10 +1,10 @@
-use crate::hydration::Hydrator;
+use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
     AuthorFeatures, AuthorLabel, ClientCapability, ConversationControlFeatures, Decided,
-    DropReason, FosnrReason, HydratedTweetCandidate, LimitedEngagement, LimitedEngagementReason,
-    MediaInterstitial, MediaRestriction, Notice, NsfwViewerDropReason, SafetyLabelMap,
-    SafetyLabelType, TombstoneReason, TweetFeatures, Verdict, VerifyBlurSupport, Viewer,
-    ViewerFeatures, ViewerProfile, Withholding,
+    DropReason, FosnrReason, LimitedEngagement, LimitedEngagementReason, MediaInterstitial,
+    MediaRestriction, Notice, NsfwViewerDropReason, PostCandidate, PostEntity, SafetyLabelMap,
+    SafetyLabelType, TombstoneReason, TweetFeatures, UserEntity, Verdict, VerifyBlurSupport,
+    Viewer, ViewerFeatures, ViewerProfile, Withholding,
 };
 use crate::params::LimitedActionType;
 use std::collections::HashSet;
@@ -354,10 +354,17 @@ pub(super) fn conversation_control(
 
 pub(crate) fn candidate() -> CandidateBuilder {
     CandidateBuilder {
-        candidate: HydratedTweetCandidate {
-            tweet_id: TWEET_ID,
-            author_id: AUTHOR_ID,
-            ..Default::default()
+        candidate: PostCandidate {
+            author: UserEntity {
+                id: AUTHOR_ID,
+                ..Default::default()
+            },
+            post: PostEntity {
+                tweet_id: TWEET_ID,
+                ..Default::default()
+            },
+            viewer_relationship: Default::default(),
+            failed: Hydrators::empty(),
         },
         labels: HashSet::new(),
         agent_labels: HashSet::new(),
@@ -365,14 +372,14 @@ pub(crate) fn candidate() -> CandidateBuilder {
 }
 
 pub(crate) struct CandidateBuilder {
-    candidate: HydratedTweetCandidate,
+    candidate: PostCandidate,
     labels: HashSet<SafetyLabelType>,
     agent_labels: HashSet<SafetyLabelType>,
 }
 
 impl CandidateBuilder {
     pub(crate) fn tweet_id(mut self, id: u64) -> Self {
-        self.candidate.tweet_id = id;
+        self.candidate.post.tweet_id = id;
         self
     }
 
@@ -387,28 +394,41 @@ impl CandidateBuilder {
     }
 
     pub(crate) fn with_author_user_label(mut self, label: AuthorLabel) -> Self {
-        self.candidate.author_labels.insert(label);
+        self.candidate.author.labels.insert(label);
         self
     }
 
     pub(crate) fn with_tweet_features(mut self, features: TweetFeatures) -> Self {
-        self.candidate.tweet_features = features;
+        self.candidate.post.tweet_features = features;
         self
     }
 
     pub(crate) fn with_author_features(mut self, features: AuthorFeatures) -> Self {
-        self.candidate.author_features = features;
+        self.candidate.author = UserEntity::new(
+            self.candidate.author.id,
+            features,
+            self.candidate.author.labels,
+        );
         self
     }
 
     pub(crate) fn with_edge(mut self, edge: Hydrator) -> Self {
         debug_assert!(edge.is_edge(), "{edge:?} is not an edge node");
-        self.candidate.edges = self.candidate.edges.with(edge);
+        if let Some(slot) = self.candidate.viewer_relationship.slot(edge) {
+            *slot = true;
+        } else {
+            self.candidate.post.edges = self.candidate.post.edges.with(edge);
+        }
+        debug_assert!(self.candidate.post.edges.iter().all(|node| self
+            .candidate
+            .viewer_relationship
+            .get(node)
+            .is_none()));
         self
     }
 
     pub(crate) fn with_media(mut self) -> Self {
-        self.candidate.tweet_features.media.has_media = true;
+        self.candidate.post.tweet_features.media.has_media = true;
         self
     }
 
@@ -416,19 +436,24 @@ impl CandidateBuilder {
         mut self,
         features: ConversationControlFeatures,
     ) -> Self {
-        self.candidate.conversation_control = Some(features);
+        self.candidate.post.conversation_control = Some(features);
         self
     }
 
     pub(crate) fn retweet_of(mut self, source_tweet_id: u64) -> Self {
-        self.candidate.source_tweet_id = Some(source_tweet_id);
+        self.candidate.post.source_tweet_id = Some(source_tweet_id);
         self
     }
 
-    pub(crate) fn build(self) -> HydratedTweetCandidate {
+    pub(crate) fn reply(mut self) -> Self {
+        self.candidate.post.is_reply = true;
+        self
+    }
+
+    pub(crate) fn build(self) -> PostCandidate {
         let mut candidate = self.candidate;
         if !self.labels.is_empty() {
-            candidate.safety_labels = self.agent_labels.into_iter().fold(
+            candidate.post.safety_labels = self.agent_labels.into_iter().fold(
                 SafetyLabelMap::new(self.labels),
                 SafetyLabelMap::assigned_by_agent,
             );

@@ -2,47 +2,44 @@ use super::{
     ENV_IMAGE, ENV_TWEETYPIE_CLIENT_ID, ENV_TWEETYPIE_TLS_DOMAIN, ENV_TWEETYPIE_XDS_LISTENER,
 };
 use crate::config::ENV_REFERENCE;
-use crate::filter::{FilterOutcome, FilterRequest, FilterTweets};
-use crate::hydration::{HYDRATION_TIMEOUT, request_context};
+use crate::evaluate_tweets::{evaluate_tweets_request, Sends};
+use crate::filter::{FilterOutcome, FilterTweets};
+use crate::hydration::{request_context, HYDRATION_TIMEOUT};
+use crate::models::viewer::Client;
 use crate::models::{Evaluation, RawCandidate, TweetId, Verdict};
 use crate::params::{ClientSwitches, LimitedActionsPolicies};
+use crate::result_label::{failed, label, state_label, Class, Failure, Label, NONE};
 use crate::retweet;
 use crate::rules::SafetyLevel;
-use crate::rules::metrics::Rpc;
 use crate::server_deps::init_client_with_retry;
 use crate::staging::reference_compare::resolve_build_sha;
 use crate::treatment;
 use anyhow::Context;
 use futures::future::join;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::fmt::Debug;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::spawn;
 use tokio::sync::Semaphore;
-use tokio::time::{Instant, timeout};
+use tokio::time::{timeout, Instant};
 use tonic::metadata::MetadataMap;
 use tracing::warn;
 use xai_build_version::current_build_information;
 use xai_stats_receiver::global_stats_receiver;
-use xai_strato::strato_thrift::{StratoResult, strato_decode};
-use xai_strato::{StratoGrpc, encode};
+use xai_strato::strato_thrift::{strato_decode, StratoResult};
+use xai_strato::{encode, StratoGrpc};
 use xai_twittercontext_proto::TwitterContextViewer;
 use xai_x_rpc::balanced_channel::LbPolicy;
 use xai_x_rpc::grpc_client::{ChannelBuilder, TlsMode};
 use xai_x_rpc::retry::RetryConfig;
 use xai_x_rpc::timed_buffer::DEFAULT_BUFFER_MAX_WAIT;
 use xai_x_rpc::total_timeout::DEFAULT_TOTAL_TIMEOUT;
-use xai_x_thrift::action::Action;
 use xai_x_thrift::get_tweet_fields::{
-    GetTweetFieldsOptions, GetTweetFieldsResult, TweetFieldsResultState,
-    VISIBILITY_POLICY_USER_VISIBLE,
+    GetTweetFieldsOptions, GetTweetFieldsResult, VISIBILITY_POLICY_USER_VISIBLE,
 };
 use xai_x_thrift::safety_level::SafetyLevel as ThriftSafetyLevel;
-use xai_x_thrift::safety_result::FilteredReason;
 use xai_xds_client::StartFrom;
 
 const COLUMN: &str = "tweetypie/getTweetFields.Tweet";
@@ -52,95 +49,14 @@ const TWEETYPIE_TIMEOUT: Duration = Duration::from_millis(1500);
 const COMPARE: &str = "vf_tweetypie_reference_compare";
 const BATCHES: &str = "vf_tweetypie_reference_batches";
 const RECORD_LINE_MARKER: &str = "vf_tweetypie_reference_record";
-const SAFETY_LEVEL: SafetyLevel = SafetyLevel::TimelineHomeHydration;
+pub(crate) const SAFETY_LEVEL: SafetyLevel = SafetyLevel::TimelineHomeHydration;
 const RECORD_CAP_PER_MINUTE: u32 = 20;
-const NONE: &str = "none";
-
-#[derive(Clone, Copy, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-pub(crate) enum Class {
-    Allow,
-    BareDrop,
-    Drop,
-    Suppressed,
-    NotFound,
-    Failed,
-    Missing,
-}
-
-#[derive(Clone, Copy, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-enum Failure {
-    NoValue,
-    StratoError,
-    RateLimited,
-    DecodeError,
-    RpcError,
-    OverCapacity,
-    TweetypieFailed,
-}
-
 #[derive(Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 enum BatchOutcome {
     Compared,
     TweetypieTimeout,
     Busy,
-}
-
-pub(crate) type Label = (String, String);
-
-fn label(class: Class, reason: impl Into<String>) -> Label {
-    (<&str>::from(class).to_string(), reason.into())
-}
-
-fn failed(failure: Failure) -> Label {
-    label(Class::Failed, <&str>::from(failure))
-}
-
-fn ident(s: &str) -> (&str, &str) {
-    let end = s
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or(s.len());
-    s.split_at(end)
-}
-
-fn snake(ident: &str) -> String {
-    let mut out = String::with_capacity(ident.len() + 4);
-    for (i, c) in ident.chars().enumerate() {
-        if c.is_ascii_uppercase() && i > 0 {
-            out.push('_');
-        }
-        out.push(c.to_ascii_lowercase());
-    }
-    out
-}
-
-fn debug_label(value: &impl Debug) -> Label {
-    let debug = format!("{value:?}");
-    let class = snake(ident(&debug).0);
-    let Some((_, mut rest)) = debug.split_once("reason: Some(") else {
-        return (class, NONE.to_string());
-    };
-    let reason = loop {
-        let (name, after) = ident(rest);
-        if let Some(inner) = after.strip_prefix(" {")
-            && let Some((_, nested)) = inner.split_once("Some(")
-        {
-            rest = nested;
-            continue;
-        }
-        let number = after
-            .strip_prefix('(')
-            .and_then(|r| r.split(')').next())
-            .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit() || c == '-'));
-        break match (name, number) {
-            ("", _) => "unknown".to_string(),
-            (name, Some(n)) => format!("{}_{n}", snake(name)),
-            (name, None) => snake(name),
-        };
-    };
-    (class, reason)
 }
 
 pub(crate) struct TpResult {
@@ -250,77 +166,6 @@ fn required_env(name: &str) -> String {
         .unwrap_or_else(|| panic!("{name} must be set when {ENV_REFERENCE}=tweetypie"))
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::VariantArray,
-)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Client {
-    #[default]
-    Web,
-    IosCurrent,
-    IosOutdated,
-    AndroidCurrent,
-    AndroidOutdated,
-    AndroidWithoutFosnr,
-    MacApp,
-}
-
-impl Client {
-            const fn app(self) -> (i64, Option<&'static str>) {
-        match self {
-            Self::Web => (3_033_300, None),
-            Self::IosCurrent => (
-                129_032,
-                Some("Twitter-iPhone/11.11.5 iOS/17.0 (Apple;iPhone15,2;;;;;1;2022)"),
-            ),
-            Self::IosOutdated => (
-                129_032,
-                Some("Twitter-iPhone/11.11.4 iOS/17.0 (Apple;iPhone15,2;;;;;1;2022)"),
-            ),
-            Self::AndroidCurrent => (
-                258_901,
-                Some(
-                    "TwitterAndroid/11.11.0-release.00 (311110000-r-0) Pixel 7/14 \
-                     (Google;panther;google;panther;0;;1;2022)",
-                ),
-            ),
-            Self::AndroidOutdated => (
-                258_901,
-                Some(
-                    "TwitterAndroid/11.10.9-release.00 (311109000-r-0) Pixel 7/14 \
-                     (Google;panther;google;panther;0;;1;2022)",
-                ),
-            ),
-            Self::AndroidWithoutFosnr => (
-                258_901,
-                Some(
-                    "TwitterAndroid/9.82.0-release.00 (29820000-r-0) Pixel 7/14 \
-                     (Google;panther;google;panther;0;;1;2022)",
-                ),
-            ),
-            Self::MacApp => (
-                557_701,
-                Some("Twitter-Mac/11.11.5 macOS/14.0 (Apple;Mac14,2)"),
-            ),
-        }
-    }
-
-    pub(crate) fn context(
-        self,
-        viewer_id: Option<u64>,
-        country_code: Option<&str>,
-    ) -> TwitterContextViewer {
-        let (client_application_id, user_agent) = self.app();
-        TwitterContextViewer {
-            user_id: viewer_id.map_or(0, u64::cast_signed),
-            client_application_id,
-            user_agent: user_agent.unwrap_or_default().to_string(),
-            request_country_code: country_code.unwrap_or_default().to_string(),
-            ..Default::default()
-        }
-    }
-}
-
 pub(super) struct TweetypieReference {
     tweetypie: StratoGrpc,
     filter_tweets: Arc<FilterTweets>,
@@ -386,19 +231,16 @@ impl TweetypieReference {
             })
             .collect();
         let client = Client::Web.context(Some(viewer_id), country_code.as_deref());
-        let client_capability =
-            self.client_switches
-                .resolve(Some(&client), Some(viewer_id), country_code.as_deref());
+        let request = evaluate_tweets_request(
+            &self.client_switches,
+            Some(&client),
+            Some(viewer_id),
+            SAFETY_LEVEL,
+            candidates,
+        );
         let rust = request_context(Instant::now(), None).scope(retweet::evaluate_merging_sources(
             &self.filter_tweets,
-            FilterRequest {
-                viewer_id: Some(viewer_id),
-                country_code: country_code.clone(),
-                client_capability,
-                safety_level: SAFETY_LEVEL,
-                candidates,
-                rpc: Rpc::EvaluateTweets,
-            },
+            request,
         ));
         let tp = timeout(
             TWEETYPIE_TIMEOUT,
@@ -512,9 +354,10 @@ struct Compared<'a> {
 
 impl Compared<'_> {
     fn bucket(&self) -> Bucket {
-        let vf = self
-            .vf
-            .map_or_else(|| label(Class::Missing, NONE), vf_label);
+        let vf = self.vf.map_or_else(
+            || label(Class::Missing, NONE),
+            |outcome| vf_label(outcome, SAFETY_LEVEL),
+        );
         let allow: &str = Class::Allow.into();
         let (tp, vf) = if self.tp.label.0 == allow && vf.0 == allow {
             (label(Class::Allow, NONE), label(Class::Allow, NONE))
@@ -523,8 +366,8 @@ impl Compared<'_> {
         };
         let vf_rule = self
             .vf
-            .and_then(|outcome| treatment::decided_rows(outcome.evaluation.verdict()).next())
-            .map_or(NONE, |(rule, _)| rule);
+            .and_then(|outcome| treatment::decided_by(outcome.evaluation.verdict()))
+            .unwrap_or(NONE);
         Bucket { tp, vf, vf_rule }
     }
 
@@ -568,7 +411,7 @@ fn tp_result(result: StratoResult<GetTweetFieldsResult>) -> TpResult {
         StratoResult::Ok {
             value: Some(value), ..
         } => TpResult {
-            label: tp_label(&value.tweet_result),
+            label: state_label(&value.tweet_result),
             result: Some(format!("{:?}", value.tweet_result)),
             strato_error: None,
         },
@@ -592,66 +435,13 @@ fn vf_status(evaluation: &Evaluation) -> &'static str {
     }
 }
 
-pub(crate) fn vf_label(outcome: &FilterOutcome) -> Label {
-    match &outcome.evaluation {
-        Evaluation::Complete { verdict } => tp_label(&treatment::thrift_result_state(
-            verdict,
-            SAFETY_LEVEL,
-            &LimitedActionsPolicies::default(),
-        )),
-        Evaluation::NotFound(_) => label(Class::NotFound, NONE),
-        Evaluation::Partial { .. } | Evaluation::Failed(_) => label(Class::Failed, NONE),
-    }
-}
-
-fn tp_label(state: &TweetFieldsResultState) -> Label {
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "FilteredReason is a generated Thrift union; every variant but SafetyResult labels by its Debug name, including any the IDL adds"
-    )]
-    let reason = |reason: &FilteredReason| match reason {
-        FilteredReason::SafetyResult(result) => debug_label(result).1,
-        other => debug_label(other).0,
-    };
-    match state {
-        TweetFieldsResultState::Found(found) => match &found.suppress_reason {
-            None => label(Class::Allow, NONE),
-            Some(suppress @ FilteredReason::SafetyResult(result)) => {
-                (debug_label(&result.action).0, reason(suppress))
-            }
-            Some(suppress) => label(Class::Suppressed, reason(suppress)),
-        },
-        TweetFieldsResultState::Filtered(filtered) => {
-            #[expect(
-                clippy::wildcard_enum_match_arm,
-                reason = "FilteredReason is a generated Thrift union; every variant but SafetyResult is a plain drop, including any the IDL adds"
-            )]
-            let drop_label = match &filtered.reason {
-                FilteredReason::SafetyResult(result)
-                    if result.reason.is_none()
-                        && matches!(&result.action, Action::Drop(drop) if drop.reason.is_none()) =>
-                {
-                    label(Class::BareDrop, NONE)
-                }
-                filtered @ FilteredReason::SafetyResult(result) => {
-                    (debug_label(&result.action).0, reason(filtered))
-                }
-                filtered => label(Class::Drop, reason(filtered)),
-            };
-            drop_label
-        }
-        TweetFieldsResultState::NotFound(not_found) => label(
-            Class::NotFound,
-            not_found
-                .filtered_reason
-                .as_ref()
-                .map_or_else(|| NONE.to_string(), reason),
-        ),
-        TweetFieldsResultState::Failed(result) if result.over_capacity => {
-            failed(Failure::OverCapacity)
-        }
-        TweetFieldsResultState::Failed(_) => failed(Failure::TweetypieFailed),
-    }
+pub(crate) fn vf_label(outcome: &FilterOutcome, level: SafetyLevel) -> Label {
+    Sends::new(
+        &outcome.evaluation,
+        level,
+        &LimitedActionsPolicies::default(),
+    )
+    .label()
 }
 
 #[cfg(test)]
@@ -665,11 +455,12 @@ mod tests {
     use strum::VariantArray;
     use xai_visibility_filtering::models::FilteredReason as VfFilteredReason;
     use xai_x_thrift::action::{
-        AnyInterstitial, BlockedViewer, Drop as ThriftDrop, Interstitial, InterstitialReason,
-        LimitedEngagementReason, LimitedEngagements, LocalizedMessage, TweetInterstitial,
+        Action, AnyInterstitial, BlockedViewer, Drop as ThriftDrop, Interstitial,
+        InterstitialReason, LimitedEngagementReason, LimitedEngagements, LocalizedMessage,
+        TweetInterstitial,
     };
-    use xai_x_thrift::get_tweet_fields::TweetFieldsResultFound;
-    use xai_x_thrift::safety_result::SafetyResult;
+    use xai_x_thrift::get_tweet_fields::{TweetFieldsResultFound, TweetFieldsResultState};
+    use xai_x_thrift::safety_result::{FilteredReason, SafetyResult};
     use xai_x_thrift::tweet_service::{
         TweetFieldsResultFailed, TweetFieldsResultFiltered, TweetFieldsResultNotFound,
     };
@@ -773,7 +564,7 @@ mod tests {
             ),
         ];
         for (state, (class, reason)) in cases {
-            assert_eq!(tp_label(&state), pair(class, reason), "{state:?}");
+            assert_eq!(state_label(&state), pair(class, reason), "{state:?}");
         }
         let rate_limited = tp_result(StratoResult::Err {
             code: 305,
@@ -865,7 +656,7 @@ mod tests {
             FilteredReason::SafetyResult(SafetyResult::new(None, action)),
         )));
         assert_eq!(
-            tp_label(&state),
+            state_label(&state),
             pair("tweet_interstitial", "blocked_viewer")
         );
     }

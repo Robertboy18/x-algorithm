@@ -40,7 +40,7 @@ class RecsysDenseOptimConfig(OptimConfig):
         @inject_hyperparams
         def schedule_optim(learning_rate, b1, b2, weight_decay):
             return optax.chain(
-                optax.clip_by_global_norm(self.clip_by_global_norm),
+                self.make_clip(),
                 optimizer(learning_rate, b1=b1, b2=b2, weight_decay=weight_decay),
                 scale_by_lr_multiplier(),
             )

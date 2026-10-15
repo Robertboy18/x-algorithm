@@ -1,6 +1,6 @@
 use super::builders::{tweet_candidate, viewer_in_country};
 use super::{Role, Row};
-use crate::models::{HydratedTweetCandidate, TweetFeatures, ViewerFeatures};
+use crate::models::{PostCandidate, TweetFeatures, ViewerFeatures};
 use crate::rules::fixtures::{allow, author_viewer, candidate, dropped};
 use crate::rules::SafetyLevel::TimelineHome;
 use xai_core_entities::entities::TakedownReason;
@@ -214,7 +214,7 @@ pub(super) fn rows() -> Vec<Row> {
     ]
 }
 
-fn takedown_candidate(reason: TakedownReason) -> HydratedTweetCandidate {
+fn takedown_candidate(reason: TakedownReason) -> PostCandidate {
     candidate()
         .with_tweet_features(TweetFeatures {
             takedown_reasons: vec![reason],

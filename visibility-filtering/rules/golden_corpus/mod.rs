@@ -20,8 +20,8 @@ mod trusted_friends;
 mod tweet_label;
 mod tweet_state;
 
-use crate::hydration::{Hydrator, Hydrators};
-use crate::models::{HydratedTweetCandidate, Verdict, ViewerFeatures};
+use crate::hydration::Hydrators;
+use crate::models::{PostCandidate, Verdict, ViewerFeatures};
 use crate::rules::fixtures::{logged_out_viewer, viewer, VIEWER_ID};
 use crate::rules::{RuleEngine, SafetyLevel};
 use crate::treatment::proto_action;
@@ -42,7 +42,7 @@ enum Role {
 
 struct Row {
     name: &'static str,
-    post: HydratedTweetCandidate,
+    post: PostCandidate,
     expect: Vec<(SafetyLevel, Role, Verdict)>,
 }
 
@@ -50,7 +50,7 @@ struct CorpusCase {
     name: String,
     level: SafetyLevel,
     viewer: ViewerFeatures,
-    candidate: HydratedTweetCandidate,
+    candidate: PostCandidate,
     expected: Verdict,
 }
 
@@ -61,13 +61,14 @@ impl Row {
             let mut candidate = post.clone();
             let (role_name, viewer) = match role {
                 Role::NonFollower => ("non_follower", viewer(VIEWER_ID)),
-                Role::Author => ("author", viewer(candidate.author_id)),
+                Role::Author => ("author", viewer(candidate.author.id)),
                 Role::Follower => {
-                    candidate.edges = candidate.edges.with(Hydrator::Follows);
+                    candidate.viewer_relationship.follows = true;
                     ("follower", viewer(VIEWER_ID))
                 }
                 Role::LoggedOut => {
-                    candidate.edges = Hydrators::empty();
+                    candidate.viewer_relationship = Default::default();
+                    candidate.post.edges = Hydrators::empty();
                     ("logged_out", logged_out_viewer())
                 }
                 Role::As(role_name, viewer) => (role_name, viewer),
@@ -209,6 +210,13 @@ fn every_wired_rule_decides_a_corpus_case() {
 
 fn corpus() -> Vec<CorpusCase> {
     rows().into_iter().flat_map(Row::expand).collect()
+}
+
+pub(super) fn pairs() -> Vec<(ViewerFeatures, PostCandidate)> {
+    corpus()
+        .into_iter()
+        .map(|case| (case.viewer, case.candidate))
+        .collect()
 }
 
 fn rows() -> Vec<Row> {

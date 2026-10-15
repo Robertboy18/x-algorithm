@@ -3,8 +3,7 @@ use super::{Role, Row};
 use crate::hydration::Hydrator::OutsideNarrowcastPlace;
 use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    ConversationControlFeatures, HydratedTweetCandidate, LimitedEngagementReason, SafetyLabelType,
-    TweetFeatures,
+    ConversationControlFeatures, LimitedEngagementReason, SafetyLabelType, TweetFeatures,
 };
 use crate::rules::fixtures::{
     allow, blurred, blurred_and_limited, candidate, conversation_control, limited, limited_for,
@@ -74,20 +73,22 @@ pub(super) fn rows() -> Vec<Row> {
         },
         Row {
             name: "local_post_location_lookup_failed",
-            post: HydratedTweetCandidate {
-                failed: Hydrators::of(OutsideNarrowcastPlace),
-                ..local_post().build()
+            post: {
+                let mut candidate = local_post().build();
+                candidate.failed = Hydrators::of(OutsideNarrowcastPlace);
+                candidate
             },
             expect: vec![hydration(Role::NonFollower, allow())],
         },
         Row {
             name: "local_post_conversation_control_failed",
-            post: HydratedTweetCandidate {
-                failed: Hydrators::of(Hydrator::ConversationControl),
-                ..candidate()
+            post: {
+                let mut candidate = candidate()
                     .with_tweet_features(local_place())
                     .with_edge(OutsideNarrowcastPlace)
-                    .build()
+                    .build();
+                candidate.failed = Hydrators::of(Hydrator::ConversationControl);
+                candidate
             },
             expect: vec![hydration(Role::Author, local())],
         },

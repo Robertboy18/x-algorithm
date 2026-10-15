@@ -408,6 +408,9 @@ class RustParquetDataset(PhoenixDataset):
                 zero_stale_post_14d_candidate_counts=dataset.enable_stale_post,
                 stale_post_30d=dataset.enable_stale_post_30d,
                 ads_head_masking=dataset.ads_head_masking,
+                ads_pixel_head_masking=dataset.ads_pixel_head_masking,
+                reply_parent_mode=dataset.reply_parent_mode,
+                page_records=dataset.page_records,
             )
 
             if record_batch.num_rows < batch_size:

@@ -1,7 +1,8 @@
 use super::builders::controlled_root;
 use super::{Role, Row};
 use crate::hydration::Hydrator::{
-    BlockedByAuthor, BlockedByReplyRoot, Blocks, MuteRetweets, Mutes,
+    BlockedByAuthor, BlockedByConversationRoot, BlockedByConversationRootPost, BlockedByReplyRoot,
+    Blocks, MuteRetweets, Mutes,
 };
 use crate::models::LimitedEngagementReason;
 use crate::rules::fixtures::{allow, candidate, dropped, limited, limited_for};
@@ -114,6 +115,55 @@ pub(super) fn rows() -> Vec<Row> {
                         LimitedEngagementReason::ConversationControl,
                     ],
                     "blocked_viewer/limited_engagement/root_author_blocked_viewer",
+                ),
+            )],
+        },
+        Row {
+            name: "nested_root_author_block_community_conversation",
+            post: candidate()
+                .with_edge(BlockedByConversationRoot)
+                .reply()
+                .with_conversation_control(controlled_root(ConversationControlArm::Community))
+                .build(),
+            expect: vec![(
+                TimelineHomeHydration,
+                Role::NonFollower,
+                limited_for(
+                    &[
+                        LimitedEngagementReason::RootAuthorBlockedViewer,
+                        LimitedEngagementReason::ConversationControl,
+                    ],
+                    "blocked_viewer/limited_engagement/root_author_blocked_viewer",
+                ),
+            )],
+        },
+        Row {
+            name: "conversation_root_post_author_block",
+            post: candidate()
+                .with_edge(BlockedByConversationRootPost)
+                .reply()
+                .build(),
+            expect: vec![(
+                TimelineHomeHydration,
+                Role::NonFollower,
+                limited(
+                    LimitedEngagementReason::RootAuthorBlockedViewer,
+                    "blocked_viewer/limited_engagement/root_author_blocked_viewer",
+                ),
+            )],
+        },
+        Row {
+            name: "root_author_block_on_the_community_root",
+            post: candidate()
+                .with_edge(BlockedByConversationRoot)
+                .with_conversation_control(controlled_root(ConversationControlArm::Community))
+                .build(),
+            expect: vec![(
+                TimelineHomeHydration,
+                Role::NonFollower,
+                limited(
+                    LimitedEngagementReason::ConversationControl,
+                    "limit_replies_community/limited_engagement/conversation_control",
                 ),
             )],
         },

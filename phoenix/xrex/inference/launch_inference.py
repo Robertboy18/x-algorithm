@@ -6,6 +6,7 @@ import importlib.util
 import os
 import random
 import logging
+import re
 import shutil
 import uuid
 
@@ -23,7 +24,7 @@ from xrex.utils import cluster
 import xrex.inference.sid_services
 import xrex.inference.serving_services
 
-for _family in ("xrex.inference.gen_recs_services",):
+for _family in ("xrex.inference.gen_recs_services", "xrex.inference.reply_services"):
     if importlib.util.find_spec(_family) is not None:
         importlib.import_module(_family)
 
@@ -34,6 +35,29 @@ log_level_str = os.environ.get("LOG_LEVEL", "INFO")
 log_level = getattr(logging, log_level_str.upper(), logging.INFO)
 logger = logging.getLogger()
 logger.setLevel(log_level)
+
+
+class _BatchLogSampler(logging.Filter):
+    _PREFIX = re.compile(r"^\[batch=(-?\d+)\]")
+
+    def __init__(self, every: int):
+        super().__init__()
+        self.every = every
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        m = self._PREFIX.match(record.getMessage())
+        if m is None:
+            return True
+        batch_id = int(m.group(1))
+        return batch_id < 0 or batch_id % self.every == 0
+
+
+def install_batch_log_sampler(every: int) -> None:
+    if every <= 1:
+        return
+    sampler = _BatchLogSampler(every)
+    for name in ("xrex.inference.model_runner", "xrex.inference.h2d"):
+        logging.getLogger(name).addFilter(sampler)
 
 
 def str2bool(value: str) -> bool:
@@ -357,6 +381,8 @@ def run(
     runner.channel_size = args.channel_size
     runner.enqueue_timeout_ms = args.enqueue_timeout_ms
     runner.queue_max_staleness_ms = args.queue_max_staleness_ms
+    runner.queue_batch_wait_ms = args.queue_batch_wait_ms
+    runner.reload_trigger_poll_interval_s = args.reload_trigger_poll_interval_ms / 1000.0
     runner.enable_deadline_admission = args.enable_deadline_admission
     runner.deadline_margin_ms = args.deadline_margin_ms
     runner.deadline_post_ms = args.deadline_post_ms
@@ -370,6 +396,7 @@ def run(
     runner.enable_topic_filter = args.enable_topic_filter
     runner.fake_mm_embeddings = args.fake_mm_embeddings
     runner.enable_async_response_compression = args.enable_async_response_compression
+    runner.sid_endpoint = args.sid_endpoint
     runner.enable_hotswap = args.enable_hotswap
     runner.hotswap_download_rate_limit_gbps = args.hotswap_download_rate_limit_gib_per_s
     runner.hotswap_download_max_concurrent = args.hotswap_download_max_concurrent
@@ -523,6 +550,31 @@ if __name__ == "__main__":
         type=int,
         default=1000,
         help="Timeout in ms for enqueueing requests (default: 1000)",
+    )
+    parser.add_argument(
+        "--queue_batch_wait_ms",
+        type=float,
+        default=0.0,
+        help=(
+            "Dequeue batching window in ms. 0 (default) returns whatever is buffered; "
+            "> 0 waits up to this long for a first item when the queue is empty, or to fill "
+            "the batch when it isn't, so host-bound models amortize per-batch work."
+        ),
+    )
+    parser.add_argument(
+        "--reload_trigger_poll_interval_ms",
+        type=float,
+        default=0.0,
+        help="Multi-worker: min interval between shm reload-trigger polls (0 = every loop).",
+    )
+    parser.add_argument(
+        "--batch_log_every",
+        type=int,
+        default=1,
+        help=(
+            "Emit the per-batch '[batch=N] ...' timing log lines only for every Nth batch "
+            "(1 = every batch). Each batch logs ~10 lines, which is measurable at high QPS."
+        ),
     )
     parser.add_argument(
         "--queue_max_staleness_ms",
@@ -695,6 +747,12 @@ if __name__ == "__main__":
         help="Enable async gRPC response compression (zstd, off the tokio executor).",
     )
     parser.add_argument(
+        "--sid_endpoint",
+        type=str,
+        default=None,
+        help="Reply ranker: SID root (http://host:port) for request-path hydration.",
+    )
+    parser.add_argument(
         "--enable_hotswap",
         type=str2bool,
         default=False,
@@ -850,6 +908,7 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    install_batch_log_sampler(args.batch_log_every)
     for flag, env in (
         ("copy_tls_ca", "COPY_PORT_TLS_CA"),
         ("copy_tls_cert", "COPY_PORT_TLS_CERT"),

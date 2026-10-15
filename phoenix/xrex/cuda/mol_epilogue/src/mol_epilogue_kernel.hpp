@@ -22,3 +22,21 @@ ffi::Error mol_epilogue(
     int64_t num_users,
     int64_t num_components
 );
+
+ffi::Error mol_fused_int8(
+    cudaStream_t stream,
+    ffi::Buffer<ffi::DataType::S8> posts,
+    ffi::Buffer<ffi::DataType::F32> post_scales,
+    ffi::Buffer<ffi::DataType::S8> queries,
+    ffi::Buffer<ffi::DataType::F32> query_scales,
+    ffi::Buffer<ffi::DataType::F32> norms,
+    ffi::Buffer<ffi::DataType::F32> ubias,
+    ffi::Buffer<ffi::DataType::F32> ibias,
+    ffi::Buffer<ffi::DataType::F32> w1,
+    ffi::Buffer<ffi::DataType::F32> b1,
+    ffi::Buffer<ffi::DataType::F32> w2,
+    ffi::Buffer<ffi::DataType::F32> b2,
+    ffi::Result<ffi::Buffer<ffi::DataType::BF16>> out,
+    int64_t num_users,
+    int64_t col_offset
+);

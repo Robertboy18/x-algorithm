@@ -20,6 +20,14 @@ fn author_hydration_lookup_context() -> LookupContext {
     }
 }
 
+fn viewer_lookup_context(viewer_id: i64) -> LookupContext {
+    LookupContext {
+        for_user_id: Some(viewer_id),
+        include_soft_users: true,
+        ..author_hydration_lookup_context()
+    }
+}
+
 impl GizmoduckLookup {
     pub fn new(inner: Arc<dyn GizmoduckClient + Send + Sync>) -> Self {
         Self { inner }
@@ -44,9 +52,14 @@ impl GizmoduckLookup {
         viewer_id: u64,
         fields: &[QueryFields],
     ) -> anyhow::Result<Option<GizmoduckUser>> {
+        let viewer_id = viewer_id.cast_signed();
         let result = self
             .inner
-            .get_users_with_context(vec![viewer_id.cast_signed()], None, fields)
+            .get_users_with_context(
+                vec![viewer_id],
+                Some(viewer_lookup_context(viewer_id)),
+                fields,
+            )
             .await
             .into_values()
             .next()
@@ -140,12 +153,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn viewer_lookups_pass_no_context() {
+    async fn viewer_lookups_include_every_user_state_tweetypie_reads() {
         let client = Arc::new(Recording::default());
         let viewer = GizmoduckLookup::new(Arc::<Recording>::clone(&client))
             .get_viewer(10, &[QueryFields::SAFETY])
             .await;
         assert!(viewer.is_err(), "an empty batch is an error");
-        assert!(matches!(client.0.lock().unwrap().as_slice(), [None]));
+        let contexts = client.0.lock().unwrap();
+        let [Some(context)] = contexts.as_slice() else {
+            panic!("one lookup with a context: {contexts:?}")
+        };
+        assert!(context.include_deactivated);
+        assert!(context.include_failed);
+        assert!(context.include_erased);
+        assert!(context.include_offboarded);
+        assert!(context.include_no_screen_name_users);
+        assert!(context.include_soft_users);
+        assert_eq!(context.for_user_id, Some(10));
     }
 }

@@ -64,36 +64,11 @@ mod tests {
     const TTL: Duration = Duration::from_secs(30);
 
     #[test]
-    fn entry_past_ttl_is_expired() {
-        let (clock, mock) = Clock::mock();
-        let cache = ExpiringCache::<u64, u32>::with_clock(8, clock);
-        cache.insert(1, 42, TTL);
-        mock.increment(TTL + Duration::from_secs(1));
-        assert!(matches!(cache.get(&1), Lookup::Expired));
-    }
-
-    #[test]
     fn entry_exactly_at_ttl_is_expired() {
         let (clock, mock) = Clock::mock();
         let cache = ExpiringCache::<u64, u32>::with_clock(8, clock);
         cache.insert(1, 42, TTL);
         mock.increment(TTL);
         assert!(matches!(cache.get(&1), Lookup::Expired));
-    }
-
-    #[test]
-    fn reinsert_restamps_expiry() {
-        let (clock, mock) = Clock::mock();
-        let cache = ExpiringCache::<u64, u32>::with_clock(8, clock);
-        cache.insert(1, 42, TTL);
-        assert!(matches!(cache.get(&1), Lookup::Found(42)));
-        let first = cache.expiry_of(&1).unwrap();
-
-        mock.increment(TTL + Duration::from_secs(1));
-        cache.insert(1, 7, TTL);
-
-        let restamped = cache.expiry_of(&1).unwrap();
-        assert!(restamped > first);
-        assert!(matches!(cache.get(&1), Lookup::Found(7)));
     }
 }

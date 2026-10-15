@@ -13,7 +13,8 @@ use xai_feature_switches::{Feature, FeatureSwitches, RecipientBuilder, Value};
 use xai_stats_receiver::StatsReceiverExt;
 
 pub(crate) use client_switches::ClientSwitches;
-pub(crate) use limited_actions_policy::{LimitedActionType, LimitedActionsPolicies};
+pub use limited_actions_policy::LimitedActionType;
+pub(crate) use limited_actions_policy::LimitedActionsPolicies;
 
 const SCALA_FILES: [&str; 6] = [
     "age_verification.yml",
@@ -33,7 +34,7 @@ const LOAD_FAILURE_COUNTER: &str = "feature_switch_load_failures";
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, strum::VariantArray,
 )]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CountryList {
+pub enum CountryList {
     NsfwGating,
     AgeVerification,
     Tombstone,
@@ -52,6 +53,14 @@ impl CountryList {
                 "country_specific_nsfw_content_gating_local_regulations_countries"
             }
         }
+    }
+
+    pub(crate) fn listed_by_default(code: &str) -> Option<&'static str> {
+        Self::VARIANTS
+            .iter()
+            .flat_map(|list| list.default_codes())
+            .find(|&&listed| listed == code)
+            .copied()
     }
 
     const fn default_codes(self) -> &'static [&'static str] {

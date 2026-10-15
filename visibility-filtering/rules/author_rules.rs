@@ -1,182 +1,156 @@
 use crate::models::AuthorLabel;
-use crate::rules::rule_spec::{
-    author, drop_post, everyone, except_author, not, relationship, rule, tweet, viewer,
-    AuthorPredicate, Condition, RelationshipPredicate, RuleClause, RuleId, TweetPredicate,
-    ViewerPredicate,
+use crate::rules::rule_spec::leaves::*;
+use crate::rules::rule_spec::rule::Audience::{Everyone, NonAuthors, NonFollowers};
+use crate::rules::rule_spec::rule::{all, Rule};
+use crate::rules::rule_spec::*;
+
+pub(super) const SUSPENDED_AUTHOR_DROP: Rule = Rule {
+    id: RuleId::SuspendedAuthor,
+    audience: NonAuthors,
+    when: all![AuthorIsSuspended],
+    action: drop_post(DropAs::AuthorIsSuspended),
 };
-use xai_visibility_filtering::models::FilteredReason;
 
-const NOT_FOLLOWER: Condition = not(relationship(RelationshipPredicate::ViewerFollowsAuthor));
+pub(super) const DEACTIVATED_AUTHOR_DROP: Rule = Rule {
+    id: RuleId::DeactivatedAuthor,
+    audience: NonAuthors,
+    when: all![AuthorIsDeactivated],
+    action: drop_post(DropAs::AuthorIsDeactivated),
+};
 
-fn author_drop(id: RuleId, state: AuthorPredicate, reason: FilteredReason) -> Vec<RuleClause> {
-    rule(id, except_author([author(state)], drop_post(reason)))
-}
+pub(super) const ERASED_AUTHOR_DROP_INACTIVE: Rule = Rule {
+    id: RuleId::ErasedAuthor,
+    audience: NonAuthors,
+    when: all![AuthorIsErased],
+    action: drop_post(DropAs::AuthorAccountIsInactive),
+};
 
-fn suspended_author() -> Vec<RuleClause> {
-    author_drop(
-        RuleId::SuspendedAuthor,
-        AuthorPredicate::IsSuspended,
-        FilteredReason::AuthorIsSuspended,
-    )
-}
+pub(super) const OFFBOARDED_AUTHOR_DROP_INACTIVE: Rule = Rule {
+    id: RuleId::OffboardedAuthor,
+    audience: NonAuthors,
+    when: all![AuthorIsOffboarded],
+    action: drop_post(DropAs::AuthorAccountIsInactive),
+};
 
-fn deactivated_author() -> Vec<RuleClause> {
-    author_drop(
-        RuleId::DeactivatedAuthor,
-        AuthorPredicate::IsDeactivated,
-        FilteredReason::AuthorIsDeactivated,
-    )
-}
+pub(super) const PROTECTED_AUTHOR_DROP: Rule = Rule {
+    id: RuleId::ProtectedAuthor,
+    audience: NonFollowers,
+    when: all![AuthorIsProtected],
+    action: drop_post(DropAs::AuthorIsProtected),
+};
 
-fn erased_author() -> Vec<RuleClause> {
-    author_drop(
-        RuleId::ErasedAuthor,
-        AuthorPredicate::IsErased,
-        FilteredReason::AuthorAccountIsInactive,
-    )
-}
+pub(super) const VIEWER_BLOCKS_AUTHOR_DROP: Rule = Rule {
+    id: RuleId::ViewerBlocksAuthor,
+    audience: Everyone,
+    when: all![!ViewerLoggedOut, ViewerBlocksAuthor],
+    action: drop_post(DropAs::ViewerBlocksAuthor),
+};
 
-fn offboarded_author() -> Vec<RuleClause> {
-    author_drop(
-        RuleId::OffboardedAuthor,
-        AuthorPredicate::IsOffboarded,
-        FilteredReason::AuthorAccountIsInactive,
-    )
-}
+pub(super) const VIEWER_MUTES_AUTHOR_DROP: Rule = Rule {
+    id: RuleId::ViewerMutesAuthor,
+    audience: Everyone,
+    when: all![!ViewerLoggedOut, ViewerMutesAuthor],
+    action: drop_post(DropAs::ViewerMutesAuthor),
+};
 
-fn protected_author() -> Vec<RuleClause> {
-    rule(
-        RuleId::ProtectedAuthor,
-        except_author(
-            [author(AuthorPredicate::IsProtected), NOT_FOLLOWER],
-            drop_post(FilteredReason::AuthorIsProtected),
-        ),
-    )
-}
+pub(super) const VIEWER_MUTES_RETWEETS_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::ViewerMutesRetweets,
+    audience: Everyone,
+    when: all![
+        !ViewerLoggedOut,
+        TweetIsRetweet,
+        ViewerMutesRetweetsFromAuthor
+    ],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
 
-pub(super) fn author_state_drops() -> Vec<RuleClause> {
-    [
-        suspended_author(),
-        deactivated_author(),
-        erased_author(),
-        offboarded_author(),
-        protected_author(),
-    ]
-    .concat()
-}
+pub(super) const NSFW_USER_AUTHOR_DROP_NSFW_MEDIA: Rule = Rule {
+    id: RuleId::NsfwUserAuthor,
+    audience: NonAuthors,
+    when: all![AuthorIsNsfwUser],
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
 
-pub(super) fn home_hydration_author_state_drops() -> Vec<RuleClause> {
-    [
-        erased_author(),
-        deactivated_author(),
-        suspended_author(),
-        offboarded_author(),
-        protected_author(),
-    ]
-    .concat()
-}
+pub(super) const NSFW_ADMIN_AUTHOR_DROP_NSFW_MEDIA: Rule = Rule {
+    id: RuleId::NsfwAdminAuthor,
+    audience: NonAuthors,
+    when: all![AuthorIsNsfwAdmin],
+    action: drop_post(DropAs::ContainNsfwMedia),
+};
 
-pub(super) fn oon_nsfw_author_drops() -> Vec<RuleClause> {
-    [
-        author_drop(
-            RuleId::NsfwUserAuthor,
-            AuthorPredicate::IsNsfwUser,
-            FilteredReason::ContainNsfwMedia,
-        ),
-        author_drop(
-            RuleId::NsfwAdminAuthor,
-            AuthorPredicate::IsNsfwAdmin,
-            FilteredReason::ContainNsfwMedia,
-        ),
-    ]
-    .concat()
-}
+pub(super) const NSFW_HIGH_RECALL_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::NsfwHighRecallUserLabel,
+    audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::NsfwHighRecall)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
 
-fn user_label_drop(id: RuleId, label: AuthorLabel) -> Vec<RuleClause> {
-    author_drop(
-        id,
-        AuthorPredicate::HasUserLabel(label),
-        FilteredReason::UnspecifiedReason,
-    )
-}
+pub(super) const NSFW_HIGH_PRECISION_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::NsfwHighPrecisionUserLabel,
+    audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::NsfwHighPrecision)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
 
-fn non_follower_user_label_drop(id: RuleId, label: AuthorLabel) -> Vec<RuleClause> {
-    rule(
-        id,
-        except_author(
-            [author(AuthorPredicate::HasUserLabel(label)), NOT_FOLLOWER],
-            drop_post(FilteredReason::UnspecifiedReason),
-        ),
-    )
-}
+pub(super) const NSFW_AVATAR_IMAGE_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::NsfwAvatarImageUserLabel,
+    audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::NsfwAvatarImage)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
 
-pub(super) fn oon_nsfw_user_label_drops() -> Vec<RuleClause> {
-    use AuthorLabel::{
-        NsfwAvatarImage, NsfwBannerImage, NsfwHighPrecision, NsfwHighRecall, NsfwNearPerfect,
-    };
-    [
-        user_label_drop(RuleId::NsfwHighRecallUserLabel, NsfwHighRecall),
-        user_label_drop(RuleId::NsfwHighPrecisionUserLabel, NsfwHighPrecision),
-        user_label_drop(RuleId::NsfwAvatarImageUserLabel, NsfwAvatarImage),
-        user_label_drop(RuleId::NsfwBannerImageUserLabel, NsfwBannerImage),
-        user_label_drop(RuleId::NsfwNearPerfectUserLabel, NsfwNearPerfect),
-    ]
-    .concat()
-}
+pub(super) const NSFW_BANNER_IMAGE_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::NsfwBannerImageUserLabel,
+    audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::NsfwBannerImage)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
 
-pub(super) fn oon_user_label_drops() -> Vec<RuleClause> {
-    use AuthorLabel::{
-        AbusiveHighRecall, Compromised, DoNotAmplify, ImpersonationHighPrecision, ReadOnly,
-        SpamHighRecall,
-    };
-    [
-        user_label_drop(RuleId::SpamHighRecallUserLabel, SpamHighRecall),
-        user_label_drop(RuleId::CompromisedUserLabel, Compromised),
-        user_label_drop(RuleId::ReadOnlyUserLabel, ReadOnly),
-        user_label_drop(
-            RuleId::ImpersonationHighPrecisionUserLabel,
-            ImpersonationHighPrecision,
-        ),
-        non_follower_user_label_drop(RuleId::AbusiveHighRecallUserLabel, AbusiveHighRecall),
-        non_follower_user_label_drop(RuleId::DoNotAmplifyUserLabel, DoNotAmplify),
-    ]
-    .concat()
-}
+pub(super) const NSFW_NEAR_PERFECT_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::NsfwNearPerfectUserLabel,
+    audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::NsfwNearPerfect)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
 
-pub(super) fn socialgraph_drops() -> Vec<RuleClause> {
-    const NOT_LOGGED_OUT: Condition = not(viewer(ViewerPredicate::LoggedOut));
-    [
-        rule(
-            RuleId::ViewerBlocksAuthor,
-            everyone(
-                [
-                    NOT_LOGGED_OUT,
-                    relationship(RelationshipPredicate::ViewerBlocksAuthor),
-                ],
-                drop_post(FilteredReason::ViewerBlocksAuthor),
-            ),
-        ),
-        rule(
-            RuleId::ViewerMutesAuthor,
-            everyone(
-                [
-                    NOT_LOGGED_OUT,
-                    relationship(RelationshipPredicate::ViewerMutesAuthor),
-                ],
-                drop_post(FilteredReason::ViewerMutesAuthor),
-            ),
-        ),
-        rule(
-            RuleId::ViewerMutesRetweets,
-            everyone(
-                [
-                    NOT_LOGGED_OUT,
-                    tweet(TweetPredicate::IsRetweet),
-                    relationship(RelationshipPredicate::ViewerMutesRetweetsFromAuthor),
-                ],
-                drop_post(FilteredReason::UnspecifiedReason),
-            ),
-        ),
-    ]
-    .concat()
-}
+pub(super) const SPAM_HIGH_RECALL_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::SpamHighRecallUserLabel,
+    audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::SpamHighRecall)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const COMPROMISED_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::CompromisedUserLabel,
+    audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::Compromised)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const READ_ONLY_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::ReadOnlyUserLabel,
+    audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::ReadOnly)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const IMPERSONATION_HIGH_PRECISION_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::ImpersonationHighPrecisionUserLabel,
+    audience: NonAuthors,
+    when: all![AuthorHasLabel(AuthorLabel::ImpersonationHighPrecision)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const ABUSIVE_HIGH_RECALL_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::AbusiveHighRecallUserLabel,
+    audience: NonFollowers,
+    when: all![AuthorHasLabel(AuthorLabel::AbusiveHighRecall)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};
+
+pub(super) const DO_NOT_AMPLIFY_USER_LABEL_DROP_UNSPECIFIED: Rule = Rule {
+    id: RuleId::DoNotAmplifyUserLabel,
+    audience: NonFollowers,
+    when: all![AuthorHasLabel(AuthorLabel::DoNotAmplify)],
+    action: drop_post(DropAs::UnspecifiedReason),
+};

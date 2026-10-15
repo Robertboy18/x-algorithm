@@ -433,6 +433,16 @@ class MultiHeadAttention(hk.Module):
                 extra_attn_kwargs.update(
                     {f"bsp_{f.name}": _add_h_axis(getattr(bs, f.name)) for f in dc_fields(bs)}
                 )
+                if seqpack_layout.candidate_cu_seqlens is not None:
+                    for name in (
+                        "candidate_cu_seqlens",
+                        "candidate_token_to_slot",
+                        "candidate_key_starts",
+                        "candidate_key_counts",
+                    ):
+                        extra_attn_kwargs[name] = jnp.asarray(
+                            getattr(seqpack_layout, name), dtype=jnp.int32
+                        )
             case "cutedsl_ranker_attn":
                 attn_class = CutedslRankerAttention
             case _:

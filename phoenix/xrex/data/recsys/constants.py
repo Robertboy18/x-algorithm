@@ -83,6 +83,9 @@ primary_engagement_to_action_types = {
     "IsPostUnexplored": [
         "ServerTweetPostUnexplored",
     ],
+    "IsReactedWithVideo": [
+        "ServerTweetReactWithVideo",
+    ],
     "IsExternalLinkLongDwelled": [
         "ClientTweetExternalLinkLongDwelled",
     ],
@@ -402,6 +405,29 @@ ads_slim_engagement_to_action_types = {
     },
 }
 
+_REPLY_KEEP_ENGAGEMENTS = {
+    "IsFavorited",
+    "IsClicked",
+    "IsRecapDwelled",
+    "IsRecapNotDwelled",
+    "IsVideoQualityViewed",
+    "IsProfileClicked",
+    "IsOpenLink",
+    "IsReplied",
+    "IsRetweeted",
+}
+reply_engagement_to_action_types = {
+    eng: actions
+    for eng, actions in primary_engagement_to_action_types.items()
+    if eng in _REPLY_KEEP_ENGAGEMENTS
+}
+reply_engagement_to_action_types["IsNegativeFeedback"] = [
+    "ClientTweetBlockAuthor",
+    "ClientTweetMuteAuthor",
+    "ClientTweetReport",
+    "ServerTweetReport",
+]
+
 
 eng_to_action_types = {
     "default": primary_engagement_to_action_types,
@@ -411,6 +437,7 @@ eng_to_action_types = {
     "ads_conversion": ads_conversion_engagement_to_action_types,
     "ads_p_conv_click": ads_p_conv_click_engagement_to_action_types,
     "ads_slim": ads_slim_engagement_to_action_types,
+    "reply": reply_engagement_to_action_types,
     "none": {},
 }
 

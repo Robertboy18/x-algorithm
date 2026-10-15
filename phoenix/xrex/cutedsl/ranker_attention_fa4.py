@@ -99,6 +99,117 @@ def build_dense_block_sparse_layout(seq_len, hist_len, num_q_heads, hist_valid_l
     return fwd_bs, bwd_bs, _bcast(valid_block_upper), _bcast(valid_block_lower)
 
 
+def fwd_launcher(arch, head_dim, qhead_per_kvhead, use_pack_gqa, score_mod):
+    import cuda.bindings.driver as cuda_driver
+    import cutlass
+    import cutlass.cute as cute
+
+    from xrex.cutedsl.ranker_fa4.block_sparsity import BlockSparseTensors
+
+    m_block = 128
+    n_block = 128
+    if arch == 80:
+        from xrex.cutedsl.ranker_fa4.flash_fwd import FlashAttentionForwardSm80
+
+        fa_fwd = FlashAttentionForwardSm80(
+            cutlass.BFloat16,
+            head_dim,
+            head_dim,
+            qhead_per_kvhead,
+            is_causal=False,
+            is_local=False,
+            pack_gqa=False,
+            tile_m=64,
+            tile_n=n_block,
+            num_stages=1,
+            num_threads=128,
+            Q_in_regs=False,
+            q_subtile_factor=m_block // 64,
+        )
+    elif arch == 90:
+        from xrex.cutedsl.ranker_fa4.flash_fwd_sm90 import FlashAttentionForwardSm90
+
+        fa_fwd = FlashAttentionForwardSm90(
+            cutlass.BFloat16,
+            head_dim,
+            head_dim,
+            qhead_per_kvhead,
+            is_causal=False,
+            is_local=False,
+            pack_gqa=use_pack_gqa,
+            tile_m=m_block,
+            tile_n=n_block,
+            num_stages=2,
+            num_threads=384,
+            Q_in_regs=False,
+            intra_wg_overlap=True,
+            mma_pv_is_rs=True,
+            mask_mod=None,
+            score_mod=score_mod,
+        )
+    else:
+        from xrex.cutedsl.ranker_fa4.flash_fwd_sm100 import FlashAttentionForwardSm100
+
+        fa_fwd = FlashAttentionForwardSm100(
+            head_dim=head_dim,
+            head_dim_v=head_dim,
+            qhead_per_kvhead=qhead_per_kvhead,
+            is_causal=False,
+            is_local=False,
+            pack_gqa=use_pack_gqa,
+            is_persistent=True,
+            mask_mod=None,
+            score_mod=score_mod,
+            q_stage=1,
+        )
+
+    @cute.jit
+    def launch_fwd(
+        stream: cuda_driver.CUstream,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mMaskCnt: cute.Tensor,
+        mMaskIdx: cute.Tensor,
+        mFullCnt: cute.Tensor,
+        mFullIdx: cute.Tensor,
+        mDiagCnt: cute.Tensor,
+        mDiagIdx: cute.Tensor,
+        mValidUpper: cute.Tensor,
+        mValidLower: cute.Tensor,
+        mO: cute.Tensor,
+        mLSE: cute.Tensor,
+        softmax_scale: cutlass.Float32,
+    ):
+        bs = BlockSparseTensors(
+            mask_block_cnt=mMaskCnt,
+            mask_block_idx=mMaskIdx,
+            full_block_cnt=mFullCnt,
+            full_block_idx=mFullIdx,
+            cu_total_m_blocks=None,
+            cu_block_idx_offsets=None,
+            dq_write_order=None,
+            dq_write_order_full=None,
+            diag_block_cnt=mDiagCnt,
+            diag_block_idx=mDiagIdx,
+            dq_write_order_diag=None,
+            valid_block_upper=mValidUpper,
+            valid_block_lower=mValidLower,
+        )
+        fa_fwd(
+            mQ,
+            mK,
+            mV,
+            mO,
+            mLSE,
+            softmax_scale,
+            blocksparse_tensors=bs,
+            stream=stream,
+        )
+
+    return launch_fwd
+
+
 def ranker_attention_fa4(
     q,
     k,
@@ -180,108 +291,11 @@ def ranker_attention_fa4(
     )
 
     if cache_key not in _FA4_KERNEL_CACHE:
-        if arch == 80:
-            from xrex.cutedsl.ranker_fa4.flash_fwd import FlashAttentionForwardSm80
-
-            fa_fwd = FlashAttentionForwardSm80(
-                cutlass.BFloat16,
-                head_dim,
-                head_dim,
-                qhead_per_kvhead,
-                is_causal=False,
-                is_local=False,
-                pack_gqa=False,
-                tile_m=64,
-                tile_n=n_block,
-                num_stages=1,
-                num_threads=128,
-                Q_in_regs=False,
-                q_subtile_factor=m_block // 64,
-            )
-        elif arch == 90:
-            from xrex.cutedsl.ranker_fa4.flash_fwd_sm90 import FlashAttentionForwardSm90
-
-            fa_fwd = FlashAttentionForwardSm90(
-                cutlass.BFloat16,
-                head_dim,
-                head_dim,
-                qhead_per_kvhead,
-                is_causal=False,
-                is_local=False,
-                pack_gqa=use_pack_gqa,
-                tile_m=m_block,
-                tile_n=n_block,
-                num_stages=2,
-                num_threads=384,
-                Q_in_regs=False,
-                intra_wg_overlap=True,
-                mma_pv_is_rs=True,
-                mask_mod=None,
-                score_mod=score_mod,
-            )
-        else:
-            from xrex.cutedsl.ranker_fa4.flash_fwd_sm100 import FlashAttentionForwardSm100
-
-            fa_fwd = FlashAttentionForwardSm100(
-                head_dim=head_dim,
-                head_dim_v=head_dim,
-                qhead_per_kvhead=qhead_per_kvhead,
-                is_causal=False,
-                is_local=False,
-                pack_gqa=use_pack_gqa,
-                is_persistent=True,
-                mask_mod=None,
-                score_mod=score_mod,
-                q_stage=1,
-            )
+        launch_fwd = fwd_launcher(arch, head_dim, qhead_per_kvhead, use_pack_gqa, score_mod)
 
         q_shape = (batch_size, seq_len, num_q_heads, head_dim)
         k_shape = (batch_size, seq_len, num_kv_heads, head_dim)
         lse_shape = (batch_size, num_q_heads, seq_len)
-
-        @cute.jit
-        def launch_fwd(
-            stream: cuda_driver.CUstream,
-            mQ: cute.Tensor,
-            mK: cute.Tensor,
-            mV: cute.Tensor,
-            mMaskCnt: cute.Tensor,
-            mMaskIdx: cute.Tensor,
-            mFullCnt: cute.Tensor,
-            mFullIdx: cute.Tensor,
-            mDiagCnt: cute.Tensor,
-            mDiagIdx: cute.Tensor,
-            mValidUpper: cute.Tensor,
-            mValidLower: cute.Tensor,
-            mO: cute.Tensor,
-            mLSE: cute.Tensor,
-            softmax_scale: cutlass.Float32,
-        ):
-            bs = BlockSparseTensors(
-                mask_block_cnt=mMaskCnt,
-                mask_block_idx=mMaskIdx,
-                full_block_cnt=mFullCnt,
-                full_block_idx=mFullIdx,
-                cu_total_m_blocks=None,
-                cu_block_idx_offsets=None,
-                dq_write_order=None,
-                dq_write_order_full=None,
-                diag_block_cnt=mDiagCnt,
-                diag_block_idx=mDiagIdx,
-                dq_write_order_diag=None,
-                valid_block_upper=mValidUpper,
-                valid_block_lower=mValidLower,
-            )
-            fa_fwd(
-                mQ,
-                mK,
-                mV,
-                mO,
-                mLSE,
-                softmax_scale,
-                blocksparse_tensors=bs,
-                stream=stream,
-            )
 
         fwd_call = cutlass_call(
             launch_fwd,

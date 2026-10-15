@@ -8,8 +8,10 @@ import jax.numpy as jnp
 _log = logging.getLogger(__name__)
 
 TARGET = "xrex_mol_epilogue"
+FUSED_TARGET = "xrex_mol_fused_int8"
 SUPPORTED_KL_H = ((4, 32), (8, 16), (8, 32), (16, 16))
 MAX_USERS = 512
+FUSED_QUERY_ROWS = (32, 64, 96, 128)
 
 try:
     import xrex_cuda_kernels.mol_epilogue_api as mol_epilogue_api
@@ -21,10 +23,34 @@ except ModuleNotFoundError:
     )
 else:
     jax.ffi.register_ffi_target(TARGET, fn=mol_epilogue_api.mol_epilogue(), platform="CUDA")
+    if hasattr(mol_epilogue_api, "mol_fused_int8"):
+        jax.ffi.register_ffi_target(
+            FUSED_TARGET, fn=mol_epilogue_api.mol_fused_int8(), platform="CUDA"
+        )
 
 
 def available() -> bool:
     return mol_epilogue_api is not None and jax.default_backend() == "gpu"
+
+
+def fused_col_offset_supported() -> bool:
+    return getattr(mol_epilogue_api, "mol_fused_int8_col_offset", False) is True
+
+
+def fused_query_rows(num_rows: int) -> int | None:
+    return next((r for r in FUSED_QUERY_ROWS if r >= num_rows), None)
+
+
+def fused_supported(kl: int, num_components: int, hidden: int, num_users: int, dim: int) -> bool:
+    return (
+        available()
+        and hasattr(mol_epilogue_api, "mol_fused_int8")
+        and kl == 4
+        and num_components == 1
+        and hidden == 32
+        and dim % 64 == 0
+        and fused_query_rows(kl * num_users) is not None
+    )
 
 
 def mol_epilogue(
@@ -68,4 +94,58 @@ def mol_epilogue(
         b2.reshape(-1).astype(jnp.float32),
         num_users=num_users,
         num_components=num_components,
+    )
+
+
+def mol_fused_int8(
+    posts_q8: jax.Array,
+    post_scales: jax.Array,
+    queries_q8: jax.Array,
+    query_scales: jax.Array,
+    norms: jax.Array,
+    ubias_t: jax.Array,
+    ibias: jax.Array,
+    w1: jax.Array,
+    b1: jax.Array,
+    w2: jax.Array,
+    b2: jax.Array,
+    *,
+    num_users: int,
+    col_offset: int = 0,
+) -> jax.Array:
+    kl, hidden = w1.shape
+    dim = queries_q8.shape[1]
+    strided = col_offset != 0 or posts_q8.shape[1] != dim
+    if strided and not fused_col_offset_supported():
+        raise RuntimeError(
+            f"{FUSED_TARGET!r} in this xrex_cuda_kernels cannot read a column offset"
+        )
+    if not fused_supported(kl, norms.shape[0], hidden, num_users, dim):
+        raise RuntimeError(
+            f"{FUSED_TARGET!r} unsupported for KL={kl}, L={norms.shape[0]}, H={hidden}, "
+            f"B={num_users}, D={dim} (or xrex_cuda_kernels lacks it)"
+        )
+    if queries_q8.shape[0] not in FUSED_QUERY_ROWS or queries_q8.shape[0] < kl * num_users:
+        raise ValueError(
+            f"queries must have {FUSED_QUERY_ROWS} rows >= KL*B; got {queries_q8.shape}"
+        )
+    call = jax.ffi.ffi_call(
+        FUSED_TARGET,
+        jax.ShapeDtypeStruct((num_users, posts_q8.shape[0]), jnp.bfloat16),
+        vmap_method="sequential",
+    )
+    return call(
+        posts_q8.astype(jnp.int8),
+        post_scales.astype(jnp.float32),
+        queries_q8.astype(jnp.int8),
+        query_scales.astype(jnp.float32),
+        norms.astype(jnp.float32),
+        ubias_t.astype(jnp.float32),
+        ibias.astype(jnp.float32),
+        w1.astype(jnp.float32),
+        b1.reshape(-1).astype(jnp.float32),
+        w2.astype(jnp.float32),
+        b2.reshape(-1).astype(jnp.float32),
+        num_users=num_users,
+        **({"col_offset": col_offset} if fused_col_offset_supported() else {}),
     )

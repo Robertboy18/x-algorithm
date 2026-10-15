@@ -1,30 +1,21 @@
 use crate::clients::read_fields;
 use anyhow::bail;
 use thrift::protocol::{TInputProtocol, TOutputProtocol, TSerializable, TType};
-use tonic::async_trait;
 use xai_strato::strato_thrift::{strato_decode, StratoResult};
 use xai_strato::StratoGrpc;
 
 const TFE_TOP_COUNTRY_COLUMN: &str = "about_this_account/tfe_top_country.User";
 
-#[async_trait]
-pub trait AboutThisAccountClient: Send + Sync {
-    async fn tfe_top_country(&self, user_id: u64) -> anyhow::Result<Option<String>>;
-}
-
-pub struct ProdAboutThisAccountClient {
+pub struct AboutThisAccountClient {
     grpc: StratoGrpc,
 }
 
-impl ProdAboutThisAccountClient {
+impl AboutThisAccountClient {
     pub fn new(grpc: StratoGrpc) -> Self {
         Self { grpc }
     }
-}
 
-#[async_trait]
-impl AboutThisAccountClient for ProdAboutThisAccountClient {
-    async fn tfe_top_country(&self, user_id: u64) -> anyhow::Result<Option<String>> {
+    pub async fn tfe_top_country(&self, user_id: u64) -> anyhow::Result<Option<String>> {
         let bytes = self
             .grpc
             .call(
@@ -81,52 +72,19 @@ impl TSerializable for UserTfeTopCountry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thrift::protocol::{
-        TBinaryInputProtocol, TBinaryOutputProtocol, TFieldIdentifier, TStructIdentifier,
-    };
-
-    fn country_details(
-        o_prot: &mut TBinaryOutputProtocol<&mut Vec<u8>>,
-        id: i16,
-        country_id: &str,
-    ) {
-        o_prot
-            .write_field_begin(&TFieldIdentifier::new("", TType::Struct, id))
-            .unwrap();
-        o_prot
-            .write_struct_begin(&TStructIdentifier::new(""))
-            .unwrap();
-        o_prot
-            .write_field_begin(&TFieldIdentifier::new("", TType::String, 1))
-            .unwrap();
-        o_prot.write_string(country_id).unwrap();
-        o_prot
-            .write_field_begin(&TFieldIdentifier::new("", TType::Bool, 2))
-            .unwrap();
-        o_prot.write_bool(true).unwrap();
-        o_prot.write_field_stop().unwrap();
-        o_prot.write_struct_end().unwrap();
-        o_prot.write_field_end().unwrap();
-    }
+    use crate::clients::strato_answer::Thrift::{Bool, Str, Struct, I64};
+    use thrift::protocol::TBinaryInputProtocol;
 
     fn decode_row(details: &[(i16, &str)]) -> UserTfeTopCountry {
-        let mut bytes = Vec::new();
-        let mut o_prot = TBinaryOutputProtocol::new(&mut bytes, false);
-        o_prot
-            .write_struct_begin(&TStructIdentifier::new(""))
-            .unwrap();
-        o_prot
-            .write_field_begin(&TFieldIdentifier::new("", TType::I64, 1))
-            .unwrap();
-        o_prot.write_i64(7).unwrap();
-        for (id, country_id) in details {
-            country_details(&mut o_prot, *id, country_id);
-        }
-        o_prot
-            .write_field_begin(&TFieldIdentifier::new("", TType::I64, 5))
-            .unwrap();
-        o_prot.write_i64(1).unwrap();
-        o_prot.write_field_stop().unwrap();
+        let details = details.iter().map(|&(id, country_id)| {
+            let country = Struct(vec![(1, Str(country_id.to_owned())), (2, Bool(true))]);
+            (id, country)
+        });
+        let fields = [(1, I64(7))]
+            .into_iter()
+            .chain(details)
+            .chain([(5, I64(1))]);
+        let bytes = Struct(fields.collect()).bytes();
         let mut i_prot = TBinaryInputProtocol::new(&bytes[..], false);
         UserTfeTopCountry::read_from_in_protocol(&mut i_prot).unwrap()
     }

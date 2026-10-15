@@ -1,4 +1,4 @@
-// mirrored from config feature-switch defaults; last sync 2026-10-07T16:00:42Z
+// mirrored from config feature-switch defaults; last sync 2026-10-14T16:00:44Z
 use xai_feature_switches::param;
 
 param!(
@@ -74,6 +74,12 @@ param!(
     EnablePhoenixOonReplies,
     bool,
     "rust_home_mixer_enable_phoenix_oon_replies",
+    false
+);
+param!(
+    PhoenixOonRepliesRootOnly,
+    bool,
+    "rust_home_mixer_phoenix_oon_replies_root_only",
     false
 );
 param!(
@@ -311,7 +317,7 @@ param!(
 // navigating to a post (i.e., coordinating via groupchat) has no
 // ranking impact. And users cannot manufacture a post to show up in
 // their Timeline in any consistently reproducible way.
-param!(FavoriteWeight, f64, "rust_home_mixer_favorite_weight", 0.5);
+param!(FavoriteWeight, f64, "rust_home_mixer_favorite_weight", 0.66);
 param!(ReplyWeight, f64, "rust_home_mixer_reply_weight", 5.0);
 param!(
     BidirectionalFollowReplyWeightBoost,
@@ -336,7 +342,7 @@ param!(
     VideoOpenWeight,
     f64,
     "rust_home_mixer_video_open_weight",
-    0.07
+    0.02
 );
 param!(ClickWeight, f64, "rust_home_mixer_click_weight", 0.3);
 param!(OpenLinkWeight, f64, "rust_home_mixer_open_link_weight", 0.2);
@@ -387,10 +393,16 @@ param!(
     0.015
 );
 param!(
+    ReactWithVideoWeight,
+    f64,
+    "rust_home_mixer_react_with_video_weight",
+    0.0
+);
+param!(
     ContDwellTimeWeight,
     f64,
     "rust_home_mixer_cont_dwell_time_weight",
-    0.004
+    0.006
 );
 param!(
     ContClickDwellTimeWeight,
@@ -403,7 +415,7 @@ param!(
     NotInterestedWeight,
     f64,
     "rust_home_mixer_not_interested_weight",
-    -47.52
+    -52.272
 );
 param!(
     BlockAuthorWeight,
@@ -796,7 +808,7 @@ param!(
     EnableAdsAuthorBrandSafetyFallback,
     bool,
     "rust_home_mixer_ads_bs_author_fallback_enabled",
-    false
+    true
 );
 param!(
     AdsTimeGapTSec,
@@ -1055,6 +1067,42 @@ param!(
     u32,
     "rust_home_mixer_video_carousel_position",
     6
+);
+param!(
+    EnableVideoCarouselAuthorDedupe,
+    bool,
+    "rust_home_mixer_enable_video_carousel_author_dedupe",
+    false
+);
+param!(
+    VideoCarouselSemanticIdDedupeLevels,
+    u32,
+    "rust_home_mixer_video_carousel_semantic_id_dedupe_levels",
+    0
+);
+param!(
+    VideoCarouselVideoOpenWeight,
+    f64,
+    "rust_home_mixer_video_carousel_video_open_weight",
+    1.0
+);
+param!(
+    VideoCarouselImmersiveVqvWeight,
+    f64,
+    "rust_home_mixer_video_carousel_immersive_vqv_weight",
+    0.0
+);
+param!(
+    VideoCarouselImmersiveClusterId,
+    String,
+    "rust_home_mixer_video_carousel_immersive_cluster_id",
+    "Experiment3Fou"
+);
+param!(
+    VideoCarouselImmersiveAggregationType,
+    String,
+    "rust_home_mixer_video_carousel_immersive_aggregation_type",
+    "IMMERSIVE_LONG_DWELL"
 );
 
 param!(

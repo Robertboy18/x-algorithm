@@ -111,6 +111,13 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                     &retrieval_cluster,
                     &experiment_buckets,
                 );
+                record_phoenix_retrieval_zero_fav_stats(
+                    receiver.as_ref(),
+                    &input.selected_candidates,
+                    &input.non_selected_candidates,
+                    &retrieval_cluster,
+                    &experiment_buckets,
+                );
                 if input.query.request_type != RequestType::PhoenixScores
                     && !input.query.in_network_only
                 {
@@ -542,6 +549,24 @@ fn record_phoenix_retrieval_cold_stats(
         experiment_buckets,
         ServedType::ForYouPhoenixRetrievalCold,
         "PhoenixRetrievalColdTweets",
+    );
+}
+
+fn record_phoenix_retrieval_zero_fav_stats(
+    receiver: &dyn StatsReceiverExt,
+    selected_candidates: &[PostCandidate],
+    non_selected_candidates: &[PostCandidate],
+    retrieval_cluster: &str,
+    experiment_buckets: &[&ExperimentBucket],
+) {
+    record_retrieval_source_stats(
+        receiver,
+        selected_candidates,
+        non_selected_candidates,
+        retrieval_cluster,
+        experiment_buckets,
+        ServedType::ForYouPhoenixRetrievalZeroFav,
+        "PhoenixRetrievalZeroFavTweets",
     );
 }
 

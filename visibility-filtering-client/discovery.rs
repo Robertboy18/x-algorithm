@@ -28,31 +28,31 @@ const VF_XDS_BUILD_TIMEOUT: Duration = Duration::from_secs(10);
 
 const VF_XDS_EAGER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VfDiscovery {
-    #[default]
     Wily,
     Xds,
 }
 
 impl VfDiscovery {
-    pub(crate) fn parse(env_name: &str, value: Option<&str>) -> Self {
+    pub(crate) fn parse(env_name: &str, value: Option<&str>, default: Self) -> Self {
         match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
             Some("xds") => Self::Xds,
-            None | Some("") | Some("wily") => Self::Wily,
+            Some("wily") => Self::Wily,
+            None | Some("") => default,
             Some(other) => {
                 warn!(
                     value = other,
                     env = env_name,
-                    "unrecognized VF discovery mode; defaulting to wily"
+                    "unrecognized VF discovery mode; defaulting to {default:?}"
                 );
-                Self::Wily
+                default
             }
         }
     }
 
-    pub(crate) fn from_env(env_name: &str) -> Self {
-        Self::parse(env_name, std::env::var(env_name).ok().as_deref())
+    pub(crate) fn from_env(env_name: &str, default: Self) -> Self {
+        Self::parse(env_name, std::env::var(env_name).ok().as_deref(), default)
     }
 }
 
@@ -265,18 +265,20 @@ mod tests {
     const ENV: &str = "VF_TEST_DISCOVERY";
 
     #[test]
-    fn discovery_parse_defaults_to_wily() {
-        assert_eq!(VfDiscovery::parse(ENV, None), VfDiscovery::Wily);
-        assert_eq!(VfDiscovery::parse(ENV, Some("")), VfDiscovery::Wily);
-        assert_eq!(VfDiscovery::parse(ENV, Some("wily")), VfDiscovery::Wily);
-        assert_eq!(VfDiscovery::parse(ENV, Some("bogus")), VfDiscovery::Wily);
-        assert_eq!(VfDiscovery::default(), VfDiscovery::Wily);
-    }
-
-    #[test]
-    fn discovery_parse_xds_opt_in() {
-        assert_eq!(VfDiscovery::parse(ENV, Some("xds")), VfDiscovery::Xds);
-        assert_eq!(VfDiscovery::parse(ENV, Some(" XDS ")), VfDiscovery::Xds);
+    fn discovery_parse_uses_default_unless_mode_is_explicit() {
+        for default in [VfDiscovery::Wily, VfDiscovery::Xds] {
+            assert_eq!(VfDiscovery::parse(ENV, None, default), default);
+            assert_eq!(VfDiscovery::parse(ENV, Some(""), default), default);
+            assert_eq!(VfDiscovery::parse(ENV, Some("bogus"), default), default);
+        }
+        assert_eq!(
+            VfDiscovery::parse(ENV, Some("wily"), VfDiscovery::Xds),
+            VfDiscovery::Wily
+        );
+        assert_eq!(
+            VfDiscovery::parse(ENV, Some(" XDS "), VfDiscovery::Wily),
+            VfDiscovery::Xds
+        );
     }
 
     #[test]

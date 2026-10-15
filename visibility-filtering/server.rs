@@ -148,6 +148,7 @@ mod tests {
         let filter_tweets = Arc::new(FilterTweets::new(
             Arc::new(sources),
             RuleEngine::for_tests(),
+            Arc::default(),
         ));
         let labels = Arc::new(NoLabels);
         VFServer::from_endpoints(

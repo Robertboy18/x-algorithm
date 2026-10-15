@@ -12,6 +12,7 @@ half = { workspace = true }
 lazy_static = { workspace = true }
 log = { workspace = true }
 prometheus = { workspace = true }
+serde_json = { workspace = true }
 xai-recsys-proto = { workspace = true }
 
 [lints]

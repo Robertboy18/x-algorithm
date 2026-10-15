@@ -1,7 +1,6 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use std::sync::atomic::Ordering;
 use std::{path::PathBuf, time::Duration};
 
 use axum::{http::StatusCode, routing::get, Router};
@@ -14,8 +13,8 @@ use xai_service_runner::ServerBuilder;
 use xai_abuse_enforcement_service::auth::ApiKeys;
 use xai_abuse_enforcement_service::config::Config;
 use xai_abuse_enforcement_service::{
-    build_api_router, build_docs_router, build_state, init_runtime_globals, shutdown_kafka,
-    spawn_config_refresh, start_kafka_consumers,
+    build_api_router, build_docs_router, build_state, init_runtime_globals, service_ready,
+    shutdown_kafka_startup, spawn_config_refresh, spawn_kafka_consumers,
 };
 
 fn admin_ui_public_dir() -> PathBuf {
@@ -64,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
         .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
         .on_response(DefaultOnResponse::new().level(Level::INFO));
 
-    let kafka_ready = state.kafka_ready.clone();
+    let ready_state = state.clone();
 
     let app: Router = Router::new()
         .nest("/api", api_router)
@@ -72,9 +71,9 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/kafka_ready",
             get(move || {
-                let kafka_ready = kafka_ready.clone();
+                let state = ready_state.clone();
                 async move {
-                    if kafka_ready.load(Ordering::Relaxed) {
+                    if service_ready(&state) {
                         StatusCode::OK
                     } else {
                         StatusCode::SERVICE_UNAVAILABLE
@@ -85,8 +84,6 @@ async fn main() -> anyhow::Result<()> {
         .fallback_service(admin_ui)
         .layer(trace_layer);
 
-    let kafka_consumers = start_kafka_consumers(state.clone(), &cfg).await?;
-
     let server = ServerBuilder::new(cfg.port)
         .merge(app)
         .drain_period(Duration::from_secs(cfg.drain_period_secs))
@@ -94,10 +91,13 @@ async fn main() -> anyhow::Result<()> {
             info!("Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)");
         });
     spawn_config_refresh(&state, server.shutdown_signal());
+
+    let kafka = spawn_kafka_consumers(state.clone(), cfg, server.shutdown_signal());
     let served = server.run().await;
 
-    shutdown_kafka(&state, kafka_consumers).await;
+    let kafka = shutdown_kafka_startup(&state, kafka).await;
     served?;
+    kafka?;
     info!("Server shutdown complete");
     Ok(())
 }

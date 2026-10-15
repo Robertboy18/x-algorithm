@@ -12,7 +12,7 @@ const MISSING_POLICY_COUNTER: &str = "limited_actions_policy_missing";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum LimitedActionType {
+pub enum LimitedActionType {
     Reply,
     Retweet,
     QuoteTweet,

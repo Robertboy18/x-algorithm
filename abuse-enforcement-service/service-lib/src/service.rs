@@ -111,6 +111,8 @@ pub struct AppState {
         pub kafka_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
                 pub kafka_producers: crate::KafkaProducers,
                 pub hold_gate: std::sync::Arc<crate::overturn_hold::HoldGate>,
+                pub off_switch: std::sync::Arc<crate::off_switch::OffSwitch>,
+            pub action_control: std::sync::Arc<crate::action_control::ActionControl>,
                 pub boot_config: serde_json::Value,
 }
 
@@ -2070,9 +2072,487 @@ pub async fn handle_allowlist_delete_entity(
     }
 }
 
+
+use crate::off_switch::{
+    OffSwitchListResponse, OffSwitchPutRequest, OffSwitchView, SetError, SetOutcome,
+};
+
+#[utoipa::path(
+    get,
+    path = "/off_switches",
+    tag = "off_switch",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "Stored switches and this pod's list state", body = OffSwitchListResponse),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_off_switches_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let resp = state
+        .off_switch
+        .list(
+            state.dynamic_config.off_switch_enabled(),
+            crate::now_millis(),
+        )
+        .await;
+    (StatusCode::OK, Json(resp))
+}
+
+#[utoipa::path(
+    put,
+    path = "/off_switches",
+    tag = "off_switch",
+    security(("BearerAuth" = [])),
+    request_body = OffSwitchPutRequest,
+    responses(
+        (status = 200, description = "Stored switch", body = OffSwitchView),
+        (status = 400, description = "Invalid head / classifier / reason / auto_on_at_ms"),
+        (status = 500, description = "Manhattan write failed"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_off_switches_put(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    Json(req): Json<OffSwitchPutRequest>,
+) -> impl IntoResponse {
+    info!(
+        head = %req.head,
+        classifier = req.classifier.as_deref().unwrap_or(""),
+        off = req.off,
+        "PUT /api/off_switches"
+    );
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .off_switch
+        .set(req, &actor.0, crate::now_millis())
+        .await;
+    if let Err(SetError::Invalid(msg)) = &result {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg })));
+    }
+    publish_admin_action_event(
+        state.kafka_producers.admin_actions(),
+        &off_switch_admin_event(actor.0, &method, uri.path(), request_json, &result),
+    );
+    match result {
+        Ok(out) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(out.view).unwrap_or_default()),
+        ),
+        Err(e) => {
+            error!("PUT /api/off_switches failed: {e:?}");
+            let msg = match e {
+                SetError::Invalid(m) | SetError::Store(m) => m,
+            };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": msg })),
+            )
+        }
+    }
+}
+
+pub(crate) fn off_switch_admin_event(
+    actor_key_id: String,
+    method: &Method,
+    path: &str,
+    request_json: String,
+    result: &Result<SetOutcome, SetError>,
+) -> AdminActionEvent {
+    let (success, error, before_json) = match result {
+        Ok(out) => (
+            true,
+            String::new(),
+            out.before
+                .as_ref()
+                .and_then(|b| serde_json::to_string(b).ok())
+                .unwrap_or_default(),
+        ),
+        Err(SetError::Invalid(e) | SetError::Store(e)) => (false, e.clone(), String::new()),
+    };
+    AdminActionEvent {
+        occurred_at_ms: crate::now_millis(),
+        action: AdminAction::Unspecified as i32,
+        actor_key_id,
+        environment: AUDIT_ENVIRONMENT.clone(),
+        http_method: method.to_string(),
+        http_path: path.to_string(),
+        success,
+        error,
+        request_json,
+        before_json,
+        ..Default::default()
+    }
+}
+
+
+use crate::action_control::{
+    ActionControlHistoryResponse, ActionControlListResponse, ActionControlPutRequest,
+    SetError as ControlSetError, SetOutcome as ControlSetOutcome,
+};
+use crate::safety_checks::SafetyChecksByEntity;
+use xai_abuse_enforcement_types::action_control::{PodOffSwitchView, PodView};
+
+pub const UPDATED_BY_HEADER: &str = "x-updated-by";
+
+fn updated_by(
+    headers: &axum::http::HeaderMap,
+    body: Option<&str>,
+    key_id: &str,
+    cfg: &crate::action_control::ControlConfig,
+) -> String {
+    let named = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    cfg.may_name_updater(key_id)
+        .then(|| {
+            named(headers.get(UPDATED_BY_HEADER).and_then(|v| v.to_str().ok()))
+                .or_else(|| named(body))
+        })
+        .flatten()
+        .unwrap_or_else(|| key_id.to_owned())
+}
+
+pub(crate) fn safety_checks_now(state: &AppState) -> SafetyChecksByEntity {
+    let status = |entity: EntityType| {
+        let rules = state.rules_cache.resolve(
+            entity,
+            state.dynamic_config.enforcement_rules_yaml(entity).as_ref(),
+        );
+        crate::safety_checks::status(entity, &rules)
+    };
+    SafetyChecksByEntity {
+        user: status(EntityType::User),
+        post: status(EntityType::Post),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/action_controls",
+    tag = "action_control",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "Records, seen list and feature state", body = ActionControlListResponse),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_action_controls_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.dynamic_config.action_control_config();
+    let resp = state
+        .action_control
+        .list(&cfg, safety_checks_now(&state))
+        .await;
+    (StatusCode::OK, Json(resp))
+}
+
+#[utoipa::path(
+    put,
+    path = "/action_controls",
+    tag = "action_control",
+    security(("BearerAuth" = [])),
+    request_body = ActionControlPutRequest,
+    responses(
+        (status = 200, description = "Stored record, previous record, harsher reasons"),
+        (status = 400, description = "Invalid request: {error: code, detail}"),
+        (status = 409, description = "version_conflict or lost_race, with the current record"),
+        (status = 500, description = "Manhattan write failed"),
+        (status = 503, description = "action_control.ignore_store is set"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_action_controls_put(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<KeyId>,
+    method: Method,
+    uri: Uri,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ActionControlPutRequest>,
+) -> impl IntoResponse {
+    let cfg = state.dynamic_config.action_control_config();
+    let who = updated_by(&headers, req.updated_by.as_deref(), &actor.0, &cfg);
+    info!(
+        entity_type = req.entity_type.as_str(),
+        head = %req.head,
+        classifier = req.classifier.as_deref().unwrap_or(""),
+        band = req.band.as_deref().unwrap_or(""),
+        mode = req.mode.as_str(),
+        who = %who,
+        "PUT /api/action_controls"
+    );
+    if who.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "updated_by_too_long", "detail": "who is longer than 256 bytes"})),
+        );
+    }
+    let request_json = serde_json::to_string(&req).unwrap_or_default();
+    let result = state
+        .action_control
+        .set(
+            req,
+            &who,
+            &actor.0,
+            crate::now_millis(),
+            &cfg,
+            &safety_checks_now(&state),
+        )
+        .await;
+    if !matches!(result, Err(ControlSetError::Invalid(..))) {
+        publish_admin_action_event(
+            state.kafka_producers.admin_actions(),
+            &action_control_admin_event(actor.0, &method, uri.path(), request_json, &result),
+        );
+    }
+    action_control_put_response(result)
+}
+
+pub(crate) fn action_control_put_response(
+    result: Result<ControlSetOutcome, ControlSetError>,
+) -> (StatusCode, Json<Value>) {
+    match result {
+        Ok(out) => (
+            StatusCode::OK,
+            Json(json!({
+                "record": out.view,
+                "before": out.before,
+                "harsher": !out.harsher_because.is_empty(),
+                "harsher_because": out.harsher_because,
+                "history_written": out.history_written,
+            })),
+        ),
+        Err(ControlSetError::Invalid(code, detail)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": code, "detail": detail})),
+        ),
+        Err(ControlSetError::Conflict(current, current_version)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "version_conflict",
+                "detail": "the stored version differs from expected_version; review the current record and try again",
+                "current": current,
+                "current_version": current_version,
+            })),
+        ),
+        Err(ControlSetError::LostRace(current)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "lost_race",
+                "detail": "another change landed at the same moment and replaced this one; review the current record",
+                "current": current,
+            })),
+        ),
+        Err(ControlSetError::Ignored) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "ignore_store",
+                "detail": "GrowthBook action_control.ignore_store is set; records are ignored and can't be written",
+            })),
+        ),
+        Err(ControlSetError::Store(e)) => {
+            error!("PUT /api/action_controls failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "store", "detail": e})),
+            )
+        }
+    }
+}
+
+pub(crate) fn action_control_admin_event(
+    actor_key_id: String,
+    method: &Method,
+    path: &str,
+    request_json: String,
+    result: &Result<ControlSetOutcome, ControlSetError>,
+) -> AdminActionEvent {
+    let (success, error, before_json) = match result {
+        Ok(out) => (
+            true,
+            String::new(),
+            out.before
+                .as_ref()
+                .and_then(|b| serde_json::to_string(b).ok())
+                .unwrap_or_default(),
+        ),
+        Err(e) => (false, format!("{e:?}"), String::new()),
+    };
+    AdminActionEvent {
+        occurred_at_ms: crate::now_millis(),
+        action: AdminAction::Unspecified as i32,
+        actor_key_id,
+        environment: AUDIT_ENVIRONMENT.clone(),
+        http_method: method.to_string(),
+        http_path: path.to_string(),
+        success,
+        error,
+        request_json,
+        before_json,
+        ..Default::default()
+    }
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct HistoryQuery {
+    pub head: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/action_controls/history",
+    tag = "action_control",
+    security(("BearerAuth" = [])),
+    params(HistoryQuery),
+    responses(
+        (status = 200, description = "History entries", body = ActionControlHistoryResponse),
+        (status = 400, description = "Invalid head"),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_action_controls_history(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
+) -> impl IntoResponse {
+    if !crate::off_switch::valid_name(&q.head) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error": "invalid_head", "detail": "head must be 1-256 characters of [A-Za-z0-9_.:@-]"}),
+            ),
+        );
+    }
+    let resp = state
+        .action_control
+        .history(
+            &q.head,
+            q.limit
+                .unwrap_or(crate::action_control::HISTORY_LIMIT_DEFAULT),
+        )
+        .await;
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(resp).unwrap_or_default()),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/action_controls/pod",
+    tag = "action_control",
+    security(("BearerAuth" = [])),
+    responses(
+        (status = 200, description = "This pod's view", body = PodView),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn handle_action_controls_pod(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let bi = current_build_information();
+    let view = PodView {
+        pod: state.action_control.pod.clone(),
+        env: state.action_control.env.clone(),
+        image: bi.git_commit_sha.to_string(),
+        action_control: state.action_control.pod_view(),
+        off_switch: PodOffSwitchView {
+            snapshot_age_ms: state.off_switch.snapshot_age_ms().unwrap_or(-1),
+            active: state.off_switch.active_lkeys(crate::now_millis()),
+        },
+    };
+    (StatusCode::OK, Json(view))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_allowed_keys_name_the_updater() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(UPDATED_BY_HEADER, "a@example.com".parse().unwrap());
+        let any = crate::action_control::ControlConfig::default();
+        assert_eq!(
+            updated_by(&headers, Some("b@example.com"), "pv2", &any),
+            "a@example.com"
+        );
+        assert_eq!(
+            updated_by(&Default::default(), Some(" b@example.com "), "pv2", &any),
+            "b@example.com"
+        );
+        assert_eq!(
+            updated_by(&Default::default(), Some(" "), "pv2", &any),
+            "pv2"
+        );
+        let page_only = crate::action_control::ControlConfig::from_config(Some(&json!({
+            "action_control": {"updated_by_keys": ["pv2"]}
+        })));
+        assert_eq!(
+            updated_by(&headers, None, "pv2", &page_only),
+            "a@example.com"
+        );
+        assert_eq!(
+            updated_by(&headers, Some("b@example.com"), "dev", &page_only),
+            "dev"
+        );
+        for malformed in [json!("pv2"), json!({"pv2": true}), json!(["pv2", 7])] {
+            let cfg = crate::action_control::ControlConfig::from_config(Some(&json!({
+                "action_control": {"updated_by_keys": malformed.clone()}
+            })));
+            assert_eq!(
+                updated_by(&headers, None, "pv2", &cfg),
+                "pv2",
+                "{malformed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn off_switch_put_audit_event_carries_actor_body_and_prior_state() {
+        use crate::off_switch::OffSwitchRecord;
+        use crate::off_switch::test_support::{loaded, record};
+        let (sw, _) = loaded(&[record("H", None, true, None)]).await;
+        let req = OffSwitchPutRequest {
+            head: "H".into(),
+            classifier: None,
+            off: false,
+            reason: "fixed".into(),
+            auto_on_at_ms: None,
+            updated_by: Some("operator@example.com".into()),
+        };
+        let request_json = serde_json::to_string(&req).unwrap();
+        let result = sw.set(req, "pv2", crate::now_millis()).await;
+        let ev = off_switch_admin_event(
+            "pv2".into(),
+            &Method::PUT,
+            "/api/off_switches",
+            request_json.clone(),
+            &result,
+        );
+        assert!(ev.success);
+        assert_eq!(ev.error, "");
+        assert_eq!(ev.actor_key_id, "pv2");
+        assert_eq!(ev.http_method, "PUT");
+        assert_eq!(ev.http_path, "/api/off_switches");
+        assert_eq!(ev.request_json, request_json);
+        let before: OffSwitchRecord = serde_json::from_str(&ev.before_json).unwrap();
+        assert!(before.off, "prior state is the switch that was off");
+
+        let failed: Result<SetOutcome, SetError> = Err(SetError::Store("timeout".into()));
+        let ev = off_switch_admin_event(
+            "pv2".into(),
+            &Method::PUT,
+            "/api/off_switches",
+            String::new(),
+            &failed,
+        );
+        assert!(!ev.success);
+        assert_eq!(ev.error, "timeout");
+        assert_eq!(ev.before_json, "");
+    }
 
     #[test]
     fn truncate_utf8_does_not_split_multibyte_chars() {

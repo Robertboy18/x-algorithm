@@ -14,7 +14,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy import typing as npt
 
+from xrex.data.recsys import reply_features
 from xrex.data.recsys.ads_head_masking import build_trained_candidate_mask
+from xrex.data.recsys.ads_pixel_head_masking import build_head_eligible_mask
 from xrex.data.recsys.constants import (
     CONVERSION_DELAY_COLUMNS,
     CONVERSION_DELAY_NONE,
@@ -209,10 +211,11 @@ def _col(
     col: str,
     batch_size: int,
     t: type[_T],
+    fill: float = 0,
 ) -> npt.NDArray[_T]:
     values = _list_values(rb.column(col))
     if values.null_count:
-        values = values.fill_null(False if pa.types.is_boolean(values.type) else 0)
+        values = values.fill_null(False if pa.types.is_boolean(values.type) else fill)
     arr = values.to_numpy(zero_copy_only=False).reshape(batch_size, -1).astype(t)
     return typing.cast(npt.NDArray[_T], arr)
 
@@ -253,6 +256,7 @@ class PostSeq(TypedDict):
     promoted_ids: npt.NDArray[np.int64] | None
     line_item_objective: npt.NDArray[np.int16] | None
     trained_candidate_mask: NotRequired[npt.NDArray[np.bool_] | None]
+    head_eligible_mask: NotRequired[npt.NDArray[np.bool_] | None]
     value_label_valid: NotRequired[npt.NDArray[np.bool_]]
     value_baseline_mean_usd: NotRequired[npt.NDArray[np.float32]]
     conversion_delay_ms: NotRequired[npt.NDArray[np.int32]]
@@ -265,11 +269,36 @@ class PostSeq(TypedDict):
     bool_features: npt.NDArray[np.bool_]
     post_creation_ts_sec: npt.NDArray[np.int32]
     post_sids: npt.NDArray[np.uint16] | None
+    rl_served_slot: NotRequired[npt.NDArray[np.int32]]
+    rl_weighted_score: NotRequired[npt.NDArray[np.float32]]
+    rl_final_score: NotRequired[npt.NDArray[np.float32]]
+    rl_rerank_prob: NotRequired[npt.NDArray[np.float32]]
+    rl_decode_prob: NotRequired[npt.NDArray[np.float32]]
+    rl_impressed: NotRequired[npt.NDArray[np.bool_]]
+
+
+PAGE_RECORD_COLUMNS: dict[str, tuple[str, type, float]] = {
+    "rl_served_slot": ("servedSlotSeq", np.int32, -1),
+    "rl_weighted_score": ("weightedScoreSeq", np.float32, 0.0),
+    "rl_final_score": ("finalScoreSeq", np.float32, 0.0),
+    "rl_rerank_prob": ("rewardRerankSlotProbSeq", np.float32, 0.0),
+    "rl_decode_prob": ("pageDecodeSlotProbSeq", np.float32, 0.0),
+}
+
+
+def empty_page_record_arrays(batch_size: int, seq_len: int) -> dict[str, np.ndarray]:
+    arrays = {
+        key: np.full((batch_size, seq_len), fill, dtype=dtype)
+        for key, (_, dtype, fill) in PAGE_RECORD_COLUMNS.items()
+    }
+    arrays["rl_impressed"] = np.zeros((batch_size, seq_len), dtype=np.bool_)
+    return arrays
 
 
 def empty_feature_arrays(
     batch_size: int,
     seq_len: int,
+    post_int64_size: int = POST_INT64_FEATURE_SIZE,
 ) -> dict[str, np.ndarray]:
     return {
         "categorical_features": np.zeros(
@@ -279,18 +308,20 @@ def empty_feature_arrays(
         "float_features": np.zeros(
             (batch_size, seq_len, POST_FLOAT_FEATURE_SIZE), dtype=np.float32
         ),
-        "int64_features": np.zeros((batch_size, seq_len, POST_INT64_FEATURE_SIZE), dtype=np.int64),
+        "int64_features": np.zeros((batch_size, seq_len, post_int64_size), dtype=np.int64),
     }
 
 
-def empty_user_feature_arrays(batch_size: int) -> dict[str, typing.Any]:
+def empty_user_feature_arrays(
+    batch_size: int, user_int64_size: int = USER_INT64_FEATURE_SIZE
+) -> dict[str, typing.Any]:
     return {
         "user_categorical_features": np.zeros(
             (batch_size, USER_CATEGORICAL_FEATURE_SIZE), dtype=np.int16
         ),
         "user_bool_features": np.zeros((batch_size, USER_BOOL_FEATURE_SIZE), dtype=np.bool_),
         "user_float_features": np.zeros((batch_size, USER_FLOAT_FEATURE_SIZE), dtype=np.float32),
-        "user_int64_features": np.zeros((batch_size, USER_INT64_FEATURE_SIZE), dtype=np.int64),
+        "user_int64_features": np.zeros((batch_size, user_int64_size), dtype=np.int64),
     }
 
 
@@ -350,6 +381,7 @@ class RecsysFeaturesBatch(TypedDict):
     num_positive_candidates: npt.NDArray[np.int32] | None
     sample_weights: NotRequired[npt.NDArray[np.float32] | None]
     sample_source: NotRequired[npt.NDArray[np.int8] | None]
+    candidate_positions: NotRequired[npt.NDArray[np.int32] | None]
     packing_layout: NotRequired[SequencePackedLayout | None]
 
 
@@ -448,6 +480,24 @@ def _extend_value_labels(post_seq: PostSeq, shape: tuple[int, int]) -> dict[str,
     return labels
 
 
+def _extend_head_eligible_mask(post_seq: PostSeq, num_slots: int) -> dict[str, np.ndarray]:
+    mask = post_seq.get("head_eligible_mask")
+    if mask is None:
+        return {}
+    widened = np.ones((mask.shape[0], num_slots, mask.shape[-1]), dtype=np.bool_)
+    widened[:, : mask.shape[1]] = mask
+    return {"head_eligible_mask": widened}
+
+
+def _extend_page_record_fields(post_seq: PostSeq, shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    if "rl_served_slot" not in post_seq:
+        return {}
+    fields = empty_page_record_arrays(*shape)
+    for key, values in fields.items():
+        values[:, : post_seq[key].shape[1]] = post_seq[key]
+    return fields
+
+
 def _extract_feature_columns(
     record_batch: pa.RecordBatch,
     feature_list: list[str],
@@ -499,7 +549,10 @@ def from_record_batch(
     zero_stale_post_14d_candidate_counts: bool = False,
     stale_post_30d: bool = False,
     search_negative_clear_word_match: bool = False,
+    reply_parent_mode: bool = False,
     ads_head_masking: bool = False,
+    ads_pixel_head_masking: bool = False,
+    page_records: bool = False,
 ) -> RecsysFeaturesBatch:
     start = time.time()
     batch_size = record_batch.num_rows
@@ -508,6 +561,23 @@ def from_record_batch(
     tweet_ids = _col(record_batch, "tweetIdSeq", batch_size, np.int64)
     author_ids = _col(record_batch, "authorIdSeq", batch_size, np.int64)
     impression_timestamps_ms = _col(record_batch, "impressedTimeMsSeq", batch_size, np.int64)
+    page_record = np.zeros(batch_size, dtype=np.bool_)
+    page_columns: dict[str, np.ndarray] = {}
+    if page_records:
+        page_record = (
+            record_batch.column("validPageRecord")
+            .fill_null(False)
+            .to_numpy(zero_copy_only=False)
+            .astype(np.bool_)
+        )
+        page_columns = {
+            key: _col(record_batch, column, batch_size, dtype, fill)
+            for key, (column, dtype, fill) in PAGE_RECORD_COLUMNS.items()
+        }
+        page_columns["rl_served_slot"] = np.where(
+            page_record[:, None], page_columns["rl_served_slot"], np.int32(-1)
+        )
+        page_columns["rl_impressed"] = impression_timestamps_ms > 0
     product_surface = _col(record_batch, "productSurfaceSeq", batch_size, np.int32)
     new_event_mask = _col(record_batch, "newEventMask", batch_size, np.bool_)
     padding_mask = _col(record_batch, "paddingMask", batch_size, np.bool_)
@@ -520,6 +590,18 @@ def from_record_batch(
         safety_label_mask = _col(record_batch, "safetyLabelMaskSeq", batch_size, np.int64)
     else:
         safety_label_mask = np.zeros_like(promoted_ids, dtype=np.int64)
+
+    reply_cand_int64_cols: dict[int, np.ndarray] = {}
+    reply_cand_categorical_cols: dict[int, np.ndarray] = {}
+    candidate_positions: np.ndarray | None = None
+    post_int64_size = POST_INT64_FEATURE_SIZE
+    if reply_parent_mode:
+        post_int64_size = reply_features.REPLY_POST_INT64_FEATURE_SIZE
+        reply_cand_int64_cols, reply_cand_categorical_cols = reply_features.read_candidate_columns(
+            record_batch, batch_size
+        )
+        if "tweetPositionSeq" in record_batch.schema.names:
+            candidate_positions = _col(record_batch, "tweetPositionSeq", batch_size, np.int32)
 
     action_col = record_batch.column("actionNameMultiHotSeqSeq")
     assert action_col.type.value_type.list_size == output_vocab_size, (
@@ -566,6 +648,16 @@ def from_record_batch(
         conversion_keep_bits[null_rows] = CONVERSION_KEEP_WEB | CONVERSION_KEEP_APP
     else:
         conversion_keep_bits = None
+    if ads_pixel_head_masking and "conversionEligibleTypesSeq" in record_batch.schema.names:
+        conversion_eligible_types = _col(
+            record_batch, "conversionEligibleTypesSeq", batch_size, np.uint64
+        )
+        null_rows = ~record_batch.column("conversionEligibleTypesSeq").is_valid().to_numpy(
+            zero_copy_only=False
+        )
+        conversion_eligible_types[null_rows] = 0
+    else:
+        conversion_eligible_types = None
     sample_source = (
         record_batch.column("sample_source")
         .fill_null(0)
@@ -685,7 +777,15 @@ def from_record_batch(
         "timezoneSeq",
         np.zeros((batch_size, impression_timestamps_ms.shape[1]), dtype=np.int16),
     )
-    _local_hour, _local_dow = compute_local_time_features(impression_timestamps_ms, _timezone_enum)
+    feature_timestamps_ms = impression_timestamps_ms
+    if page_records:
+        served_ms = _col(record_batch, "servedTimeMsSeq", batch_size, np.int64)
+        base_rule = np.where(impression_timestamps_ms > 0, impression_timestamps_ms, served_ms)
+        page_rule = np.where(served_ms > 0, served_ms, base_rule)
+        feature_timestamps_ms = np.where(
+            page_record[:, None] & new_event_mask, page_rule, base_rule
+        )
+    _local_hour, _local_dow = compute_local_time_features(feature_timestamps_ms, _timezone_enum)
     hist_raw_categorical["localHourOfDaySeq"] = _local_hour
     hist_raw_categorical["localDayOfWeekSeq"] = _local_dow
     cand_raw_categorical["localHourOfDaySeq"] = _local_hour
@@ -735,7 +835,7 @@ def from_record_batch(
         dtype=np.float32,
     )
     hist_int64_features = np.zeros(
-        (batch_size, max_history_post_action_pairs, POST_INT64_FEATURE_SIZE), dtype=np.int64
+        (batch_size, max_history_post_action_pairs, post_int64_size), dtype=np.int64
     )
 
     cand_shape_2d = (batch_size, max_candidate_post_action_pairs)
@@ -749,6 +849,12 @@ def from_record_batch(
     candidate_client_app_id = np.zeros(cand_shape_2d, dtype=np.int32)
     candidate_trained_actions_bits = np.full(
         cand_shape_2d, CONVERSION_KEEP_WEB | CONVERSION_KEEP_APP, dtype=np.uint8
+    )
+    candidate_eligible_types = np.zeros(cand_shape_2d, dtype=np.uint64)
+    candidate_page = (
+        empty_page_record_arrays(batch_size, max_candidate_post_action_pairs)
+        if page_records
+        else {}
     )
     candidate_value_labels: dict[str, np.ndarray] = {
         key: np.zeros(cand_shape_2d, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()
@@ -787,9 +893,14 @@ def from_record_batch(
         dtype=np.float32,
     )
     cand_int64_features = np.zeros(
-        (batch_size, max_candidate_post_action_pairs, POST_INT64_FEATURE_SIZE),
+        (batch_size, max_candidate_post_action_pairs, post_int64_size),
         dtype=np.int64,
     )
+    cand_positions_aligned: np.ndarray | None = None
+    if candidate_positions is not None or reply_parent_mode:
+        cand_positions_aligned = np.zeros(
+            (batch_size, max_candidate_post_action_pairs), dtype=np.int32
+        )
 
     history_post_sids: np.ndarray | None = (
         np.zeros((batch_size, max_history_post_action_pairs, sid_num_levels), dtype=np.uint16)
@@ -912,7 +1023,7 @@ def from_record_batch(
                 _src = semantic_ids_full_raw[*dslice]
                 _w = min(_src.shape[-1], candidate_post_sids.shape[-1])
                 candidate_post_sids[*cslice, :_w] = (_src[..., :_w] + 1).astype(np.uint16)
-            ts_values = impression_timestamps_ms[*dslice] / 1000
+            ts_values = feature_timestamps_ms[*dslice] / 1000
             ts_values = np.nan_to_num(ts_values, nan=0.0, posinf=0.0, neginf=0.0)
             ts_values = np.clip(ts_values, -2147483648, 2147483647)
             candidate_impr_ts[*cslice] = ts_values.astype(np.int32)
@@ -920,6 +1031,10 @@ def from_record_batch(
             candidate_client_app_id[*cslice] = client_app_id[*dslice]
             if conversion_keep_bits is not None:
                 candidate_trained_actions_bits[*cslice] = conversion_keep_bits[*dslice]
+            if conversion_eligible_types is not None:
+                candidate_eligible_types[*cslice] = conversion_eligible_types[*dslice]
+            for key, values in page_columns.items():
+                candidate_page[key][*cslice] = values[*dslice]
             candidate_post_creation_ts_sec[*cslice] = post_creation_ts_sec[*dslice]
             candidate_actions[*cslice] = actions[*dslice, :]
             candidate_continuous_actions[*cslice] = continuous_actions[*dslice, :]
@@ -931,6 +1046,8 @@ def from_record_batch(
             candidate_promoted_ids[*cslice] = promoted_ids[*dslice]
             candidate_line_item_objective[*cslice] = line_item_objective[*dslice]
             candidate_safety_label_mask[*cslice] = safety_label_mask[*dslice]
+            if candidate_positions is not None and cand_positions_aligned is not None:
+                cand_positions_aligned[*cslice] = candidate_positions[*dslice]
             if (
                 candidate_search_query_embeddings is not None
                 and search_query_embeddings is not None
@@ -999,6 +1116,10 @@ def from_record_batch(
                 cand_int64_features,
                 cslice,
             )
+            for _slot, _col_arr in reply_cand_int64_cols.items():
+                cand_int64_features[*cslice, _slot] = _col_arr[*dslice]
+            for _slot, _col_arr in reply_cand_categorical_cols.items():
+                cand_categorical_features[*cslice, _slot] = _col_arr[*dslice]
 
     if offline_embedding_table is not None:
         table_embs, found_mask = offline_embedding_table.lookup(candidate_post_ids)
@@ -1027,7 +1148,10 @@ def from_record_batch(
     history_ip_ids = hist_int64_features[:, :, _ip_idx]
     candidate_ip_ids = cand_int64_features[:, :, _ip_idx]
 
-    for _ec_idx in _ENGAGEMENT_COUNT_INT64_INDICES:
+    _saturate_idx = _ENGAGEMENT_COUNT_INT64_INDICES + (
+        reply_features.REPLY_SATURATE_INT64_INDICES if reply_parent_mode else ()
+    )
+    for _ec_idx in _saturate_idx:
         np.clip(
             hist_int64_features[:, :, _ec_idx],
             0,
@@ -1076,6 +1200,23 @@ def from_record_batch(
         if cand_bool_features.shape[2] > BoolFeature.isStalePost14d.value:
             cand_bool_features[:, :, BoolFeature.isStalePost14d.value] = stale_post_14d
 
+    user_features = _extract_user_features(record_batch, batch_size)
+    if reply_parent_mode:
+        user_features["user_int64_features"] = reply_features.read_user_int64(
+            record_batch, batch_size
+        )
+        reply_features.place_focal_post(
+            rb=record_batch,
+            batch_size=batch_size,
+            new_event_mask=new_event_mask,
+            padding_mask=padding_mask,
+            user_ids=user_ids,
+            history_post_ids=history_post_ids,
+            history_auth_ids=history_auth_ids,
+            history_post_sids=history_post_sids,
+            user_int64=user_features["user_int64_features"],
+        )
+
     history_seq = PostSeq(
         impr_ts=history_impr_ts,
         actions=history_actions,
@@ -1104,6 +1245,14 @@ def from_record_batch(
         candidate_trained_actions_bits,
         ads_head_masking=ads_head_masking,
     )
+    candidate_head_eligible: dict[str, np.ndarray] = {}
+    if ads_pixel_head_masking:
+        candidate_head_eligible["head_eligible_mask"] = build_head_eligible_mask(
+            candidate_actions,
+            candidate_eligible_types if conversion_eligible_types is not None else None,
+        )
+    if page_records:
+        candidate_trained_mask &= candidate_page["rl_impressed"][:, :, None]
     candidate_seq = PostSeq(
         impr_ts=candidate_impr_ts,
         actions=candidate_actions,
@@ -1114,6 +1263,7 @@ def from_record_batch(
         client_app_id=candidate_client_app_id,
         post_ids=candidate_post_ids if include_candidate_post_ids else None,
         trained_candidate_mask=candidate_trained_mask,
+        **candidate_head_eligible,
         **candidate_value_labels,
         conversion_delay_ms=candidate_conversion_delays,
         continuous_actions=candidate_continuous_actions,
@@ -1128,6 +1278,7 @@ def from_record_batch(
         int64_features=cand_int64_features,
         post_creation_ts_sec=candidate_post_creation_ts_sec,
         post_sids=candidate_post_sids,
+        **candidate_page,
     )
 
     candidate_seq_with_negatives = apply_negative_sampling(
@@ -1138,6 +1289,7 @@ def from_record_batch(
         max_candidate_post_action_pairs,
         sample_source=sample_source,
         ads_head_masking=ads_head_masking,
+        negatives_from_trained_rows=page_records,
         clear_negative_word_match=search_negative_clear_word_match,
         lexical_text=candidate_lexical_strings.get(LEXICAL_TEXT_COLUMN),
         lexical_query=candidate_lexical_strings.get(LEXICAL_QUERY_COLUMN),
@@ -1171,7 +1323,7 @@ def from_record_batch(
         user_ip_hashes=hash_table.get_ip_hash(user_ip_ids),
         history_seq=history_seq,
         candidate_seq=candidate_seq_with_negatives,
-        **_extract_user_features(record_batch, batch_size),
+        **user_features,
         user_installed_apps_multihot=user_installed_apps_multihot,
         sample_weights=(
             record_batch.column("sampleWeight")
@@ -1183,6 +1335,8 @@ def from_record_batch(
         ),
         sample_source=sample_source,
     )
+    if cand_positions_aligned is not None:
+        batch["candidate_positions"] = cand_positions_aligned
     batch["num_positive_candidates"] = (
         num_positive_per_user.reshape(-1, 1)
         if candidate_negative_filter is not None
@@ -1205,6 +1359,7 @@ def apply_negative_sampling(
     lexical_text: np.ndarray | None = None,
     lexical_query: np.ndarray | None = None,
     lexical_author: np.ndarray | None = None,
+    negatives_from_trained_rows: bool = False,
 ) -> PostSeq:
     if num_negatives_per_example == 0:
         return post_seq
@@ -1392,7 +1547,13 @@ def apply_negative_sampling(
     new_lexical_author = np.zeros((batch_size, total_candidate_slots), dtype=object)
 
     def _copy_neg_features(curr_user_idx, start_slot, end_slot, post_src, query_src):
-        new_post_hashes[curr_user_idx, start_slot:end_slot, :] = post_hashes[post_src]
+        src_hashes = post_hashes[post_src]
+        if negatives_from_trained_rows:
+            assert trained_candidate_mask is not None
+            src_hashes = np.where(
+                trained_candidate_mask[post_src].any(-1)[..., None], src_hashes, 0
+            )
+        new_post_hashes[curr_user_idx, start_slot:end_slot, :] = src_hashes
         new_auth_hashes[curr_user_idx, start_slot:end_slot, :] = auth_hashes[post_src]
         new_ip_hashes[curr_user_idx, start_slot:end_slot, :] = ip_hashes[post_src]
         new_impr_ts[curr_user_idx, start_slot:end_slot] = impr_ts[post_src]
@@ -1510,6 +1671,7 @@ def apply_negative_sampling(
         client_app_id=new_client_app_id,
         post_ids=new_post_ids,
         trained_candidate_mask=new_trained_mask,
+        **_extend_head_eligible_mask(post_seq, total_candidate_slots),
         **_extend_value_labels(post_seq, (batch_size, total_candidate_slots)),
         conversion_delay_ms=_extend_conversion_delays(
             post_seq, (batch_size, total_candidate_slots)
@@ -1526,6 +1688,7 @@ def apply_negative_sampling(
         int64_features=new_int64_features,
         post_creation_ts_sec=new_post_creation_ts_sec,
         post_sids=new_post_sids,
+        **_extend_page_record_fields(post_seq, (batch_size, total_candidate_slots)),
     )
 
 
@@ -1767,6 +1930,7 @@ def apply_global_negative_sampling(
         client_app_id=new_client_app_id,
         post_ids=new_post_ids,
         trained_candidate_mask=new_gn_trained_mask,
+        **_extend_head_eligible_mask(post_seq, expanded_candidate_slots),
         **_extend_value_labels(post_seq, (batch_size, expanded_candidate_slots)),
         conversion_delay_ms=_extend_conversion_delays(
             post_seq, (batch_size, expanded_candidate_slots)
@@ -1783,6 +1947,7 @@ def apply_global_negative_sampling(
         int64_features=new_int64_features,
         post_creation_ts_sec=new_post_creation_ts_sec,
         post_sids=new_gn_post_sids,
+        **_extend_page_record_fields(post_seq, (batch_size, expanded_candidate_slots)),
     )
 
 

@@ -367,9 +367,8 @@ fn read_id_field<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thrift::protocol::{
-        TBinaryOutputProtocol, TFieldIdentifier, TListIdentifier, TStructIdentifier,
-    };
+    use crate::clients::strato_answer::Thrift::{self, Bool, List, Str, Struct, I64};
+    use crate::clients::strato_answer::{found, no_row};
     use xai_core_entities::entities::{EditControlInitial, MediaEntity};
     use xai_x_thrift::media_common::MediaKey;
     use xai_x_thrift::media_entity::ColorValue;
@@ -378,98 +377,35 @@ mod tests {
         ContentIdInfo, DomainRestrictions, GeoRestrictions, Restrictions,
     };
 
-    type Proto<'a> = TBinaryOutputProtocol<&'a mut Vec<u8>>;
-    type Fields<'a> = &'a mut dyn FnMut(&mut Proto<'_>);
-
     const TWEET_ID: i64 = 10;
     const AUTHOR_ID: i64 = 7001;
     const CONVERSATION_AUTHOR_ID: i64 = 7003;
     const TRUSTED_FRIENDS_LIST_ID: i64 = 9001;
     const ARTICLE_ID: i64 = 9002;
 
-    fn field(proto: &mut Proto<'_>, id: i16, ty: TType, value: impl FnOnce(&mut Proto<'_>)) {
-        proto
-            .write_field_begin(&TFieldIdentifier::new("", ty, id))
-            .unwrap();
-        value(proto);
-        proto.write_field_end().unwrap();
+    fn exclusive_conversation() -> (i16, Thrift) {
+        (155, Struct(vec![(1, I64(CONVERSATION_AUTHOR_ID))]))
     }
 
-    fn bare_struct(proto: &mut Proto<'_>, fields: impl FnOnce(&mut Proto<'_>)) {
-        proto
-            .write_struct_begin(&TStructIdentifier::new(""))
-            .unwrap();
-        fields(proto);
-        proto.write_field_stop().unwrap();
-        proto.write_struct_end().unwrap();
+    fn narrowcast_place(id: &str) -> (i16, Thrift) {
+        (172, Struct(vec![(1, Str(id.into()))]))
     }
 
-    fn structure(proto: &mut Proto<'_>, id: i16, fields: impl FnOnce(&mut Proto<'_>)) {
-        field(proto, id, TType::Struct, |p| bare_struct(p, fields));
+    fn encode_tweet(core_data: Vec<(i16, Thrift)>, rest: Vec<(i16, Thrift)>) -> Vec<u8> {
+        let core_data = [(1, I64(AUTHOR_ID)), (2, Str("tweet text".into()))]
+            .into_iter()
+            .chain(core_data);
+        let tweet = [(1, I64(TWEET_ID)), (2, Struct(core_data.collect()))]
+            .into_iter()
+            .chain(rest);
+        found(Struct(tweet.collect()))
     }
 
-    fn list(
-        proto: &mut Proto<'_>,
-        id: i16,
-        ty: TType,
-        len: usize,
-        elements: impl FnOnce(&mut Proto<'_>),
-    ) {
-        field(proto, id, TType::List, |p| {
-            p.write_list_begin(&TListIdentifier::new(ty, len as i32))
-                .unwrap();
-            elements(p);
-            p.write_list_end().unwrap();
-        });
-    }
-
-    fn i64_field(proto: &mut Proto<'_>, id: i16, value: i64) {
-        field(proto, id, TType::I64, |p| p.write_i64(value).unwrap());
-    }
-
-    fn bool_field(proto: &mut Proto<'_>, id: i16, value: bool) {
-        field(proto, id, TType::Bool, |p| p.write_bool(value).unwrap());
-    }
-
-    fn narrowcast_place(proto: &mut Proto<'_>, id: &str) {
-        structure(proto, 172, |p| {
-            field(p, 1, TType::String, |p| p.write_string(id).unwrap());
-        });
-    }
-
-    fn encode_option(option: Fields<'_>) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut proto = TBinaryOutputProtocol::new(&mut bytes, false);
-        bare_struct(&mut proto, |p| {
-            structure(p, 4, |p| {
-                structure(p, 2556, |p| structure(p, 118, |p| option(p)));
-            });
-        });
-        bytes
-    }
-
-    fn encode_tweet(core_data: Fields<'_>, rest: Fields<'_>) -> Vec<u8> {
-        encode_option(&mut |p| {
-            structure(p, 26900, |p| {
-                i64_field(p, 1, TWEET_ID);
-                structure(p, 2, |p| {
-                    i64_field(p, 1, AUTHOR_ID);
-                    field(p, 2, TType::String, |p| {
-                        p.write_string("tweet text").unwrap()
-                    });
-                    core_data(p);
-                });
-                rest(p);
-            });
-        })
-    }
-
-    fn non_empty_list(proto: &mut Proto<'_>, id: i16, non_empty: bool) {
-        list(proto, id, TType::Struct, usize::from(non_empty), |p| {
-            if non_empty {
-                bare_struct(p, |_| {});
-            }
-        });
+    fn non_empty_list(non_empty: bool) -> Thrift {
+        List(
+            TType::Struct,
+            non_empty.then(|| Struct(vec![])).into_iter().collect(),
+        )
     }
 
     fn media_fixture(
@@ -478,20 +414,13 @@ mod tests {
         keys: Option<bool>,
         entities: &[MediaEntity],
     ) -> Vec<u8> {
-        encode_tweet(&mut |_| {}, &mut |p| {
-            list(p, 7, TType::Struct, entities.len(), |p| {
-                for entity in entities {
-                    entity.write_to_out_protocol(p).unwrap();
-                }
-            });
-            if has_card {
-                structure(p, 118, |_| {});
-            }
-            non_empty_list(p, 162, has_refs);
-            if let Some(non_empty) = keys {
-                non_empty_list(p, 32766, non_empty);
-            }
-        })
+        let entities = entities.iter().cloned().map(Thrift::generated);
+        let fields = [(7, List(TType::Struct, entities.collect()))]
+            .into_iter()
+            .chain(has_card.then(|| (118, Struct(vec![]))))
+            .chain([(162, non_empty_list(has_refs))])
+            .chain(keys.map(|non_empty| (32766, non_empty_list(non_empty))));
+        encode_tweet(vec![], fields.collect())
     }
 
     fn restricted_media(has_key: bool, dmca: bool, allow: &[&str], deny: &[&str]) -> MediaEntity {
@@ -522,38 +451,29 @@ mod tests {
 
     #[test]
     fn projects_every_read_field_of_a_found_tweet() {
+        let media = Thrift::generated(restricted_media(true, true, &[], &[]));
+        let edit = Struct(vec![
+            (1, List(TType::I64, vec![I64(TWEET_ID)])),
+            (3, I64(4)),
+        ]);
         let bytes = encode_tweet(
-            &mut |p| {
-                bool_field(p, 9, true);
-                bool_field(p, 10, false);
-                bool_field(p, 11, true);
-            },
-            &mut |p| {
-                list(p, 7, TType::Struct, 1, |p| {
-                    restricted_media(true, true, &[], &[])
-                        .write_to_out_protocol(p)
-                        .unwrap()
-                });
-                list(p, 30, TType::Struct, 1, |p| {
-                    bare_struct(p, |p| structure(p, 4, |_| {}))
-                });
-                structure(p, 118, |_| {});
-                structure(p, 125, |p| {
-                    list(p, 1, TType::I64, 1, |p| p.write_i64(500).unwrap())
-                });
-                structure(p, 155, |p| i64_field(p, 1, CONVERSATION_AUTHOR_ID));
-                structure(p, 156, |p| i64_field(p, 1, TRUSTED_FRIENDS_LIST_ID));
-                structure(p, 157, |p| {
-                    structure(p, 1, |p| {
-                        list(p, 1, TType::I64, 1, |p| p.write_i64(TWEET_ID).unwrap());
-                        i64_field(p, 3, 4);
-                    })
-                });
-                list(p, 162, TType::Struct, 1, |p| bare_struct(p, |_| {}));
-                structure(p, 170, |p| i64_field(p, 1, ARTICLE_ID));
-                narrowcast_place(p, "7f00000000000001");
-                list(p, 32766, TType::Struct, 1, |p| bare_struct(p, |_| {}));
-            },
+            vec![(9, Bool(true)), (10, Bool(false)), (11, Bool(true))],
+            vec![
+                (7, List(TType::Struct, vec![media])),
+                (
+                    30,
+                    List(TType::Struct, vec![Struct(vec![(4, Struct(vec![]))])]),
+                ),
+                (118, Struct(vec![])),
+                (125, Struct(vec![(1, List(TType::I64, vec![I64(500)]))])),
+                exclusive_conversation(),
+                (156, Struct(vec![(1, I64(TRUSTED_FRIENDS_LIST_ID))])),
+                (157, Struct(vec![(1, edit)])),
+                (162, non_empty_list(true)),
+                (170, Struct(vec![(1, I64(ARTICLE_ID))])),
+                narrowcast_place("7f00000000000001"),
+                (32766, non_empty_list(true)),
+            ],
         );
         let media = MediaFeature {
             has_media: true,
@@ -593,10 +513,10 @@ mod tests {
             ("a000000000000001", Some(0xa000_0000_0000_0001)),
             ("not hex", None),
         ] {
-            let bytes = encode_tweet(&mut |_| {}, &mut |p| {
-                narrowcast_place(p, id);
-                list(p, 32766, TType::Struct, 1, |p| bare_struct(p, |_| {}));
-            });
+            let bytes = encode_tweet(
+                vec![],
+                vec![narrowcast_place(id), (32766, non_empty_list(true))],
+            );
 
             let features = decode_fixture(&bytes);
             assert_eq!(features.narrowcast_place_id, expected, "{id}");
@@ -609,16 +529,14 @@ mod tests {
 
     #[test]
     fn an_article_with_id_0_is_no_article() {
-        let bytes = encode_tweet(&mut |_| {}, &mut |p| {
-            structure(p, 170, |p| i64_field(p, 1, 0));
-        });
+        let bytes = encode_tweet(vec![], vec![(170, Struct(vec![(1, I64(0))]))]);
 
         assert_eq!(decode_fixture(&bytes).article_id, None);
     }
 
     #[test]
     fn plain_tweet_decodes_default_features() {
-        let bytes = encode_tweet(&mut |_| {}, &mut |_| {});
+        let bytes = encode_tweet(vec![], vec![]);
 
         assert_eq!(decode_fixture(&bytes), TweetFeatures::default());
     }
@@ -687,35 +605,23 @@ mod tests {
             }),
             ..Default::default()
         };
-        let unknown = |p: &mut Proto<'_>| {
-            structure(p, 900, |p| {
-                list(p, 1, TType::Struct, 1, |p| {
-                    bare_struct(p, |p| {
-                        field(p, 2, TType::String, |p| p.write_string("x").unwrap())
-                    })
-                });
-            });
+        let unknown = || {
+            let element = Struct(vec![(2, Str("x".into()))]);
+            (900, Struct(vec![(1, List(TType::Struct, vec![element]))]))
         };
-        let bytes = encode_tweet(&mut |_| {}, &mut |p| {
-            list(p, 7, TType::Struct, 2, |p| {
-                classified.write_to_out_protocol(p).unwrap();
-                bare_struct(p, |p| {
-                    unknown(p);
-                    structure(p, 22, |p| {
-                        unknown(p);
-                        structure(p, 12, |p| {
-                            unknown(p);
-                            structure(p, 3, |p| {
-                                unknown(p);
-                                list(p, 2, TType::String, 1, |p| p.write_string("fr").unwrap());
-                            });
-                        });
-                    });
-                    structure(p, 21, |p| i64_field(p, 2, 1));
-                });
-            });
-            structure(p, 155, |p| i64_field(p, 1, CONVERSATION_AUTHOR_ID));
-        });
+        let deny = (2, List(TType::String, vec![Str("fr".into())]));
+        let restrictions = Struct(vec![unknown(), (3, Struct(vec![unknown(), deny]))]);
+        let metadata = Struct(vec![unknown(), (12, restrictions)]);
+        let unread = Struct(vec![
+            unknown(),
+            (22, metadata),
+            (21, Struct(vec![(2, I64(1))])),
+        ]);
+        let entities = vec![Thrift::generated(classified), unread];
+        let bytes = encode_tweet(
+            vec![],
+            vec![(7, List(TType::Struct, entities)), exclusive_conversation()],
+        );
 
         let features = decode_fixture(&bytes);
         assert_eq!(
@@ -805,17 +711,9 @@ mod tests {
             ),
             (vec![], None),
         ] {
-            let bytes = encode_tweet(&mut |_| {}, &mut |p| {
-                structure(p, 125, |p| {
-                    list(p, 1, TType::I64, community_ids.len(), |p| {
-                        for id in &community_ids {
-                            p.write_i64(*id).unwrap();
-                        }
-                    });
-                    field(p, 2, TType::String, |p| p.write_string("channel").unwrap());
-                });
-                structure(p, 155, |p| i64_field(p, 1, CONVERSATION_AUTHOR_ID));
-            });
+            let ids = community_ids.iter().map(|&id| I64(id)).collect();
+            let communities = Struct(vec![(1, List(TType::I64, ids)), (2, Str("channel".into()))]);
+            let bytes = encode_tweet(vec![], vec![(125, communities), exclusive_conversation()]);
 
             let features = decode_fixture(&bytes);
             assert_eq!(features.community_id, expected, "{community_ids:?}");
@@ -829,9 +727,7 @@ mod tests {
 
     #[test]
     fn a_panicking_sub_reader_is_an_error_not_a_panic() {
-        let bytes = encode_tweet(&mut |_| {}, &mut |p| {
-            structure(p, 155, |p| i64_field(p, 1, CONVERSATION_AUTHOR_ID))
-        });
+        let bytes = encode_tweet(vec![], vec![exclusive_conversation()]);
         let end = bytes
             .windows(8)
             .position(|window| window == CONVERSATION_AUTHOR_ID.to_be_bytes())
@@ -844,11 +740,9 @@ mod tests {
 
     #[test]
     fn an_absent_value_is_missing_and_a_value_without_core_data_is_an_error() {
-        let absent = encode_option(&mut |p| field(p, 9048, TType::Void, |_| {}));
-        assert!(decode_tweet(&absent).unwrap().is_none());
+        assert!(decode_tweet(&no_row()).unwrap().is_none());
 
-        let without_core_data =
-            encode_option(&mut |p| structure(p, 26900, |p| i64_field(p, 1, TWEET_ID)));
+        let without_core_data = found(Struct(vec![(1, I64(TWEET_ID))]));
         let error = decode_tweet(&without_core_data).unwrap_err();
         assert_eq!(error.to_string(), "tweet value without coreData");
     }

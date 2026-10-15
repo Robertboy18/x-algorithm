@@ -1,8 +1,8 @@
 use super::builders::tweet_candidate;
 use super::{Role, Row};
 use crate::models::{
-    AuthorFeatures, ClientCapability, HydratedTweetCandidate, LimitedEngagementReason,
-    TweetFeatures, ViewerFeatures,
+    AuthorFeatures, ClientCapability, LimitedEngagementReason, PostCandidate, TweetFeatures,
+    ViewerFeatures,
 };
 use crate::rules::fixtures::{allow, candidate, dropped, limited, viewer, VIEWER_ID};
 use crate::rules::SafetyLevel::{TimelineHome, TimelineHomeHydration};
@@ -127,7 +127,7 @@ pub(super) fn rows() -> Vec<Row> {
             name: "stale_edit_retweet",
             post: {
                 let mut retweet = stale_candidate();
-                retweet.source_tweet_id = Some(2);
+                retweet.post.source_tweet_id = Some(2);
                 retweet
             },
             expect: vec![(TimelineHome, Role::NonFollower, allow())],
@@ -145,7 +145,7 @@ pub(super) fn rows() -> Vec<Row> {
     ]
 }
 
-fn stale_candidate() -> HydratedTweetCandidate {
+fn stale_candidate() -> PostCandidate {
     tweet_candidate(|t| {
         t.edit_control = Some(EditControl::Initial(EditControlInitial {
             edit_tweet_ids: vec![1, 2],

@@ -45,6 +45,8 @@ RETRIEVAL_DUMP_PATH: str = os.environ.get("XREX_RETRIEVAL_DUMP_PATH", "/path/to/
 SID_GLOBAL_IDS_SNAPSHOT: str = os.environ.get("XREX_SID_GLOBAL_IDS_SNAPSHOT", "")
 SID_VIDEO_GLOBAL_IDS_SNAPSHOT: str = os.environ.get("XREX_SID_VIDEO_GLOBAL_IDS_SNAPSHOT", "")
 
+SID_DECODER_PATH: str = os.environ.get("XREX_SID_DECODER_PATH", "")
+
 GEN_RECS_GLOBAL_IDS: str = os.environ.get(
     "XREX_GEN_RECS_GLOBAL_IDS", "/path/to/global_negative_pool.parquet"
 )

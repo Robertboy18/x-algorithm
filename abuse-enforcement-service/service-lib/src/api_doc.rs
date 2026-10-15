@@ -46,6 +46,10 @@ pub struct AllowlistDeleteResponse {
     modifiers(&SecurityAddon),
     paths(
         service::handle_action,
+        service::handle_action_controls_get,
+        service::handle_action_controls_put,
+        service::handle_action_controls_history,
+        service::handle_action_controls_pod,
         service::handle_config,
         service::handle_dry_run,
         service::handle_rate_limit,
@@ -64,8 +68,27 @@ pub struct AllowlistDeleteResponse {
         service::handle_allowlist_get_entity,
         service::handle_allowlist_put_entity,
         service::handle_allowlist_delete_entity,
+        service::handle_off_switches_get,
+        service::handle_off_switches_put,
     ),
     components(schemas(
+        xai_abuse_enforcement_types::action_control::ActionControlRecord,
+        xai_abuse_enforcement_types::action_control::ActionControlView,
+        xai_abuse_enforcement_types::action_control::ActionControlPutRequest,
+        xai_abuse_enforcement_types::action_control::ActionControlSeen,
+        xai_abuse_enforcement_types::action_control::ActionControlListResponse,
+        xai_abuse_enforcement_types::action_control::ActionControlHistoryEntry,
+        xai_abuse_enforcement_types::action_control::ActionControlHistoryResponse,
+        xai_abuse_enforcement_types::action_control::PodView,
+        xai_abuse_enforcement_types::action_control::PageAction,
+        xai_abuse_enforcement_types::action_control::ControlMode,
+        xai_abuse_enforcement_types::action_control::ControlEntity,
+        xai_abuse_enforcement_types::action_control::ConfidenceLevel,
+        xai_abuse_enforcement_types::action_control::ConfidenceEvidence,
+        xai_abuse_enforcement_types::action_control::EvidenceOverride,
+        xai_abuse_enforcement_types::action_control::ConfidenceView,
+        xai_abuse_enforcement_types::action_control::ConfidenceLevelView,
+        xai_abuse_enforcement_types::action_control::LabelMapEntry,
         xai_abuse_enforcement_types::allowlist::AllowlistEntry,
         xai_abuse_enforcement_types::allowlist::AllowlistRecord,
         xai_abuse_enforcement_types::allowlist::AllowlistAddRequest,
@@ -74,6 +97,11 @@ pub struct AllowlistDeleteResponse {
         xai_abuse_enforcement_types::allowlist::BulkResponse,
         xai_abuse_enforcement_types::allowlist::BulkRowResult,
         xai_abuse_enforcement_types::config::ConfigPatchRequest,
+        xai_abuse_enforcement_types::off_switch::OffSwitchRecord,
+        xai_abuse_enforcement_types::off_switch::OffSwitchPutRequest,
+        xai_abuse_enforcement_types::off_switch::OffSwitchView,
+        xai_abuse_enforcement_types::off_switch::OffSwitchSeen,
+        xai_abuse_enforcement_types::off_switch::OffSwitchListResponse,
         ApiError,
         DryRunStatus,
         RateLimitStats,
@@ -82,6 +110,8 @@ pub struct AllowlistDeleteResponse {
     tags(
         (name = "config", description = "🔒 PROTECTED (bearer token). GrowthBook config — read + write."),
         (name = "allowlist", description = "🔒 PROTECTED (bearer token). Allowlist — read + write (single + bulk)."),
+        (name = "action_control", description = "🔒 PROTECTED (bearer token). Page-owned action control — per entity (user or post) and head / classifier / band: follow the GrowthBook rules, record only, or act with the page's actions; history."),
+        (name = "off_switch", description = "🔒 PROTECTED (bearer token). Enforcement off switches — turn enforcement off or back on for a whole head or one head + classifier."),
         (name = "debug", description = "Open (no auth) ops/debug endpoints — dry-run flag, rate-limit usage, dedup lookup — EXCEPT POST /action and both rate-limit writes (POST /rate_limit and POST /rate_limit/reset), which are 🔒 protected because they mutate the enforcement budget. Look for the lock icon per endpoint."),
     ),
     servers(
@@ -91,7 +121,7 @@ pub struct AllowlistDeleteResponse {
         title = "xai-abuse-enforcement-service",
         description = "HTTP API for the xAI abuse-enforcement system. Used by the slackbot + the embedded admin UI at /admin.\n\n\
         **Auth:** endpoints with a 🔒 lock icon require `Authorization: Bearer <token>` — click **Authorize** and paste a key. \
-        PROTECTED: everything under `config` + `allowlist`, plus `POST /action`, `POST /rate_limit` and `POST /rate_limit/reset`. \
+        PROTECTED: everything under `config` + `allowlist` + `off_switch` + `action_control`, plus `POST /action`, `POST /rate_limit` and `POST /rate_limit/reset`. \
         OPEN (no auth): `GET /dry_run`, `GET /rate_limit`, `GET /dedup/{user_id}`.",
     ),
 )]
@@ -122,6 +152,12 @@ mod tests {
         ("/allowlist/{entity_type}/{entity_id}", "get", true),
         ("/allowlist/{entity_type}/{entity_id}", "put", true),
         ("/allowlist/{entity_type}/{entity_id}", "delete", true),
+        ("/off_switches", "get", true),
+        ("/off_switches", "put", true),
+        ("/action_controls", "get", true),
+        ("/action_controls", "put", true),
+        ("/action_controls/history", "get", true),
+        ("/action_controls/pod", "get", true),
     ];
 
     #[test]

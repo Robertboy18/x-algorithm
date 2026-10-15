@@ -18,6 +18,7 @@ import numpy as np
 
 from xai_checkpointing.tree_util import tree_to_dict
 from xrex.models.model_utils import unwrap_tree
+from xrex.models.page_rl import PageDecodeInputs
 from xrex.models.recsys_embedding import RecsysEmbeddings
 from xrex.models.sharding_context import make_legacy_sharding_context
 
@@ -42,6 +43,7 @@ TOPIC_BITMAPS_KEY = "post_embeddings.topic_bitmaps"
 MOL_SIDE_TABLE_KEY = "post_embeddings.mol_side_table"
 TOPIC_QUERY_KEY = "topic_query"
 TOPIC_FILTER_MODES = 6
+DECODE_OUTPUT_NAMES = ("picked_idx", "picked_prob", "picked_score")
 
 _RETRIEVAL_RUNNER_ATTRS = (
     "large_k",
@@ -348,6 +350,21 @@ def ensure_packing_layout_serialization_registered() -> None:
             deserialize_auxdata=lambda data: tuple(json.loads(data)),
         )
     _packing_layout_serialization_registered = True
+
+
+_page_decode_serialization_registered = False
+
+
+def ensure_page_decode_serialization_registered() -> None:
+    global _page_decode_serialization_registered
+    if _page_decode_serialization_registered:
+        return
+    from jax import export as jax_export
+
+    jax_export.register_namedtuple_serialization(
+        PageDecodeInputs, serialized_name="xrex.models.page_rl.PageDecodeInputs"
+    )
+    _page_decode_serialization_registered = True
 
 
 def _dtype_name(dtype: Any) -> str:
@@ -666,16 +683,18 @@ def _make_forward_fn(
     model_config = export_cfg.model_config
 
     @hk.transform
-    def forward_fn(batch: Any, merged_embeddings: jax.Array):
+    def forward_fn(
+        batch: Any, merged_embeddings: jax.Array, page_decode: PageDecodeInputs | None = None
+    ):
         recsys_embeddings = _recsys_embeddings_from_merged(
             merged_embeddings, embedding_slices, packed_geometry
         )
         model = model_config.make(sharding_context=make_legacy_sharding_context(mesh))
-        logits, candidate_continuous_predictions = model.forward(batch, recsys_embeddings)
-        log_probs = jax.nn.log_sigmoid(logits).astype(jnp.bfloat16).astype(jnp.float32)
-        cont_preds = candidate_continuous_predictions.astype(jnp.bfloat16).astype(jnp.float32)
+        outputs = model.forward(batch, recsys_embeddings, page_decode)
+        log_probs = jax.nn.log_sigmoid(outputs[0]).astype(jnp.bfloat16).astype(jnp.float32)
+        cont_preds = outputs[1].astype(jnp.bfloat16).astype(jnp.float32)
         has_nan = jnp.any(jnp.isnan(log_probs), axis=tuple(range(1, log_probs.ndim)))
-        return log_probs, cont_preds, has_nan
+        return log_probs, cont_preds, has_nan, *outputs[2:]
 
     return forward_fn
 
@@ -724,11 +743,7 @@ def _make_retrieval_forward_fn(
         mol_side_tables = None
         side_table = by_kind.get("weight")
         if side_table is not None:
-            components = model_config.mol_item_components
-            mol_side_tables = (
-                jax.numpy.transpose(side_table[:, :components]),
-                jax.numpy.transpose(side_table[:, components:]),
-            )
+            mol_side_tables = model_config.mol_side_tables_from_rows(side_table)
         results = model.forward(
             batch,
             recsys_embeddings,
@@ -857,6 +872,7 @@ def _input_spec(
     merged_aval: Any,
     batch_template: Any,
     retrieval_inputs: list[tuple[str, str, Any, str]] | None = None,
+    page_decode_avals: PageDecodeInputs | None = None,
 ) -> list[dict[str, Any]]:
     from xai_checkpointing.tree_util import keystr
 
@@ -904,7 +920,17 @@ def _input_spec(
     )
     for kind, key, aval, _ in retrieval_inputs or ():
         spec.append({"kind": kind, "key": key, **_aval_entry(aval)})
+    if page_decode_avals is not None:
+        for name, aval in page_decode_avals._asdict().items():
+            spec.append({"kind": "page_decode", "key": f"page_decode.{name}", **_aval_entry(aval)})
     return spec
+
+
+def _page_decode_avals(bs: int, candidate_seq_len: int) -> PageDecodeInputs:
+    return jax.tree.map(
+        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype),
+        PageDecodeInputs.no_decode(bs, candidate_seq_len),
+    )
 
 
 def _retrieval_export(
@@ -1159,15 +1185,24 @@ def build_bundle(
 
     files: list[BundleFile] = []
     programs: dict[str, Any] = {}
+    decode_programs: dict[str, Any] = {}
     all_custom_call_targets: set[str] = set()
 
     compact_candidate_slots = packed and bool(getattr(trainer, "compact_candidate_slots", False))
+    serve_page_decoder = bool(getattr(trainer, "serve_page_decoder", False))
+    if serve_page_decoder and (retrieval is not None or compact_candidate_slots):
+        raise NotImplementedError(
+            "page decode programs are exported for ranking bundles without compact candidate slots"
+        )
+    if serve_page_decoder:
+        ensure_page_decode_serialization_registered()
     rungs = [
-        (bs_per_device, packed_seq_len)
+        (bs_per_device, packed_seq_len, decode)
         for bs_per_device in buckets
         for packed_seq_len in _packed_seq_len_rungs(trainer, bs_per_device * mesh_devices, packed)
+        for decode in ((False, True) if serve_page_decoder else (False,))
     ]
-    for bs_per_device, packed_seq_len in rungs:
+    for bs_per_device, packed_seq_len, decode in rungs:
         start = time.perf_counter()
         bs = bs_per_device * mesh_devices
         batch_template = _batch_template(
@@ -1188,9 +1223,16 @@ def build_bundle(
             model_config.embedding_dtype,
         )
         retrieval_inputs = retrieval.program_inputs(bs) if retrieval is not None else None
+        page_decode_avals = _page_decode_avals(bs, candidate_seq_len) if decode else None
         if retrieval is None:
             forward_fn = _make_forward_fn(export_cfg, embedding_slices, mesh, packed_geometry)
-            args = (params_avals, rng_aval, batch_avals, merged_aval)
+            args = (
+                params_avals,
+                rng_aval,
+                batch_avals,
+                merged_aval,
+                *([page_decode_avals] if decode else []),
+            )
         else:
             forward_fn = _make_retrieval_forward_fn(
                 export_cfg, embedding_slices, mesh, retrieval, packed_geometry
@@ -1237,7 +1279,13 @@ def build_bundle(
                 )
 
         spec = _input_spec(
-            params_avals, rng_aval, batch_avals, merged_aval, batch_template, retrieval_inputs
+            params_avals,
+            rng_aval,
+            batch_avals,
+            merged_aval,
+            batch_template,
+            retrieval_inputs,
+            page_decode_avals,
         )
         if len(spec) != len(exported.in_avals):
             raise AssertionError(
@@ -1249,14 +1297,15 @@ def build_bundle(
                 raise AssertionError(
                     f"input spec mismatch for bs={bs} {entry['key']}: {entry} vs {expected}"
                 )
-        if len(exported.out_avals) != len(output_names):
+        names = (*output_names, *DECODE_OUTPUT_NAMES) if decode else output_names
+        if len(exported.out_avals) != len(names):
             raise AssertionError(
                 f"output count mismatch for bs={bs}: {len(exported.out_avals)} != "
-                f"{len(output_names)} {output_names}"
+                f"{len(names)} {names}"
             )
         outputs = [
             {"name": name, **_aval_entry(aval)}
-            for name, aval in zip(output_names, exported.out_avals, strict=True)
+            for name, aval in zip(names, exported.out_avals, strict=True)
         ]
         if mesh_export:
             kept = {int(i) for i in exported.module_kept_var_idx}
@@ -1294,7 +1343,7 @@ def build_bundle(
                 )
 
         program_key = str(bs) if packed_seq_len is None else f"{bs}_len{packed_seq_len}"
-        file_stem = f"forward_bs{program_key}"
+        file_stem = f"forward_bs{program_key}" + ("_decode" if decode else "")
         mlir_name = f"{BUNDLE_DIR}/{file_stem}.mlirbc"
         jax_export_name = f"{BUNDLE_DIR}/{file_stem}.jax_export"
         mlir_bytes = bytes(exported.mlir_module_serialized)
@@ -1308,7 +1357,7 @@ def build_bundle(
                 f"bs={bs}: template row {row_len} != packed_seq_len {packed_seq_len}"
             )
 
-        programs[program_key] = {
+        (decode_programs if decode else programs)[program_key] = {
             "batch_size": bs,
             "mlir_module": {"file": mlir_name, "adler32": zlib.adler32(mlir_bytes)},
             "jax_export": {"file": jax_export_name, "adler32": zlib.adler32(jax_export_bytes)},
@@ -1331,7 +1380,7 @@ def build_bundle(
         logger.info(
             "Exported StableHLO %s forward bs=%d (%d/device, packed row %s) in %.1fs "
             "(%d inputs, %d kept, custom_calls=%s)",
-            "retrieval" if retrieval is not None else "ranking",
+            "retrieval" if retrieval is not None else "ranking decode" if decode else "ranking",
             bs,
             bs_per_device,
             row_len,
@@ -1353,6 +1402,7 @@ def build_bundle(
         packed=packed,
         retrieval=retrieval,
         mesh=_mesh_block(mesh, use_shardy) if mesh_export else None,
+        decode_programs=decode_programs,
     )
     files.insert(0, BundleFile(MANIFEST_NAME, json.dumps(manifest, indent=2).encode()))
     return files
@@ -1462,6 +1512,7 @@ def _build_manifest(
     packed: bool,
     retrieval: RetrievalExport | None = None,
     mesh: dict[str, Any] | None = None,
+    decode_programs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import jaxlib
 
@@ -1506,6 +1557,8 @@ def _build_manifest(
             "hash_table": dataset.hash_table.to_dict(),
         },
     }
+    if decode_programs:
+        manifest["decode_programs"] = decode_programs
     if retrieval is not None:
         manifest["retrieval"] = retrieval.manifest_block()
         if mesh is None:

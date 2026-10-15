@@ -35,6 +35,7 @@ except ImportError:
 
 from xrex import settings
 from xrex.data.parquet_recsys import DataPosition, PhoenixDataset, load_global_ids_from_parquet_file
+from xrex.data.recsys import reply_features
 from xrex.data.recsys.feature_config import (
     OPTIONAL_COLUMNS,
     REQUIRED_COLUMNS,
@@ -971,6 +972,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
     offset_ptr: dict[int, int] | None = None
     num_kafka_partitions: int | None = None
     sampling_factor: int = 1
+    partition_sampling_factor: int = 1
     negative_downsample_rate: int = 1
     negative_downsample_positive_action_indices: str = (
         DEFAULT_NEGATIVE_DOWNSAMPLE_POSITIVE_ACTION_INDICES
@@ -1037,7 +1039,12 @@ class PhoenixKafkaDataset(PhoenixDataset):
             if batch and embedding_col_name in batch[0].schema.names:
                 required_columns.append(embedding_col_name)
 
-        unified_batches = _unify_record_batch_schemas(batch, required_columns, OPTIONAL_COLUMNS)
+        optional_columns = OPTIONAL_COLUMNS
+        if self.reply_parent_mode:
+            optional_columns = list(
+                dict.fromkeys(OPTIONAL_COLUMNS + reply_features.REPLY_OPTIONAL_COLUMNS)
+            )
+        unified_batches = _unify_record_batch_schemas(batch, required_columns, optional_columns)
 
         t = time.time()
         table = pa.Table.from_batches(unified_batches)
@@ -1082,7 +1089,10 @@ class PhoenixKafkaDataset(PhoenixDataset):
             zero_stale_post_14d_candidate_counts=self.enable_stale_post,
             stale_post_30d=self.enable_stale_post_30d,
             search_negative_clear_word_match=self.search_negative_clear_word_match,
+            reply_parent_mode=self.reply_parent_mode,
             ads_head_masking=self.ads_head_masking,
+            ads_pixel_head_masking=self.ads_pixel_head_masking,
+            page_records=self.page_records,
         )
 
         elapsed = time.time() - t
@@ -1414,6 +1424,7 @@ class PhoenixKafkaDataset(PhoenixDataset):
                     stop_event=stop_event,
                     post_process_fn=post_process_fn,
                     sampling_factor=self.sampling_factor,
+                    partition_sampling_factor=self.partition_sampling_factor,
                     auto_offset_reset=self.auto_offset_reset,
                     training_name=self.name,
                     lag_tracker=lag_tracker,

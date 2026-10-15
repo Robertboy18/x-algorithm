@@ -68,6 +68,7 @@ from xrex.inference.int8_post_table import (
 from xrex.inference.metrics import MetricsPublisher, get_metrics_publisher
 from xrex.inference.status_server import StatusServer, StatusServerConfig
 from xrex.models.model_utils import Parameter, unwrap_tree
+from xrex.models.page_rl import PageDecodeInputs
 from xrex.models.recsys_embedding import RecsysEmbeddings
 from xrex.models.recsys_model import RecsysAggregatedModelConfig
 from xrex.models.sharding_context import make_legacy_sharding_context
@@ -528,6 +529,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     channel_size: int = 2048
     enqueue_timeout_ms: int = 1000
     queue_max_staleness_ms: int = 1200
+    queue_batch_wait_ms: float = 0.0
 
     enable_deadline_admission: bool = False
     deadline_margin_ms: float = 30.0
@@ -541,6 +543,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     pinned_d2h_num_buffers: int = 3
 
     enable_bloom_filter: bool = False
+
+    sid_endpoint: str | None = None
 
     log_rotate: bool = False
     log_rotate_max_bytes: int = 3 * 1024 * 1024 * 1024
@@ -558,6 +562,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     )
 
     _last_observed_reload_trigger: int = field(default=0, init=False)
+    reload_trigger_poll_interval_s: float = 0.0
+    _last_reload_trigger_poll: float = field(default=0.0, init=False)
 
     _reload_probe_executor: concurrent.futures.ThreadPoolExecutor | None = field(
         default=None, init=False
@@ -688,6 +694,11 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         )
 
     def _observe_peer_reload_trigger(self) -> bool:
+        if self.reload_trigger_poll_interval_s > 0:
+            now = time.monotonic()
+            if now - self._last_reload_trigger_poll < self.reload_trigger_poll_interval_s:
+                return False
+            self._last_reload_trigger_poll = now
         current = self._read_reload_trigger()
         if current <= self._last_observed_reload_trigger:
             return False
@@ -719,6 +730,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     _standby_emb_prefaulted: bool = field(default=False, init=False)
     _host_state_slots: list[Any] = field(default_factory=list, init=False)
     _active_host_slot: int = field(default=0, init=False)
+    _server_for_hotswap: Any = field(default=None, init=False)
     _reload_requested: threading.Event = field(default_factory=threading.Event, init=False)
     _hotswap_cycle_inflight: threading.Event = field(default_factory=threading.Event, init=False)
     _swap_ready: threading.Event = field(default_factory=threading.Event, init=False)
@@ -797,6 +809,10 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     ):
         init_params = t.to_dict()
         init_params.pop("__class")
+        init_params.pop("num_microbatch")
+        init_params.pop("use_async_emb")
+        init_params.pop("seqpack_drop_empty_candidates")
+        init_params.pop("overlap_step_host_work")
 
         init_params["inference_batch_size"] = inference_batch_size
         init_params["history_seq_len"] = history_seq_len
@@ -2123,7 +2139,9 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             dataset_types=jnp.array([RetrievalDataset.PAD.value], dtype=jnp.int32),
         )
         if isinstance(self.model_config, RecsysTwoTowerModelConfig):
-            post_embeddings = self.model_config.candidate_tower_config.make_post_embeddings()
+            post_embeddings = self.model_config.candidate_tower_config.make_post_embeddings(
+                self.model_config.num_table_slots
+            )
             padded = self.padded_max_posts
             orig = self.model_config.candidate_tower_config.max_posts
             if padded > orig:
@@ -2317,7 +2335,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             row_sharded_keys = {pe_key} if pe_checksum is not None else set()
             state = {k: v for k, v in state.items() if k not in row_sharded_keys}
             sums = jax.tree.map(adler32.adler32, state)
-            errors = [k for k, v in sums.items() if k != "opt_state" and v.item() != saved[k]]
+            errors = [k for k, v in sums.items() if v is not None and v.item() != saved[k]]
             if errors:
                 if self.metrics_publisher is not None:
                     self.metrics_publisher.checkpoint_reload_failure_total.labels(
@@ -2443,9 +2461,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                 if self.checkpoint_config.verify_checksums:
                     state_dict = tree_to_dict(unwrap_tree(self.state).purge_opt_state())
                     nfs_checksums = {
-                        k: adler32.adler32(v).item()
-                        for k, v in state_dict.items()
-                        if k != "opt_state"
+                        k: adler32.adler32(v).item() for k, v in state_dict.items() if v is not None
                     }
                 nfs_checksums_json = json.dumps({"global_checksums": nfs_checksums})
                 _save_tensors_to_shm(
@@ -3330,8 +3346,9 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                         batch_id=last_batch_id,
                     ):
                         as_np_array_t = Timer()
-                        assert len(last_out) in (3, 4), (
-                            f"model should return (log_probs, cont_preds, has_nan) or "
+                        assert len(last_out) in (3, 4, 6), (
+                            f"model should return (log_probs, cont_preds, [picked_idx, "
+                            f"picked_prob, picked_score,] has_nan) or "
                             f"(top_k_indices, top_k_scores, generated, has_nan), got {len(last_out)}"
                         )
                         *model_out_jax, has_nan_jax = last_out
@@ -3478,7 +3495,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             self.dequeued_batch_id += 1
             dequeue_t = Timer()
 
-            if self.is_multi_worker:
+            if self.is_multi_worker and self.queue_batch_wait_ms <= 0:
                 _dq_result: list = [None]
                 _dq_event = threading.Event()
 
@@ -3651,6 +3668,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
 
         if self.enable_hotswap:
             self._init_hotswap_buffers()
+            self._server_for_hotswap = server
             if getattr(self, "_is_hotswap_leader", True):
                 target = self._coordinator_loop
                 role = "leader"
@@ -3963,6 +3981,11 @@ class RankingModelRunner(
     forward_jit_by_bs_len: dict[tuple[int, int | None], JittedOrCompiled] = field(
         default_factory=dict, init=False
     )
+    serve_page_decoder: bool = False
+    forward_no_decoder_jit_by_bs: dict[int, JittedOrCompiled] = field(
+        default_factory=dict, init=False
+    )
+    _zero_page_decode_by_bs: dict[int, PageDecodeInputs] = field(default_factory=dict, init=False)
 
     def _rng_and_init_data(
         self,
@@ -4143,16 +4166,20 @@ class RankingModelRunner(
             "forward_jit/ranking",
             batch_id=batch_id,
         ):
+            if self.serve_page_decoder:
+                return self.forward_no_decoder_jit_by_bs[bs](
+                    params, rng, batch, merged_embeddings, self.zero_page_decode_inputs(bs)
+                )
             return forward_jit(params, rng, batch, merged_embeddings)
 
     def reply_request(
         self,
         request: xai_recsys_engine.PredictRequestBatch,
-        output_array: tuple[np.ndarray, np.ndarray],
+        output_array: tuple[np.ndarray, ...],
         orig_batch_size: int,
         bucket_size: int,
     ) -> None:
-        log_probs, candidate_continuous_predictions = output_array
+        log_probs, candidate_continuous_predictions = output_array[:2]
         if self.using_seqpack:
             log_probs = log_probs.reshape(bucket_size, self.candidate_seq_len, log_probs.shape[-1])
             candidate_continuous_predictions = candidate_continuous_predictions.reshape(
@@ -4173,6 +4200,17 @@ class RankingModelRunner(
         engine_sid_num_levels = (
             self.model_config.sid_num_levels if self.model_config.use_post_sid else 0
         )
+        post_int64_size, user_int64_size = self.dataset.int64_feature_sizes()
+        sid_client = None
+        if self.sid_endpoint and engine_sid_num_levels > 0:
+            sid_client = xai_recsys_engine.PySemanticIdClient(
+                self.sid_endpoint, engine_sid_num_levels
+            )
+            logger.info(
+                "Request-path SID hydration enabled: endpoint=%s sid_num_levels=%d",
+                self.sid_endpoint,
+                engine_sid_num_levels,
+            )
         return xai_recsys_engine.RecsysPredictorServer(
             self.grpc_port,
             self.metrics_port,
@@ -4181,6 +4219,7 @@ class RankingModelRunner(
             channel_size=self.channel_size,
             enqueue_timeout_ms=self.enqueue_timeout_ms,
             queue_max_staleness_ms=self.queue_max_staleness_ms,
+            queue_batch_wait_ms=self.queue_batch_wait_ms,
             enable_deadline_admission=self.enable_deadline_admission,
             deadline_margin_ms=self.deadline_margin_ms,
             deadline_post_ms=self.deadline_post_ms,
@@ -4188,6 +4227,7 @@ class RankingModelRunner(
             service_time_ewma_alpha=self.service_time_ewma_alpha,
             pipeline_depth=1 if self.use_pipelining else 0,
             mm_client=mm_client,
+            sid_client=sid_client,
             user_id_table_size=hash_keys.user_id_table_size,
             user_hash_scales=hash_keys.user_hash_scales,
             user_biases=hash_keys.user_biases,
@@ -4214,7 +4254,7 @@ class RankingModelRunner(
             num_user_categorical_features=recsys_batch.USER_CATEGORICAL_FEATURE_SIZE,
             num_user_bool_features=recsys_batch.USER_BOOL_FEATURE_SIZE,
             num_user_float_features=recsys_batch.USER_FLOAT_FEATURE_SIZE,
-            num_user_int64_features=recsys_batch.USER_INT64_FEATURE_SIZE,
+            num_user_int64_features=user_int64_size,
             num_user_installed_apps=recsys_batch.NUM_USER_INSTALLED_APPS,
             num_post_categorical_features=recsys_batch.POST_CATEGORICAL_FEATURE_SIZE,
             num_post_bool_features=recsys_batch.POST_BOOL_FEATURE_SIZE,
@@ -4224,7 +4264,7 @@ class RankingModelRunner(
                 )
             ),
             num_post_float_features=recsys_batch.POST_FLOAT_FEATURE_SIZE,
-            num_post_int64_features=recsys_batch.POST_INT64_FEATURE_SIZE,
+            num_post_int64_features=post_int64_size,
             enable_async_response_compression=self.enable_async_response_compression,
             sid_num_levels=engine_sid_num_levels,
         )
@@ -4239,8 +4279,12 @@ class RankingModelRunner(
 
         self.create_embedding_init_data()
 
+        assert not (self.serve_page_decoder and self.compact_candidate_slots), (
+            "serve_page_decoder does not support compact candidate slots"
+        )
         self.forward_jit_by_bs = {}
         self.forward_jit_by_bs_len = {}
+        self.forward_no_decoder_jit_by_bs = {}
         for bs in self.sorted_buckets:
             lens: tuple[int | None, ...] = (
                 self.packed_seq_lens(bs) if self.compact_candidate_slots else (None,)
@@ -4251,6 +4295,10 @@ class RankingModelRunner(
                 )
                 self.forward_jit_by_bs_len[(bs, n)] = jit_fn
             self.forward_jit_by_bs[bs] = jit_fn
+            if self.serve_page_decoder:
+                self.forward_no_decoder_jit_by_bs[bs] = self._build_and_register_forward_jit(
+                    bs, compiler_options, run_decoder=False
+                )
         self.forward_jit = self.forward_jit_by_bs[max(self.sorted_buckets)]
         if self.compact_candidate_slots:
             logger.info(
@@ -4263,6 +4311,7 @@ class RankingModelRunner(
         bs: int,
         compiler_options: dict[str, Any] | None,
         packed_seq_len: int | None = None,
+        run_decoder: bool = True,
     ) -> JittedOrCompiled:
         assert isinstance(self.model_config, RecsysAggregatedModelConfig)
 
@@ -4360,6 +4409,7 @@ class RankingModelRunner(
         def forward_fn(
             batch: RecsysFeaturesBatch,
             merged_embeddings: jax.Array,
+            page_decode: PageDecodeInputs | None = None,
         ):
             assert isinstance(self.model_config, RecsysAggregatedModelConfig)
             sl = embedding_slices
@@ -4385,16 +4435,17 @@ class RankingModelRunner(
                     ),
                 )
             model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
-            logits, candidate_continuous_predictions = model.forward(batch, recsys_embeddings)
-            log_probs = jax.nn.log_sigmoid(logits).astype(jnp.float32)
-            cont_preds = candidate_continuous_predictions.astype(jnp.float32)
+            outputs = model.forward(batch, recsys_embeddings, page_decode, run_decoder=run_decoder)
+            log_probs = jax.nn.log_sigmoid(outputs[0]).astype(jnp.float32)
+            cont_preds = outputs[1].astype(jnp.float32)
             has_nan = jnp.any(jnp.isnan(log_probs), axis=tuple(range(1, log_probs.ndim)))
-            return log_probs, cont_preds, has_nan
+            return log_probs, cont_preds, *outputs[2:], has_nan
 
         self.forward_fn = forward_fn
         nan_sharding = jax.sharding.NamedSharding(
             self.data_sharding.mesh, P(self.data_sharding.spec[0])
         )
+        num_decode_outputs = 3 if self.serve_page_decoder else 0
 
         forward_jit = JittedOrCompiled(
             jax.jit(
@@ -4404,11 +4455,18 @@ class RankingModelRunner(
                     None,
                     self.data_sharding,
                     self.data_sharding,
+                    *((None,) if self.serve_page_decoder else ()),
                 ),
-                out_shardings=(self.data_sharding, self.data_sharding, nan_sharding),
+                out_shardings=(
+                    self.data_sharding,
+                    self.data_sharding,
+                    *((nan_sharding,) * num_decode_outputs),
+                    nan_sharding,
+                ),
             ),
             name=f"forward_fn_bs{bs}"
-            + (f"_len{packed_seq_len}" if packed_seq_len is not None else ""),
+            + (f"_len{packed_seq_len}" if packed_seq_len is not None else "")
+            + ("" if run_decoder else "_no_decoder"),
         )
 
         rng, init_data = self._rng_and_init_data(bs=bs, packed_seq_len=packed_seq_len)
@@ -4434,9 +4492,17 @@ class RankingModelRunner(
             rng,
             init_data,
             merged_embeddings_init,
+            *((self.zero_page_decode_inputs(bs),) if self.serve_page_decoder else ()),
             compiler_options=compiler_options,
         )
         return forward_jit
+
+    def zero_page_decode_inputs(self, bs: int) -> PageDecodeInputs:
+        if bs not in self._zero_page_decode_by_bs:
+            self._zero_page_decode_by_bs[bs] = PageDecodeInputs.no_decode(
+                bs, self.candidate_seq_len
+            )
+        return self._zero_page_decode_by_bs[bs]
 
 
 @final

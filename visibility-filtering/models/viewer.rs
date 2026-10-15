@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use xai_twittercontext_proto::TwitterContextViewer;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Viewer {
@@ -82,6 +83,77 @@ impl Default for ClientCapability {
             gore_blur_ignores_settings: false,
             fosnr_rules: true,
             fosnr_fallback_drops: false,
+        }
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, strum::VariantArray,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Client {
+    #[default]
+    Web,
+    IosCurrent,
+    IosOutdated,
+    AndroidCurrent,
+    AndroidOutdated,
+    AndroidWithoutFosnr,
+    MacApp,
+}
+
+impl Client {
+    const fn app(self) -> (i64, Option<&'static str>) {
+        match self {
+            Self::Web => (3_033_300, None),
+            Self::IosCurrent => (
+                129_032,
+                Some("Twitter-iPhone/11.11.5 iOS/17.0 (Apple;iPhone15,2;;;;;1;2022)"),
+            ),
+            Self::IosOutdated => (
+                129_032,
+                Some("Twitter-iPhone/11.11.4 iOS/17.0 (Apple;iPhone15,2;;;;;1;2022)"),
+            ),
+            Self::AndroidCurrent => (
+                258_901,
+                Some(
+                    "TwitterAndroid/11.11.0-release.00 (311110000-r-0) Pixel 7/14 \
+                     (Google;panther;google;panther;0;;1;2022)",
+                ),
+            ),
+            Self::AndroidOutdated => (
+                258_901,
+                Some(
+                    "TwitterAndroid/11.10.9-release.00 (311109000-r-0) Pixel 7/14 \
+                     (Google;panther;google;panther;0;;1;2022)",
+                ),
+            ),
+            Self::AndroidWithoutFosnr => (
+                258_901,
+                Some(
+                    "TwitterAndroid/9.82.0-release.00 (29820000-r-0) Pixel 7/14 \
+                     (Google;panther;google;panther;0;;1;2022)",
+                ),
+            ),
+            Self::MacApp => (
+                557_701,
+                Some("Twitter-Mac/11.11.5 macOS/14.0 (Apple;Mac14,2)"),
+            ),
+        }
+    }
+
+    pub(crate) fn context(
+        self,
+        viewer_id: Option<u64>,
+        country_code: Option<&str>,
+    ) -> TwitterContextViewer {
+        let (client_application_id, user_agent) = self.app();
+        TwitterContextViewer {
+            user_id: viewer_id.map_or(0, u64::cast_signed),
+            client_application_id,
+            user_agent: user_agent.unwrap_or_default().to_string(),
+            request_country_code: country_code.unwrap_or_default().to_string(),
+            ..Default::default()
         }
     }
 }

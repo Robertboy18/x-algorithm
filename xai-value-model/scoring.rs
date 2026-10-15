@@ -133,6 +133,7 @@ pub fn compute_weighted_score(
         apply(scores.report_score, weights.report),
         apply(scores.not_dwelled_score, weights.not_dwelled),
         apply(scores.post_unexplored_score, post_unexplored_weight),
+        apply(scores.react_with_video_score, weights.react_with_video),
     ]
     .iter()
     .sum()
@@ -349,6 +350,7 @@ mod tests {
             cont_dwell_time: 0.1,
             cont_click_dwell_time: 0.2,
             post_unexplored: 1.5,
+            react_with_video: 2.5,
             report: -100.0,
             not_interested: -10.0,
             bidirectional_follow_reply_weight_boost: 1.0,
@@ -370,6 +372,7 @@ mod tests {
                 dwell_score: Some(0.4),
                 dwell_time: Some(10.0),
                 post_unexplored_score: Some(0.2),
+                react_with_video_score: Some(0.04),
                 ..Default::default()
             },
             author_id: 1,
@@ -422,7 +425,7 @@ mod tests {
         ];
 
         let offset = 0.001;
-        let positive_weight_sum = 2.0 + 4.0 + 1.0 + 0.5 + 3.0 + 1.5;
+        let positive_weight_sum = 2.0 + 4.0 + 1.0 + 0.5 + 3.0 + 1.5 + 2.5;
         let negative_weight_magnitude = 10.0 + 100.0;
         let total_weight_sum = positive_weight_sum + negative_weight_magnitude;
 
@@ -433,6 +436,7 @@ mod tests {
             + boosted_dwell_weight * 0.4
             + 0.1 * 10.0
             + 1.5 * 0.2
+            + 2.5 * 0.04
             + offset;
 
         let weighted_ineligible_video_oon = 2.0 * 0.2 + 0.2 * 5.0 + offset;

@@ -40,13 +40,14 @@ class RetrievalValidityTest(unittest.TestCase):
         self.posts = jnp.array([[9.0, 0.0], [8.0, 0.0], [7.0, 0.0], [6.0, 0.0]], dtype=jnp.bfloat16)
         self.dataset_types = jnp.array([1, 1, 2, 2], dtype=jnp.int32)
 
-    def forward(self, *, return_validity=True, dataset_ranges=None, **kwargs):
+    def forward(self, *, return_validity=True, dataset_ranges=None, config=None, **kwargs):
         dynamic_ranges = dataset_ranges if isinstance(dataset_ranges, jax.Array) else None
+        if config is None:
+            config = RecsysTwoTowerModelConfig(user_tower_config=None, candidate_tower_config=None)
 
         @hk.without_apply_rng
         @hk.transform
         def retrieve(users, posts, ranges):
-            config = RecsysTwoTowerModelConfig(user_tower_config=None, candidate_tower_config=None)
             model = FixedUserModel(config, None, None, self.context)
             return model.forward(
                 users,
@@ -104,6 +105,49 @@ class RetrievalValidityTest(unittest.TestCase):
         results = self.forward(target_dataset_types=(1, 2), dataset_ranges=((1, 2), (2, 2)))
         self.assert_selected(results[0], [[1]] * 4)
         self.assert_selected(results[1], [[]] * 4)
+
+    def test_query_head_weights_preserve_validity(self):
+        config = RecsysTwoTowerModelConfig(
+            user_tower_config=None,
+            candidate_tower_config=None,
+            head_names=["home", "ld"],
+            w_fav=0.0,
+            w_ld=1.0,
+        )
+        posts = jnp.concatenate(
+            [self.posts, jnp.array([[1, 0], [10, 0], [20, 0], [30, 0]], dtype=jnp.bfloat16)],
+            axis=1,
+        )
+        for use_int8 in (False, True):
+            self.posts = posts.astype(jnp.int8) if use_int8 else posts
+            post_scales = jnp.ones(4, dtype=jnp.float32) if use_int8 else None
+            for weights, selected, scores in (
+                (None, [1, 0], [10.0, 1.0]),
+                ((1.0, 0.0), [0, 1], [9.0, 8.0]),
+                ((0.25, 0.75), [1, 0], [9.5, 3.0]),
+            ):
+                for path in (
+                    {},
+                    {"dataset_ranges": ((0, 2),)},
+                    {
+                        "dataset_ranges": jnp.array([[0, 2]], dtype=jnp.int32),
+                        "dataset_capacities": (3,),
+                    },
+                ):
+                    with self.subTest(int8=use_int8, weights=weights, path=path):
+                        kwargs = dict(
+                            config=config,
+                            query_head_weights=weights,
+                            post_scales=post_scales,
+                            **path,
+                        )
+                        (result,) = self.forward(**kwargs)
+                        self.assert_selected(result, [selected] * 4)
+                        np.testing.assert_array_equal(np.asarray(result[1])[:, :2], [scores] * 4)
+                        (legacy,) = self.forward(return_validity=False, **kwargs)
+                        self.assertEqual(len(legacy), 2)
+                        for old, new in zip(legacy, result[:2]):
+                            np.testing.assert_array_equal(old, new)
 
     def test_legacy_outputs_are_unchanged(self):
         for kwargs in (

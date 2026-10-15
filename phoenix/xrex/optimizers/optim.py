@@ -2,6 +2,8 @@
 # Copyright 2026 X.AI Corp.
 import functools
 import inspect
+import re
+from collections.abc import Sequence
 from typing import Any, Callable, Iterable, NamedTuple, Union
 
 import chex
@@ -120,6 +122,52 @@ def scale_by_lr_multiplier() -> optax.GradientTransformation:
     return optax.GradientTransformation(init_empty_state, update_fn)
 
 
+def _is_parameter(x) -> bool:
+    return isinstance(x, Parameter)
+
+
+def _clip_group(path, patterns: list[re.Pattern]) -> int:
+    key = jax.tree_util.keystr(path)
+    return next((i + 1 for i, rx in enumerate(patterns) if rx.search(key)), 0)
+
+
+def _clip_group_norms(tree, patterns: list[re.Pattern]) -> list[jax.Array]:
+    sums = [jnp.zeros((), jnp.float32) for _ in range(len(patterns) + 1)]
+    for path, leaf in jax.tree_util.tree_leaves_with_path(tree, is_leaf=_is_parameter):
+        sums[_clip_group(path, patterns)] += sum(
+            jnp.sum(jnp.square(a.astype(jnp.float32))) for a in jax.tree.leaves(leaf)
+        )
+    return [jnp.sqrt(s) for s in sums]
+
+
+def clip_by_global_norm_partitioned(
+    max_norm: float, partitions: Sequence[str]
+) -> optax.GradientTransformation:
+    patterns = [re.compile(p) for p in partitions]
+
+    def update_fn(updates, state, params=None):
+        del params
+        scales = [
+            jnp.where(norm < max_norm, 1.0, max_norm / jnp.maximum(norm, 1e-6))
+            for norm in _clip_group_norms(updates, patterns)
+        ]
+
+        def scale_leaf(path, leaf):
+            s = scales[_clip_group(path, patterns)]
+            return jax.tree.map(lambda a: (a * s).astype(a.dtype), leaf)
+
+        return jax.tree_util.tree_map_with_path(scale_leaf, updates, is_leaf=_is_parameter), state
+
+    return optax.GradientTransformation(init_empty_state, update_fn)
+
+
+def partition_grad_norms(grads, partitions: Sequence[str]) -> dict[str, jax.Array]:
+    base, *parts = _clip_group_norms(grads, [re.compile(p) for p in partitions])
+    return {"global_grad_norm_base": base} | {
+        f"global_grad_norm_part{i}": norm for i, norm in enumerate(parts)
+    }
+
+
 _OPTIM_ALIASES: dict[str, str] = {}
 
 
@@ -131,6 +179,12 @@ class OptimConfig(Config):
     b2: float = 0.99
     weight_decay: float = 0.0
     clip_by_global_norm: float = 1.0
+    clip_partitions: list[str] | None = None
+
+    def make_clip(self) -> optax.GradientTransformation:
+        if self.clip_partitions:
+            return clip_by_global_norm_partitioned(self.clip_by_global_norm, self.clip_partitions)
+        return optax.clip_by_global_norm(self.clip_by_global_norm)
 
     def make(self, mesh: jax.sharding.Mesh | None = None):
         optim = _OPTIM_ALIASES.get(self.optim, self.optim)
@@ -141,7 +195,7 @@ class OptimConfig(Config):
         def schedule_optim(learning_rate, b1, b2, weight_decay):
             core = optax.adamw(learning_rate, b1=b1, b2=b2, weight_decay=weight_decay)
             return optax.chain(
-                optax.clip_by_global_norm(self.clip_by_global_norm),
+                self.make_clip(),
                 core,
                 scale_by_lr_multiplier(),
             )

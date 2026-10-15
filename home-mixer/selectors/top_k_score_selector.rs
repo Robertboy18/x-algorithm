@@ -1,6 +1,6 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use crate::params;
+use crate::params::{self, VideoCarouselImmersiveVqvWeight, VideoCarouselVideoOpenWeight};
 use crate::util::video_carousel;
 use xai_candidate_pipeline::selector::{SelectResult, Selector};
 
@@ -16,9 +16,11 @@ impl Selector<ScoredPostsQuery, PostCandidate> for TopKScoreSelector {
         let mut non_selected =
             selected.split_off(params::TOP_K_CANDIDATES_TO_SELECT.min(selected.len()));
         if video_carousel::is_enabled(query) {
-            selected.extend(video_carousel::take_videos_by_video_open(
+            selected.extend(video_carousel::take_videos_by_carousel_score(
                 &mut non_selected,
                 params::VIDEO_CAROUSEL_EXTRA_CANDIDATES,
+                query.params.get(VideoCarouselVideoOpenWeight),
+                query.params.get(VideoCarouselImmersiveVqvWeight),
             ));
         }
         SelectResult {
@@ -42,11 +44,19 @@ mod tests {
     use crate::models::candidate::PhoenixScores;
     use xai_feature_switches::{FeatureSwitches, Params, RecipientBuilder};
 
-    fn carousel_query() -> ScoredPostsQuery {
+    fn carousel_query(video_open_weight: &str, immersive_vqv_weight: &str) -> ScoredPostsQuery {
         let mut results = FeatureSwitches::new(vec![])
             .unwrap()
             .match_recipient(&RecipientBuilder::new().build());
         results.override_fs("rust_home_mixer_enable_video_carousel".to_string(), "true");
+        results.override_fs(
+            "rust_home_mixer_video_carousel_video_open_weight".to_string(),
+            video_open_weight,
+        );
+        results.override_fs(
+            "rust_home_mixer_video_carousel_immersive_vqv_weight".to_string(),
+            immersive_vqv_weight,
+        );
         let params: Params = results.into();
         ScoredPostsQuery {
             params,
@@ -108,7 +118,7 @@ mod tests {
 
     #[test]
     fn carousel_adds_videos_by_video_open_after_the_top_k() {
-        let result = TopKScoreSelector.select(&carousel_query(), candidates());
+        let result = TopKScoreSelector.select(&carousel_query("1.0", "0.0"), candidates());
 
         let mut expected: Vec<u64> = (1..=params::TOP_K_CANDIDATES_TO_SELECT as u64).collect();
         expected.extend([103, 106, 101]);
@@ -121,5 +131,30 @@ mod tests {
         assert!(extras
             .iter()
             .all(|candidate| candidate.video_carousel_extra));
+    }
+
+    #[test]
+    fn carousel_extras_follow_the_carousel_score_weights() {
+        let immersive_vqv = |tweet_id| match tweet_id {
+            101 => Some(0.9),
+            103 => Some(0.1),
+            106 => Some(0.5),
+            _ => None,
+        };
+        let candidates = candidates()
+            .into_iter()
+            .map(|candidate| PostCandidate {
+                immersive_scores: immersive_vqv(candidate.tweet_id).map(|vqv| PhoenixScores {
+                    vqv_score: Some(vqv),
+                    ..Default::default()
+                }),
+                ..candidate
+            })
+            .collect();
+
+        let result = TopKScoreSelector.select(&carousel_query("0.0", "1.0"), candidates);
+
+        let (_, extras) = result.selected.split_at(params::TOP_K_CANDIDATES_TO_SELECT);
+        assert_eq!(tweet_ids(extras), vec![101, 106, 103]);
     }
 }

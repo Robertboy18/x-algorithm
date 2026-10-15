@@ -257,6 +257,7 @@ class PhoenixGrpcDataset(PhoenixDataset):
                 trained_candidate_mask=np.ones(
                     (batch_size, self.candidate_seq_len, self.output_vocab_size), dtype=np.bool_
                 ),
+                **self._example_head_eligible_mask(batch_size, self.candidate_seq_len),
                 conversion_delay_ms=empty_conversion_delays(batch_size, self.candidate_seq_len),
                 post_creation_ts_sec=np.zeros((batch_size, self.candidate_seq_len), dtype=np.int32),
                 post_ids=None,
@@ -377,6 +378,7 @@ class PhoenixGrpcDataset(PhoenixDataset):
             trained_candidate_mask=np.ones(
                 (batch_size, candidate_seq_len, self.output_vocab_size), dtype=np.bool_
             ),
+            **self._example_head_eligible_mask(batch_size, candidate_seq_len),
             conversion_delay_ms=empty_conversion_delays(batch_size, candidate_seq_len),
             post_creation_ts_sec=np.zeros((batch_size, candidate_seq_len), dtype=np.int32),
             continuous_actions=np.zeros((batch_size, candidate_seq_len, 2), dtype=np.float32),

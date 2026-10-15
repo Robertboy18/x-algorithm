@@ -1,5 +1,6 @@
 pub mod ads_brand_safety_vf_hydrator;
 pub mod ai_trend_feedback_context_hydrator;
+pub mod ancestor_video_hydrator;
 pub mod bidirectional_follow_hydrator;
 pub mod blocked_by_hydrator;
 pub mod conversation_gap_ancestor_hydrator;

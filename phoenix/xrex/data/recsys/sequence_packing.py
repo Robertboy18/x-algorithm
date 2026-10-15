@@ -146,6 +146,37 @@ def fit_sample_budget(lengths: np.ndarray, target_sum: int, lo: int, hi: int) ->
     return lengths
 
 
+def shrink_empty_history_slots(
+    history_len: np.ndarray,
+    real_history_len: np.ndarray,
+    off: int,
+    block_size: int,
+    max_len: int,
+) -> np.ndarray:
+    blocks = (history_len + off) // block_size
+    empty = real_history_len == 0
+    if not empty.any():
+        return history_len
+    row_total = blocks.sum(axis=1)
+    min_blocks = max(1, (off + block_size - 1) // block_size)
+    max_blocks = (max_len + off + block_size - 1) // block_size
+    blocks = np.where(empty, np.minimum(blocks, min_blocks), blocks)
+    for d in range(blocks.shape[0]):
+        others = np.flatnonzero(~empty[d])
+        if others.size == 0:
+            continue
+        need = int(row_total[d] - blocks[d].sum())
+        if need > 0:
+            sub = fit_sample_budget(
+                blocks[d, others][None, :],
+                int(blocks[d, others].sum()) + need,
+                min_blocks,
+                max_blocks,
+            )
+            blocks[d, others] = sub[0]
+    return (blocks * block_size - off).astype(np.int32, copy=False)
+
+
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True, slots=True)
 class SequencePackedLayout:
@@ -157,6 +188,49 @@ class SequencePackedLayout:
     positions: np.ndarray
     block_sparse: object | None = None
     cand_slot_lens: np.ndarray | None = None
+    candidate_cu_seqlens: np.ndarray | None = None
+    candidate_key_starts: np.ndarray | None = None
+    candidate_key_counts: np.ndarray | None = None
+    prefix_positions: np.ndarray | None = None
+    candidate_token_to_slot: np.ndarray | None = None
+    candidate_slot_to_token: np.ndarray | None = None
+    token_to_source: np.ndarray | None = None
+    source_to_token: np.ndarray | None = None
+    dropped_candidate_slots: np.ndarray | None = None
+
+
+PACK_BLOCK_SIZE = 128
+
+CANDIDATE_TOKEN_ALIGN = 16
+
+
+def packed_prefix_positions(layout: SequencePackedLayout) -> np.ndarray:
+    if layout.prefix_positions is not None:
+        return layout.prefix_positions
+    return layout.cu_seqlens[:, :-1]
+
+
+def candidate_region_history_schedule(
+    layout: SequencePackedLayout, candidate_seq_len: int, num_user_prefix_tokens: int
+) -> tuple[np.ndarray, np.ndarray]:
+    assert layout.prefix_positions is not None, "not a candidate-region layout"
+    bs_per_device = layout.cu_seqlens.shape[1] - 1
+    cu_seqlens = layout.cu_seqlens - np.arange(bs_per_device + 1) * candidate_seq_len
+    padding_mask = layout.padding_mask.copy()
+    device_idx = np.arange(padding_mask.shape[0])[:, None]
+    for j in range(num_user_prefix_tokens):
+        padding_mask[device_idx, layout.prefix_positions + j] = True
+    return cu_seqlens.astype(np.int32), padding_mask
+
+
+def candidate_tokens_per_user_needed(
+    batch: RecsysFeaturesBatch, num_devices_per_process: int
+) -> int:
+    post_hashes = batch["candidate_seq"]["post_hashes"]
+    assert post_hashes is not None
+    counts = (post_hashes[:, :, 0] != 0).sum(axis=1).reshape(num_devices_per_process, -1)
+    region_len = _aligned_candidate_tokens(counts).sum(axis=1) + 1
+    return int(-(-region_len.max() // counts.shape[1]))
 
 
 def compact_candidate_layout(
@@ -243,11 +317,28 @@ def pack_batch(
     num_user_prefix_tokens: int,
     dist: LengthDistribution | None,
     rng: np.random.Generator | None,
-    block_size: int = 128,
+    block_size: int = PACK_BLOCK_SIZE,
+    candidate_tokens_per_user: int | None = None,
+    min_packed_history_len: int | None = None,
+    empty_history_min_slot: bool = False,
 ) -> RecsysFeaturesBatch:
-    _tcm = batch["candidate_seq"].get("trained_candidate_mask")
-    assert _tcm is None or bool(np.asarray(_tcm).all()), (
-        "trained_candidate_mask with masked candidates is not supported with sequence packing"
+    if empty_history_min_slot and dist is not None:
+        if not isinstance(dist, BetaLengthDistribution) or dist.block_size != block_size:
+            raise ValueError("empty_history_min_slot requires a block-matched Beta distribution")
+        if candidate_tokens_per_user is not None:
+            raise ValueError("empty_history_min_slot does not support candidate-region packing")
+    if min_packed_history_len is not None:
+        if (
+            isinstance(min_packed_history_len, bool)
+            or type(min_packed_history_len) is not int
+            or min_packed_history_len < 1
+        ):
+            raise ValueError("min_packed_history_len must be an integer >= 1")
+        if dist is None:
+            raise ValueError("min_packed_history_len requires a training distribution")
+    _hem = batch["candidate_seq"].get("head_eligible_mask")
+    assert _hem is None or bool(np.asarray(_hem).all()), (
+        "head_eligible_mask with masked heads is not supported with sequence packing"
     )
 
     read_bsz_per_process = batch["user_hashes"].shape[0]
@@ -381,6 +472,36 @@ def pack_batch(
             num_user_prefix_tokens=num_user_prefix_tokens,
             transformer_candidate_seq_len=transformer_candidate_seq_len,
         )
+        if min_packed_history_len is not None:
+            off = num_user_prefix_tokens + transformer_candidate_seq_len
+            slot_granularity = dist.block_size if isinstance(dist, BetaLengthDistribution) else 1
+            slot_offset = off if isinstance(dist, BetaLengthDistribution) else 0
+            lo = (
+                max(min_packed_history_len, dist.min_len) + slot_offset + slot_granularity - 1
+            ) // slot_granularity
+            hi = (dist.max_len + slot_offset + slot_granularity - 1) // slot_granularity
+            total_tokens = bs_per_device * (dist.mean_len + slot_offset)
+            if (
+                total_tokens % slot_granularity
+                or not bs_per_device * lo <= total_tokens // slot_granularity <= bs_per_device * hi
+            ):
+                raise ValueError("min_packed_history_len is infeasible for the sampled budget")
+            sampled_slots = (sampled_history_len + slot_offset) // slot_granularity
+            sampled_slots = np.clip(sampled_slots, lo, hi)
+            sampled_slots = fit_sample_budget(
+                sampled_slots, total_tokens // slot_granularity, lo, hi
+            )
+            sampled_history_len = (sampled_slots * slot_granularity - slot_offset).astype(
+                np.int32, copy=False
+            )
+        if empty_history_min_slot:
+            sampled_history_len = shrink_empty_history_slots(
+                sampled_history_len,
+                real_history_len,
+                off=num_user_prefix_tokens + transformer_candidate_seq_len,
+                block_size=block_size,
+                max_len=dist.max_len,
+            )
         history_real_to_use = np.minimum(sampled_history_len, real_history_len)
         history_len = sampled_history_len
         packed_history_len = bs_per_device * dist.mean_len
@@ -426,6 +547,20 @@ def pack_batch(
     packed_candidate_seq = _reshape_sequence(
         batch["candidate_seq"], candidate_seq_len, packed_candidate_len
     )
+    dropped_candidate_slots = None
+    candidate_region_len = None
+    if candidate_tokens_per_user is not None:
+        assert dist is not None and transformer_candidate_seq_len > 0, (
+            "candidate_tokens_per_user is training-only and needs transformer candidates"
+        )
+        candidate_region_len = bs_per_device * candidate_tokens_per_user
+        assert candidate_region_len % block_size == 0, (
+            f"{bs_per_device=} (per microbatch) * {candidate_tokens_per_user=} must be a multiple "
+            f"of {block_size=}"
+        )
+        packed_candidate_seq, dropped_candidate_slots = _drop_candidates_over_budget(
+            packed_candidate_seq, candidate_seq_len, candidate_region_len - 1
+        )
 
     packed_seq_len = (
         bs_per_device * (num_user_prefix_tokens + transformer_candidate_seq_len)
@@ -493,15 +628,204 @@ def pack_batch(
         num_user_prefix_tokens + history_seq_len - history_len_by_token + history_offsets_flat
     ).astype(np.float32, copy=False)
 
-    return _make_batch(
-        packed_history_seq,
-        packed_candidate_seq,
-        SequencePackedLayout(
-            cu_seqlens=cu_seqlens,
-            segment_ids=segment_ids,
-            history_positions=history_positions,
-            candidate_positions=candidate_positions,
-            padding_mask=padding_mask,
-            positions=positions,
-        ),
+    layout = SequencePackedLayout(
+        cu_seqlens=cu_seqlens,
+        segment_ids=segment_ids,
+        history_positions=history_positions,
+        candidate_positions=candidate_positions,
+        padding_mask=padding_mask,
+        positions=positions,
+    )
+    if candidate_region_len is not None:
+        assert dropped_candidate_slots is not None
+        layout = _candidate_region_layout(
+            layout,
+            seq_starts,
+            history_len + num_user_prefix_tokens,
+            num_user_prefix_tokens,
+            candidate_region_len,
+            dropped_candidate_slots,
+        )
+    return _make_batch(packed_history_seq, packed_candidate_seq, layout)
+
+
+def _aligned_candidate_tokens(counts: np.ndarray) -> np.ndarray:
+    return -(-counts // CANDIDATE_TOKEN_ALIGN) * CANDIDATE_TOKEN_ALIGN
+
+
+def _drop_candidates_over_budget(
+    seq: PostSeq, slots_per_user: int, budget: int
+) -> tuple[PostSeq, np.ndarray]:
+    post_hashes = seq["post_hashes"]
+    assert post_hashes is not None
+    num_devices, num_slots = post_hashes.shape[:2]
+    valid = post_hashes[:, :, 0] != 0
+    counts = valid.reshape(num_devices, -1, slots_per_user).sum(axis=2)
+    dropped = np.zeros(num_devices, dtype=np.int32)
+    over_budget = np.flatnonzero(_aligned_candidate_tokens(counts).sum(axis=1) > budget)
+    if over_budget.size == 0:
+        return seq, dropped
+    drop = np.zeros_like(valid)
+    slot_in_user = np.arange(num_slots) % slots_per_user
+    for d in over_budget:
+        used = int(_aligned_candidate_tokens(counts[d]).sum())
+        valid_slots = np.flatnonzero(valid[d])
+        for i in valid_slots[np.argsort(-slot_in_user[valid_slots], kind="stable")]:
+            if used <= budget:
+                break
+            u = i // slots_per_user
+            used -= int(
+                _aligned_candidate_tokens(counts[d, u])
+                - _aligned_candidate_tokens(counts[d, u] - 1)
+            )
+            counts[d, u] -= 1
+            drop[d, i] = True
+            dropped[d] += 1
+        dropped_slots = np.flatnonzero(drop[d])
+        for i in dropped_slots[np.argsort(slot_in_user[dropped_slots], kind="stable")]:
+            u = i // slots_per_user
+            extra = int(
+                _aligned_candidate_tokens(counts[d, u] + 1)
+                - _aligned_candidate_tokens(counts[d, u])
+            )
+            if used + extra <= budget:
+                used += extra
+                counts[d, u] += 1
+                drop[d, i] = False
+                dropped[d] -= 1
+    kept_seq = {}
+    for key, value in seq.items():
+        if isinstance(value, np.ndarray) and value.ndim >= 2 and value.shape[1] == num_slots:
+            value = value.copy()
+            value[drop] = 0
+        kept_seq[key] = value
+    return cast(PostSeq, kept_seq), dropped
+
+
+def _candidate_region_layout(
+    layout: SequencePackedLayout,
+    seq_starts: np.ndarray,
+    span_lens: np.ndarray,
+    num_user_prefix_tokens: int,
+    candidate_region_len: int,
+    dropped_candidate_slots: np.ndarray,
+) -> SequencePackedLayout:
+    assert num_user_prefix_tokens > 0, (
+        "history position 0 marks padding, so a prefix token is needed"
+    )
+    num_devices, regular_len = layout.segment_ids.shape
+    bs_per_device = seq_starts.shape[1]
+    device_idx = np.arange(num_devices)[:, None]
+    regular_candidate_tokens = layout.candidate_positions
+    slots_per_user = regular_candidate_tokens.shape[1] // bs_per_device
+    valid = layout.segment_ids[device_idx, regular_candidate_tokens] != 0
+    history_region_len = int(span_lens[0].sum())
+    assert (span_lens.sum(axis=1) == history_region_len).all()
+    packed_seq_len = history_region_len + candidate_region_len
+
+    regular_token = np.full((num_devices, packed_seq_len), regular_len, dtype=np.int64)
+    in_history = np.ones((num_devices, regular_len), dtype=bool)
+    in_history[
+        np.broadcast_to(device_idx, regular_candidate_tokens.shape), regular_candidate_tokens
+    ] = False
+    regular_history_tokens = np.nonzero(in_history)[1].reshape(num_devices, history_region_len)
+    span_starts = np.cumsum(span_lens, axis=1) - span_lens
+    key_counts = np.zeros((num_devices, bs_per_device), dtype=np.int64)
+    for d in range(num_devices):
+        token_user = np.repeat(np.arange(bs_per_device), span_lens[d])
+        offset = np.arange(history_region_len) - span_starts[d][token_user]
+        is_prefix = offset < num_user_prefix_tokens
+        is_key = layout.padding_mask[d, regular_history_tokens[d]] | is_prefix
+        key_counts[d] = np.bincount(token_user[is_key], minlength=bs_per_device)
+        user_pad = (span_lens[d] - key_counts[d])[token_user]
+        new_offset = np.where(
+            is_prefix,
+            offset + user_pad,
+            np.where(
+                offset < num_user_prefix_tokens + user_pad, offset - num_user_prefix_tokens, offset
+            ),
+        )
+        regular_token[d, span_starts[d][token_user] + new_offset] = regular_history_tokens[d]
+
+    counts = valid.reshape(num_devices, bs_per_device, slots_per_user).sum(axis=2)
+    candidate_cu_seqlens = np.zeros((num_devices, bs_per_device + 1), dtype=np.int32)
+    candidate_cu_seqlens[:, 1:] = np.cumsum(_aligned_candidate_tokens(counts), axis=1)
+    assert int(candidate_cu_seqlens[:, -1].max()) <= candidate_region_len - 1
+    rank_in_user = (np.cumsum(valid.reshape(num_devices, bs_per_device, -1), axis=2) - 1).reshape(
+        num_devices, -1
+    )
+    slot_user = np.arange(regular_candidate_tokens.shape[1]) // slots_per_user
+    slot_token = history_region_len + candidate_cu_seqlens[:, slot_user] + rank_in_user
+    d_valid, s_valid = np.nonzero(valid)
+    regular_token[d_valid, slot_token[d_valid, s_valid]] = regular_candidate_tokens[
+        d_valid, s_valid
+    ]
+
+    is_copy = regular_token < regular_len
+    new_token = np.full((num_devices, regular_len), packed_seq_len - 1, dtype=np.int32)
+    d_copy, t_copy = np.nonzero(is_copy)
+    new_token[d_copy, regular_token[d_copy, t_copy]] = t_copy
+
+    clamped_regular_token = np.minimum(regular_token, regular_len - 1)
+    segment_ids = np.where(
+        is_copy, np.take_along_axis(layout.segment_ids, clamped_regular_token, axis=1), 0
+    )
+    positions = np.take_along_axis(layout.positions, clamped_regular_token[:, :, None], axis=1)
+    positions[~is_copy] = 0.0
+    padding_mask = segment_ids != 0
+
+    history_positions = np.take_along_axis(new_token, layout.history_positions, axis=1)
+    candidate_positions = np.where(
+        valid, np.take_along_axis(new_token, regular_candidate_tokens, axis=1), packed_seq_len - 1
+    ).astype(np.int32)
+    prefix_positions = np.take_along_axis(new_token, seq_starts.astype(np.intp), axis=1)
+
+    region_token = slot_token[d_valid, s_valid] - history_region_len
+    num_slots = regular_candidate_tokens.shape[1]
+    candidate_token_to_slot = np.full(
+        (num_devices, candidate_region_len), num_slots, dtype=np.int32
+    )
+    candidate_token_to_slot[d_valid, region_token] = s_valid
+    candidate_slot_to_token = np.full(
+        regular_candidate_tokens.shape, candidate_region_len, dtype=np.int32
+    )
+    candidate_slot_to_token[d_valid, s_valid] = region_token
+
+    num_prefix_sources = bs_per_device * num_user_prefix_tokens
+    num_history_entries = layout.history_positions.shape[1]
+    zero_source = num_prefix_sources + num_history_entries + candidate_region_len
+    token_to_source = np.full((num_devices, packed_seq_len), zero_source, dtype=np.int32)
+    for j in range(num_user_prefix_tokens):
+        token_to_source[device_idx, prefix_positions + j] = (
+            np.arange(bs_per_device) * num_user_prefix_tokens + j
+        )
+    d_h, s_h = np.nonzero(layout.history_positions != 0)
+    token_to_source[d_h, history_positions[d_h, s_h]] = num_prefix_sources + s_h
+    token_to_source[d_valid, history_region_len + region_token] = (
+        num_prefix_sources + num_history_entries + region_token
+    )
+    source_to_token = np.full((num_devices, zero_source + 1), packed_seq_len, dtype=np.int32)
+    d_used, t_used = np.nonzero(token_to_source != zero_source)
+    source_to_token[d_used, token_to_source[d_used, t_used]] = t_used
+
+    span_ends = span_starts + span_lens
+    key_starts = np.empty((num_devices, bs_per_device + 1), dtype=np.int32)
+    key_starts[:, :-1] = span_ends - key_counts
+    key_starts[:, -1] = history_region_len
+    return SequencePackedLayout(
+        cu_seqlens=layout.cu_seqlens,
+        segment_ids=segment_ids.astype(np.int32, copy=False),
+        history_positions=history_positions,
+        candidate_positions=candidate_positions,
+        padding_mask=padding_mask,
+        positions=positions,
+        candidate_cu_seqlens=candidate_cu_seqlens,
+        candidate_key_starts=key_starts,
+        candidate_key_counts=key_counts.astype(np.int32),
+        prefix_positions=prefix_positions,
+        candidate_token_to_slot=candidate_token_to_slot,
+        candidate_slot_to_token=candidate_slot_to_token,
+        token_to_source=token_to_source,
+        source_to_token=source_to_token,
+        dropped_candidate_slots=dropped_candidate_slots[:, None],
     )

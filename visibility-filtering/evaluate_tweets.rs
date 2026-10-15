@@ -2,8 +2,9 @@ use crate::caller_identity::{self, Endpoint};
 use crate::filter::{FilterRequest, FilterTweets};
 use crate::filter_tweets::normalize_viewer_id;
 use crate::limited_actions_copy::LimitedActionsCopy;
-use crate::models::{Evaluation, RawCandidate, TweetId, Verdict};
+use crate::models::{Evaluation, RawCandidate, TweetId};
 use crate::params::{ClientSwitches, LimitedActionsPolicies};
+use crate::result_label::{label, state_label, Class, Label, NONE};
 use crate::retweet;
 use crate::rules::metrics::{self as ft_metrics, RequestMetricsGuard, Rpc};
 use crate::rules::SafetyLevel;
@@ -15,6 +16,7 @@ use vf_pb::tweet_evaluation::Outcome;
 use xai_twittercontext_proto::TwitterContextViewer;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
+use xai_x_thrift::tweet_service::TweetFieldsResultState;
 
 const REQUESTS: &str = "evaluate_tweets_requests";
 const LATENCY_MS: &str = "evaluate_tweets_latency_ms";
@@ -91,25 +93,15 @@ impl EvaluateTweetsEndpoint {
             })
             .collect();
         let viewer_id = normalize_viewer_id(req.viewer_id);
-        let country_code = twitter_context
-            .as_ref()
-            .map(|context| context.request_country_code.as_str())
-            .filter(|code| !code.is_empty());
-        let client_capability =
-            self.client_switches
-                .resolve(twitter_context.as_ref(), viewer_id, country_code);
-        let outcomes = retweet::evaluate_merging_sources(
-            &self.filter_tweets,
-            FilterRequest {
-                viewer_id,
-                country_code: country_code.map(str::to_owned),
-                client_capability,
-                safety_level,
-                candidates,
-                rpc: Rpc::EvaluateTweets,
-            },
-        )
-        .await;
+        let request = evaluate_tweets_request(
+            &self.client_switches,
+            twitter_context.as_ref(),
+            viewer_id,
+            safety_level,
+            candidates,
+        );
+        let country_code = request.country_code.clone();
+        let outcomes = retweet::evaluate_merging_sources(&self.filter_tweets, request).await;
         ft_metrics::record_verdicts(
             Rpc::EvaluateTweets,
             safety_level,
@@ -130,17 +122,10 @@ impl EvaluateTweetsEndpoint {
         let policies = self.client_switches.limited_actions_policies(
             twitter_context.as_ref(),
             viewer_id,
-            country_code,
+            country_code.as_deref(),
             outcomes
                 .iter()
-                .filter_map(|outcome| match outcome.evaluation.verdict() {
-                    Verdict::Shown {
-                        engagement: Some(limit),
-                        ..
-                    } => Some(limit.value.reasons()),
-                    Verdict::Shown { .. } | Verdict::Withheld(_) => None,
-                })
-                .flatten(),
+                .flat_map(|outcome| outcome.evaluation.verdict().limited_engagement_reasons()),
             &self.limited_actions_copy,
             xai_stats_receiver::global_stats_receiver().as_deref(),
         );
@@ -156,15 +141,10 @@ impl EvaluateTweetsEndpoint {
                     Outcome::NotEvaluated(vf_pb::NotEvaluated {})
                 } else {
                     match evaluations.get(&TweetId(tweet.tweet_id)) {
-                        Some(evaluation @ Evaluation::Complete { .. }) => {
-                            evaluated_outcome(evaluation.verdict(), safety_level, &policies)
+                        Some(evaluation) => {
+                            evaluated_outcome(Sends::new(evaluation, safety_level, &policies))
                         }
-                        Some(
-                            Evaluation::NotFound(_)
-                            | Evaluation::Partial { .. }
-                            | Evaluation::Failed(_),
-                        )
-                        | None => Outcome::Failed(vf_pb::Failed {}),
+                        None => Outcome::Failed(vf_pb::Failed {}),
                     }
                 };
                 vf_pb::TweetEvaluation {
@@ -176,30 +156,89 @@ impl EvaluateTweetsEndpoint {
     }
 }
 
-fn evaluated_outcome(
-    verdict: &Verdict,
+pub(crate) fn evaluate_tweets_request(
+    client_switches: &ClientSwitches,
+    context: Option<&TwitterContextViewer>,
+    viewer_id: Option<u64>,
+    safety_level: SafetyLevel,
+    candidates: Vec<RawCandidate>,
+) -> FilterRequest {
+    let country_code = context
+        .map(|context| context.request_country_code.as_str())
+        .filter(|code| !code.is_empty());
+    FilterRequest {
+        viewer_id,
+        country_code: country_code.map(str::to_owned),
+        client_capability: client_switches.resolve(context, viewer_id, country_code),
+        safety_level,
+        candidates,
+        rpc: Rpc::EvaluateTweets,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Sends<'a> {
+    evaluation: &'a Evaluation,
     level: SafetyLevel,
-    policies: &LimitedActionsPolicies,
-) -> Outcome {
-    let state = treatment::thrift_result_state(verdict, level, policies);
-    match xai_x_thrift::serialize_compact(&state) {
-        Ok(bytes) => Outcome::ResultStateThriftCompact(bytes.into()),
-        Err(_) => Outcome::Failed(vf_pb::Failed {}),
+    policies: &'a LimitedActionsPolicies,
+}
+
+impl<'a> Sends<'a> {
+    pub(crate) fn new(
+        evaluation: &'a Evaluation,
+        level: SafetyLevel,
+        policies: &'a LimitedActionsPolicies,
+    ) -> Self {
+        Self {
+            evaluation,
+            level,
+            policies,
+        }
+    }
+
+    pub(crate) fn result_state(self) -> Option<TweetFieldsResultState> {
+        match self.evaluation {
+            Evaluation::Complete { verdict } => Some(treatment::thrift_result_state(
+                verdict,
+                self.level,
+                self.policies,
+            )),
+            Evaluation::Partial { .. } | Evaluation::NotFound(_) | Evaluation::Failed(_) => None,
+        }
+    }
+
+    pub(crate) fn label(self) -> Label {
+        match self.evaluation {
+            Evaluation::Complete { verdict } => state_label(&treatment::thrift_result_state(
+                verdict,
+                self.level,
+                self.policies,
+            )),
+            Evaluation::NotFound(_) => label(Class::NotFound, NONE),
+            Evaluation::Partial { .. } | Evaluation::Failed(_) => label(Class::Failed, NONE),
+        }
+    }
+}
+
+fn evaluated_outcome(sends: Sends<'_>) -> Outcome {
+    match sends
+        .result_state()
+        .map(|state| xai_x_thrift::serialize_compact(&state))
+    {
+        Some(Ok(bytes)) => Outcome::ResultStateThriftCompact(bytes.into()),
+        Some(Err(_)) | None => Outcome::Failed(vf_pb::Failed {}),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clients::socialgraph_client::Graph;
     use crate::hydration::plan::Source;
-    use crate::hydration::sources::{control, Fault, InMemorySources};
-    use crate::hydration::HYDRATION_TIMEOUT;
+    use crate::hydration::sources::{Fault, InMemorySources};
     use crate::models::{TweetFeatures, VerifyBlurSupport};
     use crate::rules::RuleEngine;
     use xai_core_entities::entities::{
-        ConversationControlArm, GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety,
-        UserResponseState,
+        GizmoduckUser, GizmoduckUserResult, PureCoreData, Safety, UserResponseState,
     };
     use xai_x_thrift::action::{self, Action, DropReason};
     use xai_x_thrift::safety_result::{FilteredReason as ThriftFilteredReason, SafetyResult};
@@ -227,7 +266,7 @@ mod tests {
         let sources = Arc::new(
             InMemorySources::default()
                 .tweet_features(1, TweetFeatures::default())
-                .fail_key(Source::TesPureCore, 1)
+                .fail_key(Source::TesPureCoreData, 1)
                 .pure_core(3, core(30, None))
                 .pure_core(4, core(40, Some(6)))
                 .pure_core(5, core(50, Some(6)))
@@ -252,6 +291,7 @@ mod tests {
             Arc::new(FilterTweets::new(
                 Arc::<InMemorySources>::clone(&sources),
                 RuleEngine::for_tests(),
+                Arc::default(),
             )),
             ClientSwitches::for_tests(),
             LimitedActionsCopy::from_json("[]"),
@@ -330,7 +370,7 @@ mod tests {
                 vec![suspended, Outcome::Failed(vf_pb::Failed {})],
             ),
         ] {
-            let calls_before = sources.keys(Source::TesPureCore).len();
+            let calls_before = sources.keys(Source::TesPureCoreData).len();
             let response = endpoint
                 .handle(Request::new(vf_pb::EvaluateTweetsRequest {
                     safety_level: 8,
@@ -341,7 +381,7 @@ mod tests {
                 .unwrap()
                 .into_inner();
             assert_eq!(
-                sources.keys(Source::TesPureCore).len() - calls_before,
+                sources.keys(Source::TesPureCoreData).len() - calls_before,
                 core_data_calls
             );
             assert_eq!(
@@ -394,7 +434,11 @@ mod tests {
                 world = world.fault(Source::CommunityModeration, fault);
             }
             let endpoint = EvaluateTweetsEndpoint::new(
-                Arc::new(FilterTweets::new(Arc::new(world), RuleEngine::for_tests())),
+                Arc::new(FilterTweets::new(
+                    Arc::new(world),
+                    RuleEngine::for_tests(),
+                    Arc::default(),
+                )),
                 ClientSwitches::for_tests(),
                 LimitedActionsCopy::from_json("[]"),
             );
@@ -428,7 +472,7 @@ mod tests {
     fn a_conversation_control_limit_carries_its_prompt_in_the_request_language() {
         use crate::limited_actions_copy::tests::BUNDLE;
         use crate::models::LimitedEngagementReason::ConversationControl;
-        use crate::models::{Decided, LimitedEngagement, MediaRestriction};
+        use crate::models::{Decided, LimitedEngagement, MediaRestriction, Verdict};
         use crate::rules::fixtures::limited;
         use xai_x_thrift::action::{
             AnyInterstitial, CtaLimitedActionPrompt, Interstitial, InterstitialReason,
@@ -497,8 +541,15 @@ mod tests {
                     }),
                 ),
             ] {
+                let evaluation = Evaluation::Complete {
+                    verdict: verdict.clone(),
+                };
                 assert_eq!(
-                    evaluated_outcome(verdict, SafetyLevel::TimelineHomeHydration, &policies),
+                    evaluated_outcome(Sends::new(
+                        &evaluation,
+                        SafetyLevel::TimelineHomeHydration,
+                        &policies
+                    )),
                     found(action),
                     "{language:?} {verdict:?}"
                 );
@@ -506,43 +557,51 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_timed_out_root_edge_call_fails_the_tweet_whichever_input_lands_first() {
-        for delayed in [Source::TesConversationControl, Source::TesPureCore] {
-            let sources = InMemorySources::default()
-                .tweet(1, 10)
-                .authors(&[10])
-                .control(1, control(ConversationControlArm::Subscribers, 40, &[]))
-                .fault(delayed, Fault::Delays(HYDRATION_TIMEOUT / 2))
-                .hang_graph(Graph::SuperFollows);
-            let endpoint = EvaluateTweetsEndpoint::new(
-                Arc::new(FilterTweets::new(
-                    Arc::new(sources),
-                    RuleEngine::for_tests(),
-                )),
-                ClientSwitches::for_tests(),
-                LimitedActionsCopy::from_json("[]"),
-            );
-            let response = endpoint
-                .handle(Request::new(vf_pb::EvaluateTweetsRequest {
-                    safety_level: ThriftLevel::TIMELINE_HOME_HYDRATION.0,
-                    viewer_id: Some(50),
-                    tweets: vec![vf_pb::TweetData {
-                        tweet_id: 1,
-                        quote_context: None,
-                    }],
-                }))
-                .await
-                .unwrap()
-                .into_inner();
+    #[test]
+    fn each_evaluation_sends_and_labels_as_vf_counts_it() {
+        use crate::hydration::{Hydrator, Hydrators, Lookup};
+        use crate::rules::fixtures::{allow, dropped};
+        use xai_visibility_filtering::models::FilteredReason;
+        let shown = TweetFieldsResultState::Found(TweetFieldsResultFound::new(None));
+        let suspended = TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(
+            ThriftFilteredReason::AuthorIsSuspended(true),
+        ));
+        let cases = [
+            (
+                Evaluation::Complete { verdict: allow() },
+                Some(&shown),
+                ("allow", "none"),
+            ),
+            (
+                Evaluation::Complete {
+                    verdict: dropped(FilteredReason::AuthorIsSuspended, "rule"),
+                },
+                Some(&suspended),
+                ("drop", "author_is_suspended"),
+            ),
+            (
+                Evaluation::Partial {
+                    verdict: dropped(FilteredReason::AuthorIsSuspended, "rule"),
+                    fail_open_defaults: Hydrators::of(Hydrator::Follows),
+                },
+                None,
+                ("failed", "none"),
+            ),
+            (
+                Evaluation::NotFound(Lookup::Author),
+                None,
+                ("not_found", "none"),
+            ),
+            (Evaluation::Failed(Lookup::Tweet), None, ("failed", "none")),
+        ];
+        let policies = LimitedActionsPolicies::default();
+        for (evaluation, sent, (class, reason)) in &cases {
+            let sends = Sends::new(evaluation, SafetyLevel::TimelineHomeHydration, &policies);
+            assert_eq!(sends.result_state().as_ref(), *sent, "{evaluation:?}");
             assert_eq!(
-                response
-                    .results
-                    .into_iter()
-                    .map(|r| r.outcome.unwrap())
-                    .collect::<Vec<_>>(),
-                [Outcome::Failed(vf_pb::Failed {})],
-                "{delayed:?} lands last"
+                sends.label(),
+                ((*class).to_owned(), (*reason).to_owned()),
+                "{evaluation:?}"
             );
         }
     }
@@ -563,7 +622,11 @@ mod tests {
                 )
                 .tweet(6, 60),
         );
-        let filter_tweets = Arc::new(FilterTweets::new(sources, RuleEngine::for_tests()));
+        let filter_tweets = Arc::new(FilterTweets::new(
+            sources,
+            RuleEngine::for_tests(),
+            Arc::default(),
+        ));
         let endpoint = EvaluateTweetsEndpoint::new(
             Arc::clone(&filter_tweets),
             ClientSwitches::for_tests(),

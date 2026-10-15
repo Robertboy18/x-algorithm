@@ -1,12 +1,16 @@
 use crate::config::ENV_APP_ENV;
+use crate::evaluate_tweets::evaluate_tweets_request;
 use crate::filter::FilterTweets;
-use crate::models::TweetId;
+pub use crate::hydration::sources::test_users_metadata;
+use crate::models::viewer::Client;
+use crate::models::{RawCandidate, TweetId};
 use crate::params::{ClientSwitches, CountryList, CountryLists, SwitchFiles};
+use crate::result_label::Class;
 use crate::rules::RuleEngine;
-use crate::server_deps::{CLIENT_INIT_RETRY_BUDGET, prod_sources};
+use crate::server_deps::{CLIENT_INIT_RETRY_BUDGET, CacheWarming, prod_sources};
 use crate::staging::recording::{Recorder, Recording};
 use crate::staging::reference::ENV_IMAGE;
-use crate::staging::reference::tweetypie::{self, Class, Client, get_tweet_fields};
+use crate::staging::reference::tweetypie::{self, get_tweet_fields};
 use crate::staging::reference_compare::resolve_build_sha;
 use crate::staging::replay_corpus::{Case, Expected, Fixtures, evaluate};
 use anyhow::{Context, bail};
@@ -20,10 +24,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
-use tonic::metadata::{MetadataMap, MetadataValue};
 use xai_build_version::current_build_information;
-
-const TEST_USERS_DTAB: &str = "/s/gizmoduck/test-users-permanent=>/s/gizmoduck/gizmoduck";
 
 pub const FIXTURES_IN_IMAGE: &str = "/config/replay_corpus/fixtures.json";
 
@@ -79,9 +80,8 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
         datacenter,
         init_deadline,
         false,
-        None,
-        None,
         metadata.as_ref(),
+        CacheWarming::Off,
     )
     .await;
     let feature_switches = SwitchFiles::beside(&crate::config::fs_path())
@@ -93,6 +93,7 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
     let filter_tweets = FilterTweets::new(
         Arc::new(sources.observed(Arc::clone(&recorder))),
         RuleEngine::with_country_lists(Arc::clone(&country_lists)),
+        Arc::default(),
     );
     let fixtures = Fixtures::load(fixtures)?;
     let tweetypie = tweetypie::connect(init_deadline, metadata.as_ref()).await;
@@ -132,22 +133,28 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
         let client = request
             .client
             .context(request.viewer_id, request.country_code.as_deref());
-        let client_capability = client_switches.resolve(
+        let ids: Vec<TweetId> = request
+            .tweets
+            .iter()
+            .map(|tweet| TweetId(tweet.id))
+            .collect();
+        let vf_request = evaluate_tweets_request(
+            &client_switches,
             Some(&client),
             request.viewer_id,
-            request.country_code.as_deref(),
+            tweetypie::SAFETY_LEVEL,
+            ids.iter()
+                .map(|&tweet_id| RawCandidate {
+                    tweet_id,
+                    request_author_id: None,
+                })
+                .collect(),
         );
-        let tweet_ids: Vec<u64> = request.tweets.iter().map(|tweet| tweet.id).collect();
-        let ids: Vec<TweetId> = tweet_ids.iter().copied().map(TweetId).collect();
+        let country_code = vf_request.country_code.clone();
+        let client_capability = vf_request.client_capability;
         recorder.take();
         let (vf, tp) = join(
-            evaluate(
-                &filter_tweets,
-                request.viewer_id,
-                request.country_code.clone(),
-                client_capability,
-                &tweet_ids,
-            ),
+            evaluate(&filter_tweets, vf_request),
             get_tweet_fields(&tweetypie, &client, &ids),
         )
         .await;
@@ -205,7 +212,7 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
                 .map_or(0, |since| since.as_secs()),
             build: build.clone(),
             viewer_id: request.viewer_id,
-            country_code: request.country_code,
+            country_code,
             client: request.client,
             client_capability,
             tweets,
@@ -219,12 +226,6 @@ pub async fn run(datacenter: &str, test_users: bool, fixtures: &Path) -> anyhow:
     Ok(())
 }
 
-pub fn test_users_metadata() -> MetadataMap {
-    let mut metadata = MetadataMap::new();
-    metadata.insert("dtab-local", MetadataValue::from_static(TEST_USERS_DTAB));
-    metadata
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,7 +237,7 @@ mod tests {
     #[test]
     fn a_captured_line_is_its_case_beside_the_shared_answers() {
         let recorder = Arc::new(Recorder::default());
-        recorder.answered::<exchange::TesPureCore>(iter::once((1, Hydrated::NotFound)));
+        recorder.answered::<exchange::TesPureCoreData>(iter::once((1, Hydrated::NotFound)));
         recorder.answered::<exchange::GizmoduckViewer>(iter::once((50, Hydrated::NotFound)));
         let case = Case {
             id: "a".to_owned(),

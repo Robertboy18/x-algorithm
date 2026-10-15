@@ -1,9 +1,6 @@
-use crate::rules::registry::{
-    immersive_expanded_recommendations, timeline_home_hydration, timeline_home_recommendations,
-    timeline_home_shared,
-};
-use crate::rules::rule_spec::RuleClause;
-use crate::rules::tweet_rules;
+use crate::rules::levels;
+use crate::rules::metrics::Rpc;
+use crate::rules::rule_spec::rule::Rule;
 use strum::VariantArray;
 use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::safety_level::SafetyLevel as ThriftLevel;
@@ -20,8 +17,9 @@ pub enum SafetyLevel {
 
 pub(crate) struct LevelSpec {
     proto: Option<vf_pb::SafetyLevel>,
-    thrift: Option<ThriftLevel>,
-    pub(super) rules: fn() -> Vec<RuleClause>,
+    thrift: ThriftLevel,
+    on_evaluate_tweets: bool,
+    pub(super) rules: &'static [&'static Rule],
     pub(crate) unspecified_drop_is_exact: bool,
 }
 
@@ -30,32 +28,37 @@ impl SafetyLevel {
         match self {
             SafetyLevel::FilterAll => LevelSpec {
                 proto: Some(vf_pb::SafetyLevel::FilterAll),
-                thrift: Some(ThriftLevel::FILTER_ALL),
-                rules: tweet_rules::filter_all,
+                thrift: ThriftLevel::FILTER_ALL,
+                on_evaluate_tweets: true,
+                rules: levels::FILTER_ALL,
                 unspecified_drop_is_exact: true,
             },
             SafetyLevel::TimelineHome => LevelSpec {
                 proto: Some(vf_pb::SafetyLevel::TimelineHome),
-                thrift: Some(ThriftLevel::TIMELINE_HOME),
-                rules: timeline_home_shared,
+                thrift: ThriftLevel::TIMELINE_HOME,
+                on_evaluate_tweets: true,
+                rules: levels::TIMELINE_HOME,
                 unspecified_drop_is_exact: false,
             },
             SafetyLevel::TimelineHomeRecommendations => LevelSpec {
                 proto: Some(vf_pb::SafetyLevel::TimelineHomeRecommendations),
-                thrift: Some(ThriftLevel::TIMELINE_HOME_RECOMMENDATIONS),
-                rules: timeline_home_recommendations,
+                thrift: ThriftLevel::TIMELINE_HOME_RECOMMENDATIONS,
+                on_evaluate_tweets: true,
+                rules: levels::TIMELINE_HOME_RECOMMENDATIONS,
                 unspecified_drop_is_exact: false,
             },
             SafetyLevel::TimelineHomeHydration => LevelSpec {
                 proto: None,
-                thrift: Some(ThriftLevel::TIMELINE_HOME_HYDRATION),
-                rules: timeline_home_hydration,
+                thrift: ThriftLevel::TIMELINE_HOME_HYDRATION,
+                on_evaluate_tweets: true,
+                rules: levels::TIMELINE_HOME_HYDRATION,
                 unspecified_drop_is_exact: false,
             },
             SafetyLevel::ImmersiveExpandedRecommendations => LevelSpec {
                 proto: Some(vf_pb::SafetyLevel::ImmersiveExpandedRecommendations),
-                thrift: None,
-                rules: immersive_expanded_recommendations,
+                thrift: ThriftLevel::IMMERSIVE_EXPANDED_RECOMMENDATIONS,
+                on_evaluate_tweets: false,
+                rules: levels::IMMERSIVE_EXPANDED_RECOMMENDATIONS,
                 unspecified_drop_is_exact: false,
             },
         }
@@ -69,10 +72,21 @@ impl SafetyLevel {
     }
 
     pub(crate) fn from_thrift(level: ThriftLevel) -> Option<Self> {
-        Self::VARIANTS
-            .iter()
-            .copied()
-            .find(|variant| variant.spec().thrift == Some(level))
+        Self::VARIANTS.iter().copied().find(|variant| {
+            let spec = variant.spec();
+            spec.on_evaluate_tweets && spec.thrift == level
+        })
+    }
+
+    pub fn thrift_number(self) -> i32 {
+        self.spec().thrift.0
+    }
+
+    pub(crate) fn is_carried_by(self, rpc: Rpc) -> bool {
+        match rpc {
+            Rpc::FilterTweets => self.spec().proto.is_some(),
+            Rpc::EvaluateTweets => self.spec().on_evaluate_tweets,
+        }
     }
 }
 
@@ -130,12 +144,21 @@ mod tests {
     }
 
     #[test]
+    fn every_level_reports_the_number_the_thrift_enum_gives_it() {
+        let numbers: Vec<_> = SafetyLevel::VARIANTS
+            .iter()
+            .map(|level| level.thrift_number())
+            .collect();
+        assert_eq!(numbers, [16, 8, 61, 82, 247]);
+    }
+
+    #[test]
     fn each_level_has_rules_an_ingress_and_wire_ids_of_its_own() {
         for &level in SafetyLevel::VARIANTS {
             let spec = level.spec();
-            assert!(!(spec.rules)().is_empty(), "{level:?} wires no rule");
+            assert!(!spec.rules.is_empty(), "{level:?} wires no rule");
             assert!(
-                spec.proto.is_some() || spec.thrift.is_some(),
+                spec.proto.is_some() || spec.on_evaluate_tweets,
                 "{level:?} has no ingress"
             );
             for &other in SafetyLevel::VARIANTS
@@ -148,7 +171,7 @@ mod tests {
                     "{level:?} and {other:?} share a proto level"
                 );
                 assert!(
-                    spec.thrift.is_none() || spec.thrift != other_spec.thrift,
+                    spec.thrift != other_spec.thrift,
                     "{level:?} and {other:?} share a Thrift level"
                 );
             }

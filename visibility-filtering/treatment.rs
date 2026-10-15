@@ -549,6 +549,10 @@ pub(crate) fn decided_rows(
     notice.into_iter().chain(first).chain(second)
 }
 
+pub(crate) fn decided_by(verdict: &Verdict) -> Option<&'static str> {
+    decided_rows(verdict).next().map(|(rule, _)| rule)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +583,34 @@ mod tests {
             value: Withholding::Tombstone(reason),
             by: "rule",
         })
+    }
+
+    #[test]
+    fn decided_by_names_the_deciding_rule_or_why_the_rules_never_ran() {
+        use crate::hydration::{Hydrator, Hydrators, Lookup};
+        use crate::models::Evaluation;
+        use crate::rules::fixtures::allow;
+        let suspended = dropped(FilteredReason::AuthorIsSuspended);
+        for (evaluation, rule) in [
+            (Evaluation::Complete { verdict: allow() }, None),
+            (
+                Evaluation::Complete {
+                    verdict: suspended.clone(),
+                },
+                Some("rule"),
+            ),
+            (
+                Evaluation::Partial {
+                    verdict: suspended,
+                    fail_open_defaults: Hydrators::of(Hydrator::Follows),
+                },
+                Some("rule"),
+            ),
+            (Evaluation::NotFound(Lookup::Author), Some("not_found")),
+            (Evaluation::Failed(Lookup::Tweet), Some("lookup_failed")),
+        ] {
+            assert_eq!(decided_by(evaluation.verdict()), rule, "{evaluation:?}");
+        }
     }
 
     fn blur_with(

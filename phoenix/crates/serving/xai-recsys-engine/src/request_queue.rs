@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, mpsc};
 
+const BATCH_WAIT_POLL: Duration = Duration::from_millis(1);
+
 pub trait QueuedItem {
     fn enqueue_time(&self) -> Instant;
 
@@ -29,6 +31,7 @@ pub struct RequestQueue<T> {
     space_available_notify: Arc<Notify>,
     batch_size: usize,
     max_staleness: Duration,
+    batch_wait: Option<Duration>,
 }
 
 impl<T: QueuedItem + Send + 'static> RequestQueue<T> {
@@ -36,6 +39,15 @@ impl<T: QueuedItem + Send + 'static> RequestQueue<T> {
         batch_size: usize,
         channel_size: usize,
         max_staleness: Duration,
+    ) -> (Self, mpsc::Sender<T>, BoxFuture<'static, ()>) {
+        Self::with_batch_wait(batch_size, channel_size, max_staleness, None)
+    }
+
+    pub fn with_batch_wait(
+        batch_size: usize,
+        channel_size: usize,
+        max_staleness: Duration,
+        batch_wait: Option<Duration>,
     ) -> (Self, mpsc::Sender<T>, BoxFuture<'static, ()>) {
         let (tx, mut rx) = mpsc::channel::<T>(channel_size);
         let request_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
@@ -89,6 +101,7 @@ impl<T: QueuedItem + Send + 'static> RequestQueue<T> {
             space_available_notify,
             batch_size,
             max_staleness,
+            batch_wait,
         };
 
         (queue, tx, Box::pin(background_task))
@@ -103,6 +116,9 @@ impl<T: QueuedItem + Send + 'static> RequestQueue<T> {
             self.space_available_notify.notify_one();
         }
         drop(buffer);
+        if let Some(wait) = self.batch_wait {
+            self.wait_for_batch(&mut items, wait).await;
+        }
 
         if items.is_empty() {
             return items;
@@ -117,6 +133,25 @@ impl<T: QueuedItem + Send + 'static> RequestQueue<T> {
             }
         }
         fresh
+    }
+
+    async fn wait_for_batch(&self, items: &mut Vec<T>, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        let target = if items.is_empty() { 1 } else { self.batch_size };
+        while items.len() < target {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(remaining.min(BATCH_WAIT_POLL)).await;
+            let mut buffer = self.request_buffer.lock().await;
+            if !buffer.is_empty() {
+                let k = (self.batch_size - items.len()).min(buffer.len());
+                items.extend(buffer.drain(..k));
+                WAITING_QUEUE_SIZE.set(buffer.len() as i64);
+                self.space_available_notify.notify_one();
+            }
+        }
     }
 
     pub fn reset_dequeue_timer(&mut self) {}
